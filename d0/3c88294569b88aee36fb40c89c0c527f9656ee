@@ -1,0 +1,147 @@
+session_test.go
+  s_2ebd45aa800399::t_8e753241b957cb 18
+  s_2ebd45aa800399::t_65557eff731f26 15-17
+  s_2ebd45aa800399::t_e87c9f3d696881 19-21
+  s_2ebd45aa800399::t_8ca9fd0174cc86 1-14,22-515
+session.go
+  s_2ebd45aa800399::t_8e753241b957cb 35
+  s_2ebd45aa800399::t_ae27fd380f6a6b 32-34
+  s_2ebd45aa800399::t_23be13724cd7f2 36-38
+  s_2ebd45aa800399::t_ab4a88f6ce2f95 1-31,39-1867
+wire_test.go
+  s_2ebd45aa800399::t_8e753241b957cb 14
+  s_2ebd45aa800399::t_fb5bde62627a42 11-13
+  s_2ebd45aa800399::t_3ec7c877b30b16 15-17
+  s_2ebd45aa800399::t_b2e4f8b0015320 1-10,18-562
+tests/schema/codec_test.go
+  s_2ebd45aa800399::t_8e753241b957cb 9-15
+  s_2ebd45aa800399::t_a486bc03ee0f97 6-8
+  s_2ebd45aa800399::t_6610ee65e79e54 16-18
+  s_2ebd45aa800399::t_fef017a456719e 1-5,19-158
+proto/syntra/v1/recovery_profile.proto
+  s_5c4abee0a91914::t_134260cad7f000 1-478
+proto/syntra/v1/capabilities.proto
+  s_5c4abee0a91914::t_134260cad7f000 1-9
+proto/syntra/v1/events.proto
+  s_5c4abee0a91914::t_134260cad7f000 1-14
+go.mod
+  s_2ebd45aa800399::t_8e753241b957cb 1
+  s_2ebd45aa800399::t_c383fe6011e33f 2-4
+  s_2ebd45aa800399::t_7905a742c92b6e 5
+conformance/test-vectors/protobuf/vectors.yaml
+  s_5c4abee0a91914::t_134260cad7f000 1-117
+MIGRATION.md
+  s_2ebd45aa800399::t_8e753241b957cb 1-7,10-71,76-80
+  s_5c4abee0a91914::t_0366e892f08393 8-9,72-75
+proto/syntra/v1/session.proto
+  s_5c4abee0a91914::t_134260cad7f000 1-10
+LICENSE
+  s_5c4abee0a91914::t_134260cad7f000 1-201
+.gitignore
+  s_2ebd45aa800399::t_8e753241b957cb 1-7
+buf.yaml
+  s_5c4abee0a91914::t_134260cad7f000 4-6,8-13
+  s_2ebd45aa800399::t_8e753241b957cb 1-3,7
+proto/syntra/v1/envelope.proto
+  s_5c4abee0a91914::t_134260cad7f000 1-42
+CONTRIBUTING.md
+  s_2ebd45aa800399::t_8e753241b957cb 1-58
+SECURITY.md
+  s_2ebd45aa800399::t_8e753241b957cb 1-34
+scripts/check-generated.py
+  s_2ebd45aa800399::t_8e753241b957cb 1-70
+README.md
+  s_2ebd45aa800399::t_8e753241b957cb 1-100,102-107,109-115,117-124,130-161
+  s_5c4abee0a91914::t_0366e892f08393 101,108,116,125-128
+conformance/test-vectors/protobuf/README.md
+  s_5c4abee0a91914::t_134260cad7f000 1-18
+conformance_runner_test.go
+  s_2ebd45aa800399::t_8e753241b957cb 759
+  s_2ebd45aa800399::t_fbe6f7fc6df1ef 756-758
+  s_2ebd45aa800399::t_2282c18c949774 760-762
+  s_2ebd45aa800399::t_68c0ccf8beb26b 1-755,763-805
+syntra.go
+  s_2ebd45aa800399::t_8e753241b957cb 3-37
+  s_2ebd45aa800399::t_d17c0b1e2e076a 1-2
+  s_2ebd45aa800399::t_29b36f64fd9843 38-40
+  s_2ebd45aa800399::t_6aa5cdf331c2ff 41-1636
+proto/syntra/v1/rpc.proto
+  s_5c4abee0a91914::t_134260cad7f000 1-36
+tests/schema/fixtures/frames.json
+  s_5c4abee0a91914::t_134260cad7f000 1-9
+buf.gen.yaml
+  s_2ebd45aa800399::t_8e753241b957cb 1-19
+.github/workflows/go.yml
+  s_2ebd45aa800399::t_8e753241b957cb 1-4,6-12,14-40
+  s_5c4abee0a91914::t_0366e892f08393 5,13,41-86
+proto/syntra/v1/errors.proto
+  s_5c4abee0a91914::t_134260cad7f000 1-56
+proto/syntra/v1/handshake.proto
+  s_5c4abee0a91914::t_134260cad7f000 1-29
+gen/syntra/v1/capabilities.pb.go
+  s_5c4abee0a91914::t_573beb0c8341de 1-64
+gen/syntra/v1/envelope.pb.go
+  s_5c4abee0a91914::t_7861466c0c8dc2 1-291
+gen/syntra/v1/errors.pb.go
+  s_5c4abee0a91914::t_38cfef487e8922 1-271
+gen/syntra/v1/events.pb.go
+  s_5c4abee0a91914::t_83e6fa6e4bf384 1-127
+gen/syntra/v1/handshake.pb.go
+  s_5c4abee0a91914::t_684ba12993d70a 1-205
+gen/syntra/v1/recovery_profile.pb.go
+  s_5c4abee0a91914::t_7d3f0e6ee5b2ad 1-2305
+gen/syntra/v1/rpc.pb.go
+  s_5c4abee0a91914::t_f535e900c61389 1-289
+gen/syntra/v1/session.pb.go
+  s_5c4abee0a91914::t_249af369a26218 1-65
+go.sum
+  s_5c4abee0a91914::t_a600b40814f72e 1-6
+native.go
+  s_5c4abee0a91914::t_914ce71747e025 1-837
+native_purego.go
+  s_5c4abee0a91914::t_213907a88e26e4 1-597
+native_purego_findings_test.go
+  s_5c4abee0a91914::t_01a690789f6c12 1-212
+native_test.go
+  s_5c4abee0a91914::t_fc67827f1e664d 1-198
+recovery.go
+  s_5c4abee0a91914::t_e433ab1ad89758 1-382
+recovery_test.go
+  s_5c4abee0a91914::t_165a9b8b0c5ca1 1-521
+reliable.go
+  s_5c4abee0a91914::t_618d8a7e4869eb 1-1381
+reliable_test.go
+  s_5c4abee0a91914::t_b099b850192c22 1-1092
+session_lifecycle_regression_test.go
+  s_5c4abee0a91914::t_8310e8282d876b 1-897
+session_regression_test.go
+  s_5c4abee0a91914::t_0b65f5f5b12397 1-376
+session_teardown_test.go
+  s_5c4abee0a91914::t_ad12d1bc284320 1-99
+wire_compatibility_test.go
+  s_5c4abee0a91914::t_c468a55ba6439b 1-146
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d03c88294569b88aee36fb40c89c0c527f9656ee",
+  "prompts": {},
+  "sessions": {
+    "s_2ebd45aa800399": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e80e83aafffeJ5fNTkqRiiAJTy",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "oscarlaw <oscarlaw2010@gmail.com>"
+    },
+    "s_5c4abee0a91914": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e822dc2c8ffeuoSnmey9d4Bf5l",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "oscarlaw <oscarlaw2010@gmail.com>"
+    }
+  }
+}

@@ -383,6 +383,7 @@ type sessionState struct {
 	lease            ConfirmedLease
 	activeConnection string
 	hasActive        bool
+	attachedOnce     bool
 	outcomes         map[DeliveryID]retainedEntry
 	outcomeBytes     int
 	tombstones       map[DeliveryID]tombstoneEntry
@@ -619,6 +620,7 @@ func (m *ReliableManager) Attach(now time.Time, sid SessionID, resumeCred []byte
 		st.epoch = proposed
 		st.activeConnection = connectionID
 		st.hasActive = true
+		st.attachedOnce = true
 		st.lastActivity = now
 		st.lease = lease
 		if hadActive {
@@ -634,6 +636,14 @@ func (m *ReliableManager) Attach(now time.Time, sid SessionID, resumeCred []byte
 	if err := ValidateEpoch(st.epoch); err != nil {
 		return 0, ConfirmedLease{}, "", nil, err
 	}
+	if st.attachedOnce {
+		next, err := NextEpoch(st.epoch)
+		if err != nil {
+			return 0, ConfirmedLease{}, "", nil, err
+		}
+		st.epoch = next
+	}
+	st.attachedOnce = true
 	st.activeConnection = connectionID
 	st.hasActive = true
 	st.lastActivity = now
@@ -888,31 +898,29 @@ func (m *ReliableManager) NoteDispatch(now time.Time, sid SessionID, epoch uint6
 	// Markers created without prior content (never-seen DID tombstoned or
 	// forgotten) adopt the first live resend's digest for future validation.
 	if tombstone, ok := st.tombstones[did]; ok && now.Sub(tombstone.retainedAt) <= m.bounds.TombstoneRetention {
-		incoming := digestContent(method, payload)
 		if tombstone.hasContent {
-			if incoming != tombstone.digest {
-				return NewRpcError(ErrorCodeFailedPrecondition, "syntra: delivery id reused with different content; rejected")
+			if err := checkDigest(tombstone.digest, method, payload); err != nil {
+				return err
 			}
 			st.lastActivity = now
 			return nil
 		}
 		// Adopt content for a previously content-less tombstone.
-		tombstone.digest = incoming
+		tombstone.digest = digestContent(method, payload)
 		tombstone.hasContent = true
 		st.tombstones[did] = tombstone
 		st.lastActivity = now
 		return nil
 	}
 	if fent, ok := st.forgotten[did]; ok && now.Sub(fent.forgottenAt) <= m.bounds.ResultRetention {
-		incoming := digestContent(method, payload)
 		if fent.hasContent {
-			if incoming != fent.digest {
-				return NewRpcError(ErrorCodeFailedPrecondition, "syntra: delivery id reused with different content; rejected")
+			if err := checkDigest(fent.digest, method, payload); err != nil {
+				return err
 			}
 			st.lastActivity = now
 			return nil
 		}
-		fent.digest = incoming
+		fent.digest = digestContent(method, payload)
 		fent.hasContent = true
 		st.forgotten[did] = fent
 		st.lastActivity = now
@@ -1015,7 +1023,7 @@ func (m *ReliableManager) Reconcile(now time.Time, sid SessionID, did DeliveryID
 		}
 		// Expired outcome becomes Forgotten with its request digest so the
 		// live-forgotten window still enforces duplicate-content.
-		m.addForgottenLocked(st, did, digestContent(entry.method, entry.payload), true, now)
+		m.addForgottenForContentLocked(st, did, entry.method, entry.payload, now)
 		return ReconcileForgotten, nil, nil
 	}
 	out := copyOutcome(entry.outcome)
@@ -1054,7 +1062,7 @@ func (m *ReliableManager) Detach(sid SessionID, connectionID string) {
 // MaxTombstones) so Reconcile reports Forgotten rather than Unknown.
 // The marker retains the outcome's request digest when known so the live
 // forgotten window still enforces duplicate-content validation.
-func (m *ReliableManager) Forget(sid SessionID, did DeliveryID) (bool, error) {
+func (m *ReliableManager) Forget(now time.Time, sid SessionID, did DeliveryID) (bool, error) {
 	if did == (DeliveryID{}) {
 		return false, NewRpcError(ErrorCodeInvalidArgument, "syntra: delivery id must not be all zero")
 	}
@@ -1072,7 +1080,7 @@ func (m *ReliableManager) Forget(sid SessionID, did DeliveryID) (bool, error) {
 		if _, fok := st.forgotten[did]; fok {
 			return false, nil
 		}
-		m.addForgottenLocked(st, did, contentDigest{}, false, time.Now())
+		m.addForgottenLocked(st, did, contentDigest{}, false, now)
 		return true, nil
 	}
 	digest := digestContent(entry.method, entry.payload)
@@ -1087,7 +1095,7 @@ func (m *ReliableManager) Forget(sid SessionID, did DeliveryID) (bool, error) {
 	if st.outcomeBytes < 0 {
 		st.outcomeBytes = 0
 	}
-	m.addForgottenLocked(st, did, digest, true, time.Now())
+	m.addForgottenLocked(st, did, digest, true, now)
 	return true, nil
 }
 

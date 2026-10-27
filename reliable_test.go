@@ -155,7 +155,7 @@ func TestReliableZeroDeliveryIDRejected(t *testing.T) {
 	if _, _, err := m.TombstoneOf(now, sid, zero); err == nil {
 		t.Fatal("zero delivery id accepted by TombstoneOf")
 	}
-	if _, err := m.Forget(sid, zero); err == nil {
+	if _, err := m.Forget(now, sid, zero); err == nil {
 		t.Fatal("zero delivery id accepted by Forget")
 	}
 }
@@ -381,7 +381,7 @@ func TestReliableReviewPendingContentAndLifetime(t *testing.T) {
 			requireReliableCode(t, err, ErrorCodeFailedPrecondition)
 		})
 	}
-	if _, err := m.Forget(sid, did); err == nil {
+	if _, err := m.Forget(now, sid, did); err == nil {
 		t.Error("Forget erased live pending work")
 	}
 	later := now.Add(3 * m.bounds.ResultRetention)
@@ -494,7 +494,7 @@ func TestReliableReviewPendingBudgets(t *testing.T) {
 				t.Fatalf("pending-to-retained double charged: %v", err)
 			}
 			requireReliableCode(t, m.NoteDispatch(now, sid, epoch, DeliveryID{2}, "x", nil), ErrorCodeResourceExhausted)
-			if _, err := m.Forget(sid, did); err != nil {
+			if _, err := m.Forget(now, sid, did); err != nil {
 				t.Fatal(err)
 			}
 			if err := m.NoteDispatch(now, sid, epoch, DeliveryID{2}, "x", nil); err != nil {
@@ -636,7 +636,7 @@ func TestReliablePendingTerminalAdmissionAndRelease(t *testing.T) {
 				if _, err := m.RecordResult(now, sid, 1, did, "echo", []byte("data"), StoredOutcome{}); err != nil {
 					t.Fatal(err)
 				}
-				if _, err := m.Forget(sid, did); err != nil {
+				if _, err := m.Forget(now, sid, did); err != nil {
 					t.Fatal(err)
 				}
 			} else {
@@ -715,7 +715,7 @@ func TestReliableInsertClearsForgotten(t *testing.T) {
 	if _, err := m.RecordResult(now, sid, 1, did, "/example.Echo/Echo", []byte("x"), StoredOutcome{Payload: []byte("x")}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.Forget(sid, did); err != nil {
+	if _, err := m.Forget(now, sid, did); err != nil {
 		t.Fatal(err)
 	}
 	if out, _, _ := m.Reconcile(now, sid, did); out != ReconcileForgotten {
@@ -1041,7 +1041,7 @@ func TestReliableRedTerminalMarkerContentValidation(t *testing.T) {
 				if _, err := m.RecordResult(now, sid, epoch, did, "echo", []byte("req"), StoredOutcome{Payload: []byte("done")}); err != nil {
 					t.Fatal(err)
 				}
-				if _, err := m.Forget(sid, did); err != nil {
+				if _, err := m.Forget(now, sid, did); err != nil {
 					t.Fatal(err)
 				}
 				if got, _, _ := m.Reconcile(now, sid, did); got != ReconcileForgotten {

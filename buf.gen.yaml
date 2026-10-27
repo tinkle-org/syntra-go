@@ -1,0 +1,19 @@
+# Go-only generation for the schema snapshot; see MIGRATION.md.
+# Buf CLI 1.59.0; protobuf runtime v1.36.6; Go module floor 1.22.
+# M options override Go import paths without rewriting go_package descriptors.
+version: v2
+clean: true
+plugins:
+  - remote: buf.build/protocolbuffers/go:v1.36.6
+    revision: 1
+    out: gen
+    opt:
+      - paths=source_relative
+      - Msyntra/v1/capabilities.proto=github.com/tinkle-org/syntra-go/gen/syntra/v1;syntrav1
+      - Msyntra/v1/envelope.proto=github.com/tinkle-org/syntra-go/gen/syntra/v1;syntrav1
+      - Msyntra/v1/errors.proto=github.com/tinkle-org/syntra-go/gen/syntra/v1;syntrav1
+      - Msyntra/v1/events.proto=github.com/tinkle-org/syntra-go/gen/syntra/v1;syntrav1
+      - Msyntra/v1/handshake.proto=github.com/tinkle-org/syntra-go/gen/syntra/v1;syntrav1
+      - Msyntra/v1/recovery_profile.proto=github.com/tinkle-org/syntra-go/gen/syntra/v1;syntrav1
+      - Msyntra/v1/rpc.proto=github.com/tinkle-org/syntra-go/gen/syntra/v1;syntrav1
+      - Msyntra/v1/session.proto=github.com/tinkle-org/syntra-go/gen/syntra/v1;syntrav1

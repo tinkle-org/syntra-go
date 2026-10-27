@@ -1,0 +1,13 @@
+# Local Syntra schema snapshot (Buf v2); upstream authority and provenance
+# are recorded in MIGRATION.md. All imports resolve inside this module,
+# so no buf.lock is required. Keep STANDARD lint and FILE breaking checks.
+version: v2
+modules:
+  - path: proto
+    # This repository does not publish a Buf Schema Registry module.
+lint:
+  use:
+    - STANDARD
+breaking:
+  use:
+    - FILE

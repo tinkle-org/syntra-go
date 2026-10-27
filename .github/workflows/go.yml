@@ -1,0 +1,86 @@
+name: Go
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  pure-go:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.4'
+          cache: true
+      - name: Formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            printf '%s\n' "$unformatted"
+            exit 1
+          fi
+      - name: Build (CGO disabled)
+        env:
+          CGO_ENABLED: '0'
+        run: go build -mod=readonly ./...
+      - name: Test (CGO disabled)
+        env:
+          CGO_ENABLED: '0'
+        run: go test -mod=readonly -count=1 ./...
+      - name: Vet
+        run: go vet -mod=readonly ./...
+      - name: Race detector (pure-Go backend)
+        env:
+          CGO_ENABLED: '1'
+        run: go test -mod=readonly -race -count=1 ./...
+
+  generated-go:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - uses: bufbuild/buf-setup-action@v1
+        with:
+          version: '1.59.0'
+          github_token: ${{ github.token }}
+      - name: Pinned Go generation drift check
+        run: python3 scripts/check-generated.py
+
+  native-go:
+    runs-on: ubuntu-24.04
+    env:
+      RUSTUP_TOOLCHAIN: '1.88.0'
+      CGO_ENABLED: '1'
+      CARGO_TARGET_DIR: ${{ github.workspace }}/.tmp/syntra-rs/target
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout matching Rust extraction
+        uses: actions/checkout@v4
+        with:
+          repository: tinkle-org/syntra-rs
+          ref: fca1063515d3966be71e9844346e7cbc53769c76
+          path: .tmp/syntra-rs
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.4'
+          cache: true
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.88.0'
+      - name: Build production FFI (not the test fixture)
+        run: cargo build --locked --manifest-path .tmp/syntra-rs/Cargo.toml -p syntra-ffi --no-default-features --features production
+      - name: Test and race-check Go against the Rust library
+        run: |
+          LIBDIR="$CARGO_TARGET_DIR/debug"
+          export CGO_LDFLAGS="-L$LIBDIR"
+          export LD_LIBRARY_PATH="$LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          go test -mod=readonly -tags syntranative -count=1 ./...
+          go test -mod=readonly -tags syntranative -race -count=1 ./...

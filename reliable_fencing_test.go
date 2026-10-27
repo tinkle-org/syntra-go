@@ -39,8 +39,9 @@ func TestReliableFreshReattachAdvancesEpoch(t *testing.T) {
 	}
 }
 
-// Forget must use the caller's clock, not the system clock, so markers
-// created with a simulated clock expire on that same clock.
+// ForgetAt must use the caller's clock, not the system clock, so markers
+// created with a simulated clock expire on that same clock. Forget retains
+// the existing system-clock behavior for source compatibility.
 func TestReliableForgetUsesCallerClock(t *testing.T) {
 	m := testReliableManager(t)
 	base := time.Unix(1_700_000_000, 0).UTC()
@@ -49,7 +50,7 @@ func TestReliableForgetUsesCallerClock(t *testing.T) {
 	if _, err := m.RecordResult(base, sid, 1, did, "echo", []byte("req"), StoredOutcome{Payload: []byte("done")}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.Forget(base, sid, did); err != nil {
+	if _, err := m.ForgetAt(base, sid, did); err != nil {
 		t.Fatal(err)
 	}
 	if got, _, _ := m.Reconcile(base, sid, did); got != ReconcileForgotten {

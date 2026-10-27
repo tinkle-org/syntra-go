@@ -1220,6 +1220,9 @@ func resolveHostConfig(cfg HostConfig) (resolvedHostConfig, error) {
 	if out.maxPending < 1 {
 		return resolvedHostConfig{}, NewRpcError(ErrorCodeInvalidArgument, "syntra: host max concurrent must be positive")
 	}
+	if out.maxPending > MaxConcurrentRPCs {
+		return resolvedHostConfig{}, NewRpcError(ErrorCodeOutOfRange, "syntra: host max concurrent exceeds max")
+	}
 	return out, nil
 }
 
@@ -1765,9 +1768,12 @@ func (h *Host) cancelHandlers(hc *hostConn, ids []uint64, all bool) {
 // connections bound to principal. Connections bound to other principals
 // never observe it (directed delivery isolation for recovery batches and
 // per-stream signals). With no matching connections it is a documented
-// no-op. Recovery drivers MUST use this (or a subscription-handle-routed
-// variant above it) instead of NotifyAll broadcast: broadcast leaks stream
-// state across principals and breaks per-stream termination scope.
+// no-op. Partial-delivery failures are combined and returned; RpcError
+// values remain unwrappable via errors.As. Only connections with a
+// successful enqueue are signaled. Recovery drivers MUST use this (or a
+// subscription-handle-routed variant above it) instead of NotifyAll
+// broadcast: broadcast leaks stream state across principals and breaks
+// per-stream termination scope.
 func (h *Host) NotifyDirected(principal string, payload []byte) error {
 	if h == nil {
 		return NewRpcError(ErrorCodeInternal, "syntra: nil host")
@@ -1787,19 +1793,26 @@ func (h *Host) NotifyDirected(principal string, payload []byte) error {
 		}
 	}
 	h.mu.Unlock()
+	var errs []error
 	for _, hc := range conns {
-		_ = hc.core.notify(payload)
+		if err := hc.core.notify(payload); err != nil {
+			errs = append(errs, err)
+			continue
+		}
 		select {
 		case hc.wake <- struct{}{}:
 		default:
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // NotifyAll enqueues payload as a notification on every served
 // connection. With no connections it is a documented no-op. Payloads
 // MUST be opaque application bytes; empty is a valid empty event.
+// Partial-delivery failures are combined and returned; RpcError values
+// remain unwrappable via errors.As. Only connections with a successful
+// enqueue are signaled.
 func (h *Host) NotifyAll(payload []byte) error {
 	if h == nil {
 		return NewRpcError(ErrorCodeInternal, "syntra: nil host")
@@ -1817,14 +1830,18 @@ func (h *Host) NotifyAll(payload []byte) error {
 		conns = append(conns, hc)
 	}
 	h.mu.Unlock()
+	var errs []error
 	for _, hc := range conns {
-		_ = hc.core.notify(payload)
+		if err := hc.core.notify(payload); err != nil {
+			errs = append(errs, err)
+			continue
+		}
 		select {
 		case hc.wake <- struct{}{}:
 		default:
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // gracefulDrain implements SNTR-HS-006/013 draining for graceful close:

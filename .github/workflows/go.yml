@@ -205,7 +205,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      - uses: actions/dependency-review-action@595b5aeba73380359d087f648dbb0edce1b # v4.7.3
+      - uses: actions/dependency-review-action@595b5aeba73380359d98a5e087f648dbb0edce1b # v4.7.3
         with:
           fail-on-severity: high
 
@@ -218,9 +218,14 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      - uses: rhysd/actionlint@914e7df21a07ef503a81201c76d2b11c789d3fca # v1.7.12
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          workflow: .github/workflows/*.yml
+          go-version: '1.26.4'
+          cache: true
+      - name: Install pinned actionlint
+        run: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+      - name: Lint workflows
+        run: actionlint .github/workflows/*.yml
 
   ci-success:
     needs: [pure-go, generated-go, native-go, compat, security, fuzz-smoke, dependency-review, actionlint]

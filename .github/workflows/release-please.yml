@@ -1,0 +1,32 @@
+name: Release Please
+
+# Release automation for the Go module via release-please (conventional
+# commits). Runs only on pushes to main, never on pull_request, so untrusted
+# PRs cannot trigger releases or use the elevated permissions below.
+# On merge of a release PR, release-please pushes the root vX.Y.Z tag and
+# opens the GitHub Release; the Go proxy and pkg.go.dev index from the tag.
+# No binaries are published; Go modules ship as source through the proxy.
+# Elevated contents:write + pull-requests:write live only in this workflow.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-please
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json

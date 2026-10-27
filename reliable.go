@@ -799,6 +799,22 @@ func (m *ReliableManager) RecordResult(now time.Time, sid SessionID, epoch uint6
 			return ReconcileRetained, nil
 		}
 	}
+	// Live terminal markers enforce duplicate-content before admission or
+	// mutation; mismatches fail without deleting markers or storing outcomes.
+	if tomb, ok := st.tombstones[did]; ok && now.Sub(tomb.retainedAt) <= m.bounds.TombstoneRetention {
+		if tomb.hasContent {
+			if err := checkDigest(tomb.digest, method, payload); err != nil {
+				return "", err
+			}
+		}
+	}
+	if fent, ok := st.forgotten[did]; ok && now.Sub(fent.forgottenAt) <= m.bounds.ResultRetention {
+		if fent.hasContent {
+			if err := checkDigest(fent.digest, method, payload); err != nil {
+				return "", err
+			}
+		}
+	}
 	// Compute replacement admission without mutating stale state.
 	// Failure must preserve markers, timestamps, bytes, and activity.
 	entryBytes := len(method) + len(payload)
@@ -1062,7 +1078,14 @@ func (m *ReliableManager) Detach(sid SessionID, connectionID string) {
 // MaxTombstones) so Reconcile reports Forgotten rather than Unknown.
 // The marker retains the outcome's request digest when known so the live
 // forgotten window still enforces duplicate-content validation.
-func (m *ReliableManager) Forget(now time.Time, sid SessionID, did DeliveryID) (bool, error) {
+// Clock behavior is the existing system clock for source compatibility;
+// use ForgetAt for deterministic caller-clock tests.
+func (m *ReliableManager) Forget(sid SessionID, did DeliveryID) (bool, error) {
+	return m.ForgetAt(time.Now(), sid, did)
+}
+
+// ForgetAt is the clock-aware Forget sharing the same implementation.
+func (m *ReliableManager) ForgetAt(now time.Time, sid SessionID, did DeliveryID) (bool, error) {
 	if did == (DeliveryID{}) {
 		return false, NewRpcError(ErrorCodeInvalidArgument, "syntra: delivery id must not be all zero")
 	}

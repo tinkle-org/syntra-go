@@ -24,7 +24,8 @@ production library; follow [README.md](README.md#optional-native-backend).
 Compatibility: CI validates the declared Go 1.22 floor with
 `GOTOOLCHAIN=local` (no silent upgrades) and the current 1.26.4 toolchain,
 plus compile-only `GOOS/GOARCH` targets. Run the 1.22 toolchain locally via
-`GOTOOLCHAIN=go1.22.x go env GOROOT` when changing language features.
+`GOTOOLCHAIN=go1.22.12 go env GOROOT` (or an installed Go 1.22 toolchain with
+`GOTOOLCHAIN=local`) when changing language features.
 
 Security (all pinned, no silent ignores):
 
@@ -60,7 +61,10 @@ cancel for PRs):
   in the main-branch ruleset; do not require individual jobs.
 - `CodeQL` – Go analysis on push/main/PR/weekly (optional, does not gate).
 - `Scheduled` – weekly extended fuzz/security.
-- `Release` – tag-only `v*.*.*`, `release` environment approval, no PR trigger.
+- `Release Please` – push-to-main-only automation using conventional commits.
+  Merging a release PR pushes the root `vX.Y.Z` tag and opens the GitHub
+  Release; the Go proxy and pkg.go.dev index from the tag. No binaries are
+  published and PRs cannot trigger it.
 
 Dependabot updates `gomod` and `github-actions` weekly; update SHAs via
 Dependabot PRs after review, never floating tags.

@@ -291,6 +291,7 @@ type CheckpointReconciler struct {
 	mu       sync.Mutex
 	config   ReconcilerConfig
 	lastTick time.Time
+	cursor   string
 	// Stored cursor slices are owned and immutable: NoteObserved copies
 	// inputs and replaces whole entries, never mutating their backing arrays.
 	observed map[string]Checkpoint
@@ -329,13 +330,15 @@ func (r *CheckpointReconciler) Forget(stream string) {
 	delete(r.observed, stream)
 }
 
-// Tick reconciles up to MaxStreamsPerTick streams. For each tracked stream
+// Tick reconciles up to MaxStreamsPerTick streams. For each examined stream
 // whose last observed generation or result differs from committed, it
 // returns a needs-recovery entry keyed by stream. Streams already converged
 // (same generation and byte-identical result) return nothing. The tick runs
 // even when no batch arrived since the last tick. At most MaxStreamsPerTick
-// entries are returned in stream order for determinism. Ticks closer than
-// TickInterval are no-ops.
+// streams are examined and reported in rotated sorted order for determinism
+// with fairness: each tick starts after the cursor for the last examined
+// stream and wraps around, so permanently diverged low-sorted streams cannot
+// starve later streams. Ticks closer than TickInterval are no-ops.
 //
 // The committed callback runs WITHOUT the reconciler lock held: it may
 // safely call back into NoteObserved/Forget without deadlocking. The
@@ -358,17 +361,43 @@ func (r *CheckpointReconciler) Tick(now time.Time, committed func(stream string)
 		snap[s] = cp
 	}
 	max := r.config.MaxStreamsPerTick
+	if max <= 0 {
+		max = 16
+	}
+	cursor := r.cursor
 	r.mu.Unlock()
 	var streams []string
 	for s := range snap {
 		streams = append(streams, s)
 	}
 	sort.Strings(streams)
-	var out []string
-	for _, s := range streams {
-		if max > 0 && len(out) >= max {
-			break
+	if len(streams) == 0 {
+		return nil
+	}
+	start := 0
+	if cursor != "" {
+		found := false
+		for i, s := range streams {
+			if s == cursor {
+				start = (i + 1) % len(streams)
+				found = true
+				break
+			}
 		}
+		if !found {
+			start = 0
+		}
+	}
+	n := max
+	if n > len(streams) {
+		n = len(streams)
+	}
+	var selected []string
+	for i := 0; i < n; i++ {
+		selected = append(selected, streams[(start+i)%len(streams)])
+	}
+	var out []string
+	for _, s := range selected {
 		obs := snap[s]
 		result, gen, ok := committed(s)
 		if !ok {
@@ -378,5 +407,10 @@ func (r *CheckpointReconciler) Tick(now time.Time, committed func(stream string)
 			out = append(out, s)
 		}
 	}
+	r.mu.Lock()
+	if len(selected) > 0 {
+		r.cursor = selected[len(selected)-1]
+	}
+	r.mu.Unlock()
 	return out
 }

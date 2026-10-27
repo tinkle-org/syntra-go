@@ -54,8 +54,18 @@ func FuzzDuplicateContent(f *testing.F) {
 		if len(payloadA) > 64*1024 || len(payloadB) > 64*1024 {
 			t.Skip("payload capped")
 		}
-		_ = CheckDuplicateContent(methodA, payloadA, methodB, payloadB)
+		same := methodA == methodB && string(payloadA) == string(payloadB)
+		if err := CheckDuplicateContent(methodA, payloadA, methodB, payloadB); same && err != nil {
+			t.Fatalf("identical content rejected: %v", err)
+		} else if !same && err == nil {
+			t.Fatalf("mismatched content accepted")
+		}
 		digestA := digestContent(methodA, payloadA)
-		_ = checkDigest(digestA, methodB, payloadB)
+		digestB := digestContent(methodB, payloadB)
+		if err := checkDigest(digestA, methodB, payloadB); same && err != nil {
+			t.Fatalf("checkDigest rejected identical inputs: %v", err)
+		} else if !same && digestA != digestB && err == nil {
+			t.Fatalf("checkDigest accepted mismatched digests")
+		}
 	})
 }

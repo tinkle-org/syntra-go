@@ -1380,7 +1380,9 @@ func (h *Host) serveHandshake(ctx context.Context, t Transport, hc *hostConn) er
 	if aerr != nil {
 		return aerr
 	}
+	h.mu.Lock()
 	hc.principal = principal
+	h.mu.Unlock()
 	if serr := t.Send(ctx, readyFrame); serr != nil {
 		if errors.Is(serr, context.Canceled) || errors.Is(serr, context.DeadlineExceeded) {
 			return serr

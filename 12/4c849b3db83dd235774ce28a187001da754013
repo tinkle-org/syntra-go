@@ -1,0 +1,26 @@
+.github/workflows/scheduled.yml
+  s_17887e36af9f96::t_fb83ee84b69012 1-58
+.github/dependabot.yml
+  s_17887e36af9f96::t_6099f31d108490 1-14
+.github/workflows/codeql.yml
+  s_17887e36af9f96::t_b0caaf772d8726 1-32,34,38
+  s_17887e36af9f96::t_30e25d0b56f0c1 33,35-37,39
+.github/workflows/release.yml
+  s_17887e36af9f96::t_dc8e1ce00ca157 1-74
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "124c849b3db83dd235774ce28a187001da754013",
+  "prompts": {},
+  "sessions": {
+    "s_17887e36af9f96": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e8097db8dffel0we41WQDVrCuU",
+        "model": "muse-spark-1.3-contributor"
+      },
+      "human_author": "oscarlaw <oscarlaw2010@gmail.com>"
+    }
+  }
+}

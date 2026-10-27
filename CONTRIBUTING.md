@@ -13,11 +13,57 @@ go test -mod=readonly -count=1 ./...
 CGO_ENABLED=0 go test -mod=readonly -count=1 ./...
 go vet -mod=readonly ./...
 go test -mod=readonly -race -count=1 ./...
+go mod verify
+git diff --exit-code -- go.mod go.sum
 ```
 
 The race detector requires CGO and a C compiler, but the default-tag tests
 still exercise the pure-Go backend. Native tests require a compatible Rust
 production library; follow [README.md](README.md#optional-native-backend).
+
+Compatibility: CI validates the declared Go 1.22 floor with
+`GOTOOLCHAIN=local` (no silent upgrades) and the current 1.26.4 toolchain,
+plus compile-only `GOOS/GOARCH` targets. Run the 1.22 toolchain locally via
+`GOTOOLCHAIN=go1.22.x go env GOROOT` when changing language features.
+
+Security (all pinned, no silent ignores):
+
+```sh
+go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
+govulncheck ./...
+go install honnef.co/go/tools/cmd/staticcheck@2025.1.1
+staticcheck -tags syntranative ./...
+```
+
+`staticcheck` uses `-tags syntranative` so shared helpers used only by the
+native backend are not reported as unused. `govulncheck` gates reachable
+vulnerabilities; standard-library fixes in newer patches are tracked via
+Dependabot, not blanket exclusions.
+
+Fuzz and negative tests:
+
+```sh
+go test -mod=readonly -run 'TestFuzzSeedCorpus' -count=1 -v ./...
+go test -mod=readonly -fuzz=FuzzUnmarshalFrame -fuzztime=30s .
+go test -mod=readonly -fuzz=FuzzDuplicateContent -fuzztime=30s .
+```
+
+PR CI runs 30s smoke runs; weekly Scheduled runs 5m campaigns. Conformance
+vectors in `conformance/` must keep passing.
+
+Workflows (all actions SHA-pinned, `contents: read`, timeouts, concurrency
+cancel for PRs):
+
+- `Go` – fast required PR/main checks (`pure-go`, `generated-go`,
+  `native-go`, `compat`, `security`, `fuzz-smoke`, `dependency-review`
+  (PR-only), `actionlint`, aggregator `ci-success`). Require `ci-success`
+  in the main-branch ruleset; do not require individual jobs.
+- `CodeQL` – Go analysis on push/main/PR/weekly (optional, does not gate).
+- `Scheduled` – weekly extended fuzz/security.
+- `Release` – tag-only `v*.*.*`, `release` environment approval, no PR trigger.
+
+Dependabot updates `gomod` and `github-actions` weekly; update SHAs via
+Dependabot PRs after review, never floating tags.
 
 Use neutral opaque payloads and local test fixtures. For behavior changes,
 include a focused regression that asserts observable behavior. Report existing

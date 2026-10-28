@@ -1,0 +1,19 @@
+.github/workflows/release-please.yml
+  s_50787f1222a44a::t_eabe02279fb20a 31-33,36
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d2ce76e533c1024c7ca28fb29596d4b62a4625a6",
+  "prompts": {},
+  "sessions": {
+    "s_50787f1222a44a": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e7fd2d04effeMGSSPHoAWD3w7i",
+        "model": "glm-5.3-flash"
+      },
+      "human_author": "oscarlaw <oscarlaw2010@gmail.com>"
+    }
+  }
+}

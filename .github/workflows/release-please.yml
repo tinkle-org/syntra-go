@@ -28,10 +28,9 @@ jobs:
       pull-requests: write
       issues: write
     steps:
-      # RELEASE_PLEASE_TOKEN must be created by an admin (PAT with
-      # contents:write, pull-requests:write and issues:write, or a GitHub
-      # App token): pushes made with GITHUB_TOKEN do not trigger
-      # release-PR checks.
+      # RELEASE_PLEASE_TOKEN must be created by an admin as a PAT with
+      # contents:write, pull-requests:write and issues:write: pushes made
+      # with GITHUB_TOKEN do not trigger release-PR checks.
       - uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4
         with:
           token: ${{ secrets.RELEASE_PLEASE_TOKEN }}

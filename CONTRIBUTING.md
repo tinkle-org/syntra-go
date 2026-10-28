@@ -65,7 +65,7 @@ cancel for PRs):
   Merging a release PR pushes the root `vX.Y.Z` tag and opens the GitHub
   Release; the Go proxy and pkg.go.dev index from the tag. No binaries are
   published and PRs cannot trigger it. An admin must create the
-  `RELEASE_PLEASE_TOKEN` secret (PAT or App token) or release PRs get no
+  `RELEASE_PLEASE_TOKEN` secret (PAT) or release PRs get no
   checks; the token lives only in that workflow.
 
 A `dependency-review` gate is intentionally absent: the action reports the

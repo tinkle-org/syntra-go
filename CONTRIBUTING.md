@@ -56,15 +56,22 @@ Workflows (all actions SHA-pinned, `contents: read`, timeouts, concurrency
 cancel for PRs):
 
 - `Go` – fast required PR/main checks (`pure-go`, `generated-go`,
-  `native-go`, `compat`, `security`, `fuzz-smoke`, `dependency-review`
-  (PR-only), `actionlint`, aggregator `ci-success`). Require `ci-success`
+  `native-go`, `compat`, `security`, `fuzz-smoke`, `actionlint`,
+  aggregator `ci-success`). Require `ci-success`
   in the main-branch ruleset; do not require individual jobs.
 - `CodeQL` – Go analysis on push/main/PR/weekly (optional, does not gate).
 - `Scheduled` – weekly extended fuzz/security.
 - `Release Please` – push-to-main-only automation using conventional commits.
   Merging a release PR pushes the root `vX.Y.Z` tag and opens the GitHub
   Release; the Go proxy and pkg.go.dev index from the tag. No binaries are
-  published and PRs cannot trigger it.
+  published and PRs cannot trigger it. An admin must create the
+  `RELEASE_PLEASE_TOKEN` secret (PAT or App token) or release PRs get no
+  checks; the token lives only in that workflow.
+
+A `dependency-review` gate is intentionally absent: the action reports the
+repository does not support it until an admin enables Dependency graph
+(Settings → Code security). Re-add the gate once supported; Dependabot and
+`govulncheck` cover updates and reachable vulnerabilities meanwhile.
 
 Dependabot updates `gomod` and `github-actions` weekly; update SHAs via
 Dependabot PRs after review, never floating tags.

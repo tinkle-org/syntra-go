@@ -385,7 +385,15 @@ func (r *CheckpointReconciler) Tick(now time.Time, committed func(stream string)
 			}
 		}
 		if !found {
-			start = 0
+			// The cursor stream was forgotten between ticks: resume at
+			// the first stream sorting after it so later streams are
+			// not starved by resetting to the beginning. Wrap when
+			// no later stream exists.
+			if j := sort.Search(len(streams), func(i int) bool { return streams[i] > cursor }); j < len(streams) {
+				start = j
+			} else {
+				start = 0
+			}
 		}
 	}
 	n := max

@@ -195,20 +195,6 @@ jobs:
           go test -mod=readonly -fuzz=FuzzUnmarshalFrame -fuzztime=30s .
           go test -mod=readonly -fuzz=FuzzDuplicateContent -fuzztime=30s .
 
-  dependency-review:
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          persist-credentials: false
-      - uses: actions/dependency-review-action@595b5aeba73380359d98a5e087f648dbb0edce1b # v4.7.3
-        with:
-          fail-on-severity: high
-
   actionlint:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -228,7 +214,7 @@ jobs:
         run: actionlint .github/workflows/*.yml
 
   ci-success:
-    needs: [pure-go, generated-go, native-go, compat, security, fuzz-smoke, dependency-review, actionlint]
+    needs: [pure-go, generated-go, native-go, compat, security, fuzz-smoke, actionlint]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -240,13 +226,9 @@ jobs:
           python3 - <<'PY'
           import json, os, sys
           needs = json.loads(os.environ["NEEDS_JSON"])
-          # dependency-review is PR-only; skipped on main is allowed.
-          allowed_skip = {"dependency-review"} if os.environ.get("EVENT") != "pull_request" else set()
           failed = []
           for name, res in needs.items():
               r = res.get("result")
-              if name in allowed_skip and r == "skipped":
-                  continue
               if r != "success":
                   failed.append(f"{name}={r}")
           if failed:
@@ -256,4 +238,3 @@ jobs:
           PY
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
-          EVENT: ${{ github.event_name }}

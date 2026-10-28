@@ -126,6 +126,11 @@ const (
 	// host supports (SNTR-RPC-008). Hosts reject excess with
 	// ResourceExhausted while the connection stays usable.
 	MaxConcurrentRPCs = 16
+	// MaxHostConcurrentRPCs caps per-connection handler concurrency on the
+	// host side. Hosts fan out to many principals and may need headroom
+	// above the client minimum; values above this fail fast as OutOfRange
+	// so one connection cannot reserve an unbounded worker pool.
+	MaxHostConcurrentRPCs = 256
 	// ConnectionIDBytes is the 128-bit entropy bound into every
 	// ServerReady.connection_id (SNTR-SESS-002). The ID is a diagnostic
 	// handle, never an authenticator or resume token.

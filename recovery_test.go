@@ -380,6 +380,37 @@ func TestReconcilerBoundedTick(t *testing.T) {
 	}
 }
 
+// TestReconcilerTickCursorRemovalNoStarvation covers cursor-stream removal
+// between ticks: when the cursor stream is forgotten, the next tick resumes
+// at the first stream sorting after it instead of resetting to the
+// beginning, so later streams are not starved. Repeated removal and
+// reinsertion keep rotating without revisiting earlier streams first.
+func TestReconcilerTickCursorRemovalNoStarvation(t *testing.T) {
+	rec := NewCheckpointReconciler(ReconcilerConfig{TickInterval: 0, MaxStreamsPerTick: 1})
+	for _, s := range []string{"a", "b", "c"} {
+		rec.NoteObserved(Checkpoint{Stream: s, Generation: 1, Result: []byte("new-" + s)})
+	}
+	lookup := func(stream string) ([]byte, uint64, bool) { return []byte("old"), 1, true }
+	if got := rec.Tick(time.Now(), lookup); len(got) != 1 || got[0] != "a" {
+		t.Fatalf("tick 1 = %v, want [a]", got)
+	}
+	if got := rec.Tick(time.Now(), lookup); len(got) != 1 || got[0] != "b" {
+		t.Fatalf("tick 2 = %v, want [b]", got)
+	}
+	rec.Forget("b")
+	if got := rec.Tick(time.Now(), lookup); len(got) != 1 || got[0] != "c" {
+		t.Fatalf("tick 3 after removing cursor = %v, want [c]", got)
+	}
+	rec.Forget("c")
+	rec.NoteObserved(Checkpoint{Stream: "b", Generation: 1, Result: []byte("new-b")})
+	if got := rec.Tick(time.Now(), lookup); len(got) != 1 || got[0] != "a" {
+		t.Fatalf("tick 4 after removal and reinsertion = %v, want [a]", got)
+	}
+	if got := rec.Tick(time.Now(), lookup); len(got) != 1 || got[0] != "b" {
+		t.Fatalf("tick 5 = %v, want [b]", got)
+	}
+}
+
 // TestLossTotalsCumulativeNoDoubleCount covers unified loss semantics on the
 // public queue: cumulative counts/bytes advance exactly once per drop and
 // loss-change wakeups observe the same totals without double-counting.

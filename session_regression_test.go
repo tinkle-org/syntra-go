@@ -31,6 +31,12 @@ func TestConfigBounds(t *testing.T) {
 	if _, err := resolveClientConfig(ClientConfig{MaxConcurrent: MaxConcurrentRPCs + 1}); callCode(t, err) != ErrorCodeOutOfRange {
 		t.Fatalf("client concurrency: %v", err)
 	}
+	if cfg, err := resolveHostConfig(HostConfig{MaxConcurrent: MaxHostConcurrentRPCs}); err != nil || cfg.maxPending != MaxHostConcurrentRPCs {
+		t.Fatalf("host concurrency 256: %v %+v", err, cfg)
+	}
+	if _, err := resolveHostConfig(HostConfig{MaxConcurrent: MaxHostConcurrentRPCs + 1}); callCode(t, err) != ErrorCodeOutOfRange {
+		t.Fatalf("host concurrency: %v", err)
+	}
 }
 
 func TestNilPayloadSuccess(t *testing.T) {

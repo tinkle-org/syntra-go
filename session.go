@@ -1178,7 +1178,8 @@ type HostConfig struct {
 	// pure-Go and native backends enforce the identical deadline.
 	DefaultTimeout time.Duration
 	// MaxConcurrent caps outstanding calls per connection. Zero selects
-	// MaxConcurrentRPCs. Excess calls fail with ResourceExhausted while
+	// MaxConcurrentRPCs. Values above MaxHostConcurrentRPCs fail fast as
+	// OutOfRange. Excess calls fail with ResourceExhausted while
 	// the connection stays usable.
 	MaxConcurrent int
 }
@@ -1220,7 +1221,7 @@ func resolveHostConfig(cfg HostConfig) (resolvedHostConfig, error) {
 	if out.maxPending < 1 {
 		return resolvedHostConfig{}, NewRpcError(ErrorCodeInvalidArgument, "syntra: host max concurrent must be positive")
 	}
-	if out.maxPending > MaxConcurrentRPCs {
+	if out.maxPending > MaxHostConcurrentRPCs {
 		return resolvedHostConfig{}, NewRpcError(ErrorCodeOutOfRange, "syntra: host max concurrent exceeds max")
 	}
 	return out, nil

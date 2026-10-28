@@ -6,7 +6,8 @@ name: Release Please
 # On merge of a release PR, release-please pushes the root vX.Y.Z tag and
 # opens the GitHub Release; the Go proxy and pkg.go.dev index from the tag.
 # No binaries are published; Go modules ship as source through the proxy.
-# Elevated contents:write + pull-requests:write live only in this workflow.
+# Elevated contents:write + pull-requests:write + issues:write live only
+# in this workflow.
 on:
   push:
     branches: [main]
@@ -25,8 +26,14 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+      issues: write
     steps:
+      # RELEASE_PLEASE_TOKEN must be created by an admin (PAT with
+      # contents:write, pull-requests:write and issues:write, or a GitHub
+      # App token): pushes made with GITHUB_TOKEN do not trigger
+      # release-PR checks.
       - uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4
         with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json

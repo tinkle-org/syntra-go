@@ -1,0 +1,19 @@
+CONTRIBUTING.md
+  s_50787f1222a44a::t_201cbdfeb4ddc6 67-70
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c1f4e79fed22ff4d3e2e4d3fe106b79a86a23b64",
+  "prompts": {},
+  "sessions": {
+    "s_50787f1222a44a": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e7fd2d04effeMGSSPHoAWD3w7i",
+        "model": "glm-5.3-flash"
+      },
+      "human_author": "oscarlaw <oscarlaw2010@gmail.com>"
+    }
+  }
+}

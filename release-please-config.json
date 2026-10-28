@@ -1,0 +1,11 @@
+{
+  "$schema": "https://schema.release-please.net/schema.json",
+  "release-type": "go",
+  "packages": {
+    ".": {
+      "package-name": "syntra-go",
+      "include-component-in-tag": false,
+      "changelog-type": "github"
+    }
+  }
+}

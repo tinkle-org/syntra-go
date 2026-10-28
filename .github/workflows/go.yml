@@ -1,0 +1,240 @@
+name: Go
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pure-go:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: '1.26.4'
+          cache: true
+      - name: Formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            printf '%s\n' "$unformatted"
+            exit 1
+          fi
+      - name: Build (CGO disabled)
+        env:
+          CGO_ENABLED: '0'
+        run: go build -mod=readonly ./...
+      - name: Test (CGO disabled)
+        env:
+          CGO_ENABLED: '0'
+        run: go test -mod=readonly -count=1 ./...
+      - name: Vet
+        run: go vet -mod=readonly ./...
+      - name: Race detector (pure-Go backend)
+        env:
+          CGO_ENABLED: '1'
+        run: go test -mod=readonly -race -count=1 ./...
+
+  generated-go:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.14'
+      - uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1.50.0
+        with:
+          version: '1.59.0'
+          github_token: ${{ github.token }}
+      - name: Pinned Go generation drift check
+        run: python3 scripts/check-generated.py
+
+  native-go:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      RUSTUP_TOOLCHAIN: '1.88.0'
+      CGO_ENABLED: '1'
+      CARGO_TARGET_DIR: ${{ github.workspace }}/.tmp/syntra-rs/target
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Checkout matching Rust extraction
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: tinkle-org/syntra-rs
+          ref: fca1063515d3966be71e9844346e7cbc53769c76
+          path: .tmp/syntra-rs
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: '1.26.4'
+          cache: true
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: '1.88.0'
+      - name: Build production FFI (not the test fixture)
+        run: cargo build --locked --manifest-path .tmp/syntra-rs/Cargo.toml -p syntra-ffi --no-default-features --features production
+      - name: Test and race-check Go against the Rust library
+        run: |
+          LIBDIR="$CARGO_TARGET_DIR/debug"
+          export CGO_LDFLAGS="-L$LIBDIR"
+          export LD_LIBRARY_PATH="$LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          go test -mod=readonly -tags syntranative -count=1 ./...
+          go test -mod=readonly -tags syntranative -race -count=1 ./...
+
+  compat:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        go-version: ['1.22', '1.26.4']
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: ${{ matrix.go-version }}
+          cache: true
+      - name: Verify go.mod consistency
+        run: |
+          go mod verify
+          git diff --exit-code -- go.mod go.sum
+        env:
+          GOTOOLCHAIN: local
+      - name: Build (min and current toolchain)
+        run: go build -mod=readonly ./...
+        env:
+          GOTOOLCHAIN: local
+      - name: Vet (min and current toolchain)
+        run: go vet -mod=readonly ./...
+        env:
+          GOTOOLCHAIN: local
+      - name: Test (min and current toolchain)
+        run: go test -mod=readonly -count=1 ./...
+        env:
+          GOTOOLCHAIN: local
+      - name: Race (CGO-enabled ubuntu only)
+        run: go test -mod=readonly -race -count=1 ./...
+        env:
+          CGO_ENABLED: '1'
+          GOTOOLCHAIN: local
+      - name: Compile-only cross targets (current toolchain only)
+        if: matrix.go-version == '1.26.4'
+        run: |
+          GOOS=linux GOARCH=amd64 go build -mod=readonly ./...
+          GOOS=linux GOARCH=arm64 go build -mod=readonly ./...
+          GOOS=darwin GOARCH=amd64 go build -mod=readonly ./...
+          GOOS=darwin GOARCH=arm64 go build -mod=readonly ./...
+          GOOS=windows GOARCH=amd64 go build -mod=readonly ./...
+
+  security:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: '1.26.4'
+          cache: true
+      - name: govulncheck (reachable vulnerabilities only)
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
+          govulncheck ./...
+      - name: staticcheck (pinned, native tags cover all code)
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@2025.1.1
+          staticcheck -tags syntranative ./...
+
+  fuzz-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: '1.26.4'
+          cache: true
+      - name: Seed regression tests
+        run: go test -mod=readonly -run 'TestFuzzSeedCorpus|TestReliableFreshReattach|TestReliableForgetUsesCaller' -count=1 -v ./...
+      - name: Bounded fuzz smoke (30s each)
+        run: |
+          go test -mod=readonly -fuzz=FuzzUnmarshalFrame -fuzztime=30s .
+          go test -mod=readonly -fuzz=FuzzDuplicateContent -fuzztime=30s .
+
+  actionlint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: '1.26.4'
+          cache: true
+      - name: Install pinned actionlint
+        run: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+      - name: Lint workflows
+        run: actionlint .github/workflows/*.yml
+
+  ci-success:
+    needs: [pure-go, generated-go, native-go, compat, security, fuzz-smoke, actionlint]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Aggregate required checks
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          needs = json.loads(os.environ["NEEDS_JSON"])
+          failed = []
+          for name, res in needs.items():
+              r = res.get("result")
+              if r != "success":
+                  failed.append(f"{name}={r}")
+          if failed:
+              print("required checks failed: " + ", ".join(failed))
+              sys.exit(1)
+          print("all required checks passed")
+          PY
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}

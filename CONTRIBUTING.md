@@ -64,9 +64,10 @@ cancel for PRs):
 - `Release Please` – push-to-main-only automation using conventional commits.
   Merging a release PR pushes the root `vX.Y.Z` tag and opens the GitHub
   Release; the Go proxy and pkg.go.dev index from the tag. No binaries are
-  published and PRs cannot trigger it. An admin must create the
-  `RELEASE_PLEASE_TOKEN` secret (PAT) or release PRs get no
-  checks; the token lives only in that workflow.
+  published and PRs cannot trigger it. It authenticates with the built-in
+  `GITHUB_TOKEN` (no secret setup required); because pushes made with
+  `GITHUB_TOKEN` do not trigger other workflows, checks on release PRs run
+  once the PR opens.
 
 A `dependency-review` gate is intentionally absent: the action reports the
 repository does not support it until an admin enables Dependency graph

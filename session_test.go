@@ -88,6 +88,7 @@ func testHostConfig() HostConfig {
 		MaxVersion: 1,
 		Policy:     StaticPolicy("test-principal", true),
 		Handler:    echoHandler,
+		Authorize:  AllowAllAuthorize,
 	}
 }
 
@@ -219,12 +220,11 @@ func TestHandshakeDenied(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("server did not reject the handshake")
 	}
-	// The client is stuck awaiting ready; cancelling releases it.
-	cancel()
+	// Handshake denial closes the peer transport and releases the client.
 	select {
 	case <-runErr:
 	case <-time.After(3 * time.Second):
-		t.Fatal("client Run did not return after cancel")
+		t.Fatal("client Run did not return after handshake denial")
 	}
 }
 

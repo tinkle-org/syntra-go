@@ -48,6 +48,8 @@ func (p *handshakeDeadlineTransport) Recv(ctx context.Context) ([]byte, error) {
 	return p.hello, nil
 }
 
+func (p *handshakeDeadlineTransport) Close() error { return nil }
+
 func TestSessionHandshakeIODefaultDeadlines(t *testing.T) {
 	for _, role := range []string{"client", "host"} {
 		for _, phase := range []string{"send", "recv"} {
@@ -452,9 +454,9 @@ func TestSessionHostCloseCancelsExistingConnections(t *testing.T) {
 			if stage == "handler" || stage == "policy" {
 				awaitSignal(t, cancelled, stage+" cancellation")
 			}
-			// The session must leave the caller-owned transport open.
-			if err := b.Send(ctx, []byte("still owned")); err != nil {
-				t.Fatalf("Host.Close closed transport: %v", err)
+			// Host.Close terminates the session-owned transport.
+			if err := b.Send(ctx, []byte("closed")); callCode(t, err) != ErrorCodeUnavailable {
+				t.Fatalf("Host.Close left transport usable: %v", err)
 			}
 			if err := h.Serve(ctx, a); callCode(t, err) != ErrorCodeFailedPrecondition {
 				t.Fatalf("new Serve = %v", err)
@@ -568,12 +570,7 @@ func TestSessionCompletionWinsReadyCancel(t *testing.T) {
 				t.Fatal("missing active connection")
 			}
 			close(releaseHandler)
-			select {
-			case cc := <-hc.completed:
-				hc.completed <- cc // restore the event before resuming Serve
-			case <-time.After(time.Second):
-				t.Fatal("handler did not publish completion")
-			}
+			awaitHostWriterState(t, hc.writer, func(count, _ int, _ bool) bool { return count == 2 })
 			p.send(t, NewCancelFrame(1, 1))
 			release.Do(func() { close(gate.release) })
 			if f := p.recv(t); BodyKindOf(f) != BodyKindNotification {
@@ -648,8 +645,8 @@ func TestSessionHostCloseBoundsNonCooperativeDrain(t *testing.T) {
 	awaitSignal(t, exited, "abandoned callback exit")
 	ctx, stop := context.WithTimeout(context.Background(), 30*time.Millisecond)
 	defer stop()
-	if _, err := p.peer.Recv(ctx); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("late callback sent after Serve exited or closed caller transport: %v", err)
+	if _, err := p.peer.Recv(ctx); callCode(t, err) != ErrorCodeUnavailable {
+		t.Fatalf("late callback sent after Serve exited: %v", err)
 	}
 }
 
@@ -809,16 +806,13 @@ func TestHostAuthorizeUnauthenticatedMapsGeneric(t *testing.T) {
 	}
 }
 
-func TestHostAuthorizeNilLegacyAllowVsDenyAll(t *testing.T) {
-	// Nil Authorize preserves the legacy allow-everything behavior for
-	// backward compatibility (divergent from the Rust fail-closed default).
-	p := newRawSessionPeer(t, testHostConfig(), nil)
-	p.request(t, 1, "/example.Echo/Echo")
-	if f := p.recv(t); !validSuccess(f.GetResult()) {
-		t.Fatalf("nil Authorize must allow (legacy): %v", f)
-	}
-	// DenyAllAuthorize matches the Rust default explicitly.
+func TestHostAuthorizeNilDenyVsExplicitAllow(t *testing.T) {
 	cfg := testHostConfig()
+	cfg.Authorize = nil
+	p := newRawSessionPeer(t, cfg, nil)
+	p.request(t, 1, "/example.Echo/Echo")
+	assertTerminalCode(t, p.recv(t), 1, ErrorCodePermissionDenied)
+	// DenyAllAuthorize matches the Rust default explicitly.
 	cfg.Authorize = DenyAllAuthorize
 	q := newRawSessionPeer(t, cfg, nil)
 	q.request(t, 1, "/example.Echo/Echo")

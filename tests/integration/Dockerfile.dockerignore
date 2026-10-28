@@ -1,0 +1,16 @@
+# Relative to the root build context; exclude unrelated files and credentials.
+**
+!go.mod
+!go.sum
+!*.go
+!gen/**
+!securechannel/**
+!transport/**
+!tests/
+!tests/integration/
+!tests/integration/go.mod
+!tests/integration/go.sum
+!tests/integration/Dockerfile
+!tests/integration/Dockerfile.dockerignore
+!tests/integration/cmd/**
+!tests/integration/internal/**

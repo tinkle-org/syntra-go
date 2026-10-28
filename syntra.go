@@ -12,11 +12,11 @@
 // crates/syntra-ffi/include/syntra_production.h). See README.md for the
 // exact build, link, and test commands.
 //
-// The binding implements the transport-independent core only
-// (specifications/core/{framing,rpc,serialization,errors,handshake}.md and
-// proto/syntra/v1/*.proto). Transports (TCP/WS framing, TLS), identity
-// verification, and application payload schemas belong to the host
-// application. No messenger semantics (subscriptions, presence, JSON
+// The root package implements the transport-independent protocol core.
+// securechannel and transport provide Noise and carrier bindings; connection
+// orchestrates bounded establishment and serving. Identity policy, credential
+// storage and application payload schemas belong to the host application.
+// No messenger semantics (subscriptions, presence, JSON
 // gateways, service registries) are defined here; neutral fixtures such as
 // /example.Echo/Echo exist only in tests.
 package syntra
@@ -234,9 +234,8 @@ func BodyKindOf(f *Frame) BodyKind {
 }
 
 // IsReservedFieldNumber reports whether a raw envelope field number is in
-// the reserved set (16, 17). The codec pre-scan calls this before
-// proto.Unmarshal so a retired application replay operation can never be
-// smuggled back onto the wire (SNTR-SER-008).
+// the reserved set (16, 17). Reserved envelope numbers are rejected on
+// both encoding and decoding (SNTR-SER-008).
 func IsReservedFieldNumber(n int) bool {
 	return n == ReservedFrameFieldNumber16 || n == ReservedFrameFieldNumber17
 }
@@ -520,13 +519,11 @@ func IsAuthFailure(c ErrorCode) bool {
 	}
 }
 
-// IsRetryable reports whether c is safe to retry with backoff without
-// risking a duplicate side effect: Unavailable (effects unknown, retry
-// with an application idempotency key carried in the opaque payload),
-// Aborted (sequence conflict, retry the sequence), and ResourceExhausted
-// (budget exhausted, retry after backoff). DeadlineExceeded and Cancelled
-// are caller-scoped and must not be retried blindly; Internal and DataLoss
-// require operator triage.
+// IsRetryable identifies codes for which an application may consider another
+// attempt with backoff. It does not establish idempotency or authorize replay.
+// Unavailable can leave effects unknown; Aborted requires a new application
+// decision. The caller must establish its operation's retry and deduplication
+// contract before issuing another request.
 func IsRetryable(c ErrorCode) bool {
 	switch NormalizeErrorCode(int32(c)) {
 	case ErrorCodeUnavailable, ErrorCodeAborted, ErrorCodeResourceExhausted:
@@ -859,8 +856,7 @@ func NegotiateVersion(min, max uint32) (uint32, error) {
 // core behind NegotiateVersion: callers that carry a configured server
 // range use this instead of the binding singleton. All four bounds must
 // be nonzero with min <= max per side; disjoint ranges fail as
-// OutOfRange so the caller can distinguish an incompatible peer from a
-// malformed one.
+// FailedPrecondition to distinguish an incompatible peer from malformed input.
 func NegotiateVersionRanges(clientMin, clientMax, serverMin, serverMax uint32) (uint32, error) {
 	if clientMin == 0 || clientMax == 0 {
 		return 0, NewRpcError(ErrorCodeInvalidArgument, "syntra: hello versions must be nonzero")
@@ -883,7 +879,7 @@ func NegotiateVersionRanges(clientMin, clientMax, serverMin, serverMax uint32) (
 		ceiling = serverMax
 	}
 	if ceiling < floor {
-		return 0, NewRpcError(ErrorCodeOutOfRange, fmt.Sprintf("syntra: no version overlap (client [%d,%d], server [%d,%d])", clientMin, clientMax, serverMin, serverMax))
+		return 0, NewRpcError(ErrorCodeFailedPrecondition, fmt.Sprintf("syntra: no version overlap (client [%d,%d], server [%d,%d])", clientMin, clientMax, serverMin, serverMax))
 	}
 	return ceiling, nil
 }
@@ -1352,11 +1348,16 @@ func (t *Tracker) Pending() int {
 	return len(t.pending)
 }
 
-// MarshalFrame encodes f to protobuf binary wire bytes. It validates the
-// frame first so an invalid in-memory value can never be emitted.
+// MarshalFrame encodes f to protobuf binary wire bytes. It validates both
+// the frame value and the emitted wire, including retained unknown fields.
 func MarshalFrame(f *Frame) ([]byte, error) {
 	if err := ValidateFrame(f); err != nil {
 		return nil, err
+	}
+	if hello := f.GetHello(); hello != nil {
+		if err := ValidateCredentialSize(hello.GetCredential()); err != nil {
+			return nil, err
+		}
 	}
 	// Normalize unknown wire codes on emission: an RpcError with an
 	// out-of-range code never escapes; callers branch on code, never on
@@ -1366,11 +1367,17 @@ func MarshalFrame(f *Frame) ([]byte, error) {
 			werr.Code = NormalizeErrorCode(int32(werr.GetCode()))
 		}
 	}
+	if err := ValidateFrameSize(proto.Size(f)); err != nil {
+		return nil, err
+	}
 	out, err := proto.Marshal(f)
 	if err != nil {
 		return nil, NewRpcError(ErrorCodeInternal, fmt.Sprintf("syntra: marshal frame: %v", err))
 	}
 	if err := ValidateFrameSize(len(out)); err != nil {
+		return nil, err
+	}
+	if err := scanFrameTags(out); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -1398,7 +1405,7 @@ func UnmarshalFrame(data []byte) (*Frame, error) {
 		return nil, err
 	}
 	var f Frame
-	if err := proto.Unmarshal(data, &f); err != nil {
+	if err := (proto.UnmarshalOptions{RecursionLimit: 32}).Unmarshal(data, &f); err != nil {
 		return nil, NewRpcError(ErrorCodeInvalidArgument, fmt.Sprintf("syntra: malformed frame: %v", err))
 	}
 	// Match the Rust core's unknown-only classification (SNTR-WIRE-004).
@@ -1412,14 +1419,6 @@ func UnmarshalFrame(data []byte) (*Frame, error) {
 	// successful unmarshal here consumed exactly one Frame.
 	if err := validateFrame(&f, false); err != nil {
 		return nil, err
-	}
-	// Credential size gate before auth: the validator treats credential
-	// content as host policy, but the codec must bound allocation before
-	// the handshake touches the verifier.
-	if hello := f.GetHello(); hello != nil {
-		if err := ValidateCredentialSize(hello.GetCredential()); err != nil {
-			return nil, err
-		}
 	}
 	// Normalize unknown wire codes on receipt per SNTR-ERR-005.
 	if res := f.GetResult(); res != nil {
@@ -1443,7 +1442,7 @@ func scanFrameTags(data []byte) error {
 	raw := data
 	for len(raw) > 0 {
 		num, typ, n := protowire.ConsumeTag(raw)
-		if n < 0 {
+		if n < 0 || !num.IsValid() {
 			return NewRpcError(ErrorCodeInvalidArgument, "syntra: malformed frame tag")
 		}
 		raw = raw[n:]
@@ -1485,11 +1484,8 @@ func scanFrameTags(data []byte) error {
 				return NewRpcError(ErrorCodeInvalidArgument, "syntra: frame has multiple bodies set")
 			}
 			bodySeen = true
-			// Cancel carries no defined fields; any inner bytes are
-			// unknown fields tolerated per SNTR-SER-003 (forward
-			// compatibility), matching the Rust core. Malformed inner
-			// wire still fails in proto.Unmarshal below.
-			if err := scanNested(num, v); err != nil {
+			// The root Frame counts as depth 1, as in UnmarshalOptions.
+			if err := scanNested(num, v, 2); err != nil {
 				return err
 			}
 		default:
@@ -1497,7 +1493,7 @@ func scanFrameTags(data []byte) error {
 			// skip per wire type (SNTR-SER-003). Reserved numbers never
 			// reach here; they are rejected above.
 			var err error
-			raw, err = skipUnknown(raw, typ)
+			raw, err = skipUnknown(raw, num, typ, 1)
 			if err != nil {
 				return err
 			}
@@ -1508,9 +1504,9 @@ func scanFrameTags(data []byte) error {
 
 // skipUnknown consumes one unknown field value per wire type so
 // forward-compatible metadata is tolerated and skipped (SNTR-SER-003).
-// Start/end group types are rejected: groups are deprecated, unbounded,
-// and never appear in Syntra v1.
-func skipUnknown(raw []byte, typ protowire.Type) ([]byte, error) {
+// Groups require matching end tags and share the 32-level message budget.
+// Length-delimited unknown values are opaque, not nested messages.
+func skipUnknown(raw []byte, num protowire.Number, typ protowire.Type, depth int) ([]byte, error) {
 	switch typ {
 	case protowire.VarintType:
 		_, m := protowire.ConsumeVarint(raw)
@@ -1536,32 +1532,69 @@ func skipUnknown(raw []byte, typ protowire.Type) ([]byte, error) {
 			return nil, NewRpcError(ErrorCodeInvalidArgument, "syntra: malformed unknown fixed32 field")
 		}
 		return raw[m:], nil
+	case protowire.StartGroupType:
+		if depth >= 32 {
+			return nil, NewRpcError(ErrorCodeInvalidArgument, "syntra: exceeded max recursion depth")
+		}
+		for len(raw) > 0 {
+			child, childType, n := protowire.ConsumeTag(raw)
+			if n < 0 || !child.IsValid() {
+				return nil, NewRpcError(ErrorCodeInvalidArgument, "syntra: malformed unknown group tag")
+			}
+			raw = raw[n:]
+			if childType == protowire.EndGroupType {
+				if child != num {
+					return nil, NewRpcError(ErrorCodeInvalidArgument, "syntra: mismatched unknown end group")
+				}
+				return raw, nil
+			}
+			var err error
+			raw, err = skipUnknown(raw, child, childType, depth+1)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return nil, NewRpcError(ErrorCodeInvalidArgument, "syntra: unterminated unknown group")
 	default:
 		return nil, NewRpcError(ErrorCodeInvalidArgument, "syntra: unsupported wire type")
 	}
 }
 
-// scanNested validates nested message shapes that carry protocol
-// invariants: hello versions, result oneof cardinality. It mirrors the
-// generated field numbers so malformed inner messages fail closed before
-// allocation-heavy decode.
-func scanNested(body protowire.Number, data []byte) error {
+// scanNested walks every message reachable from Frame: its six bodies and
+// RpcResult.error (body 0). Only declared message fields recurse; strings,
+// payloads, credentials, and length-delimited unknown values stay opaque.
+func scanNested(body protowire.Number, data []byte, depth int) error {
+	if depth > 32 {
+		return NewRpcError(ErrorCodeInvalidArgument, "syntra: exceeded max recursion depth")
+	}
 	switch body {
 	case 10:
-		return scanHello(data)
+		return scanHello(data, depth)
 	case 13:
-		return scanResult(data)
+		return scanResult(data, depth)
 	default:
+		for len(data) > 0 {
+			num, typ, n := protowire.ConsumeTag(data)
+			if n < 0 || !num.IsValid() {
+				return NewRpcError(ErrorCodeInvalidArgument, "syntra: malformed nested message tag")
+			}
+			var err error
+			data, err = skipUnknown(data[n:], num, typ, depth)
+			if err != nil {
+				return err
+			}
+		}
 		return nil
 	}
 }
 
-// scanHello checks ClientHello fields 1, 2, 3 for shape.
-func scanHello(data []byte) error {
+// scanHello checks ClientHello fields 1, 2, 3 for shape and bounds every
+// credential occurrence before protobuf can allocate it, including duplicates.
+func scanHello(data []byte, depth int) error {
 	raw := data
 	for len(raw) > 0 {
 		num, typ, n := protowire.ConsumeTag(raw)
-		if n < 0 {
+		if n < 0 || !num.IsValid() {
 			return NewRpcError(ErrorCodeInvalidArgument, "syntra: malformed hello")
 		}
 		raw = raw[n:]
@@ -1582,16 +1615,19 @@ func scanHello(data []byte) error {
 			if typ != protowire.BytesType {
 				return NewRpcError(ErrorCodeInvalidArgument, "syntra: malformed hello credential")
 			}
-			_, m := protowire.ConsumeBytes(raw)
+			credential, m := protowire.ConsumeBytes(raw)
 			if m < 0 {
 				return NewRpcError(ErrorCodeInvalidArgument, "syntra: malformed hello credential")
+			}
+			if err := ValidateCredentialSize(credential); err != nil {
+				return err
 			}
 			raw = raw[m:]
 		default:
 			// Unknown hello fields are forward-compatible metadata:
 			// skip per wire type (SNTR-SER-003).
 			var err error
-			raw, err = skipUnknown(raw, typ)
+			raw, err = skipUnknown(raw, num, typ, depth)
 			if err != nil {
 				return err
 			}
@@ -1604,12 +1640,12 @@ func scanHello(data []byte) error {
 // most one outcome may appear on the wire. A second outcome alternative
 // is a duplicate body and is rejected here because the generated decoder
 // would silently collapse it into the last one.
-func scanResult(data []byte) error {
+func scanResult(data []byte, depth int) error {
 	raw := data
 	seen := 0
 	for len(raw) > 0 {
 		num, typ, n := protowire.ConsumeTag(raw)
-		if n < 0 {
+		if n < 0 || !num.IsValid() {
 			return NewRpcError(ErrorCodeInvalidArgument, "syntra: malformed result")
 		}
 		raw = raw[n:]
@@ -1618,7 +1654,7 @@ func scanResult(data []byte) error {
 			if typ != protowire.BytesType {
 				return NewRpcError(ErrorCodeInvalidArgument, "syntra: malformed result outcome")
 			}
-			_, m := protowire.ConsumeBytes(raw)
+			value, m := protowire.ConsumeBytes(raw)
 			if m < 0 {
 				return NewRpcError(ErrorCodeInvalidArgument, "syntra: malformed result outcome")
 			}
@@ -1627,11 +1663,16 @@ func scanResult(data []byte) error {
 			if seen > 1 {
 				return NewRpcError(ErrorCodeInvalidArgument, "syntra: result has multiple outcomes")
 			}
+			if num == 2 {
+				if err := scanNested(0, value, depth+1); err != nil {
+					return err
+				}
+			}
 		default:
 			// Unknown result fields are forward-compatible metadata:
 			// skip per wire type (SNTR-SER-003).
 			var err error
-			raw, err = skipUnknown(raw, typ)
+			raw, err = skipUnknown(raw, num, typ, depth)
 			if err != nil {
 				return err
 			}

@@ -24,7 +24,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: '1.26.4'
+          go-version: '1.26.10'
           cache: true
       - name: Formatting
         run: |
@@ -89,7 +89,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: '1.26.4'
+          go-version: '1.26.10'
           cache: true
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
@@ -103,6 +103,8 @@ jobs:
           export LD_LIBRARY_PATH="$LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           go test -mod=readonly -tags syntranative -count=1 ./...
           go test -mod=readonly -tags syntranative -race -count=1 ./...
+          go install honnef.co/go/tools/cmd/staticcheck@2025.1.1
+          staticcheck -tags syntranative ./...
 
   compat:
     runs-on: ubuntu-24.04
@@ -112,7 +114,7 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        go-version: ['1.22', '1.26.4']
+        go-version: ['1.23.12', '1.26.10']
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -145,7 +147,7 @@ jobs:
           CGO_ENABLED: '1'
           GOTOOLCHAIN: local
       - name: Compile-only cross targets (current toolchain only)
-        if: matrix.go-version == '1.26.4'
+        if: matrix.go-version == '1.26.10'
         run: |
           GOOS=linux GOARCH=amd64 go build -mod=readonly ./...
           GOOS=linux GOARCH=arm64 go build -mod=readonly ./...
@@ -164,16 +166,16 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: '1.26.4'
+          go-version: '1.26.10'
           cache: true
       - name: govulncheck (reachable vulnerabilities only)
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
           govulncheck ./...
-      - name: staticcheck (pinned, native tags cover all code)
+      - name: staticcheck (pure-Go backend)
         run: |
           go install honnef.co/go/tools/cmd/staticcheck@2025.1.1
-          staticcheck -tags syntranative ./...
+          staticcheck ./...
 
   fuzz-smoke:
     runs-on: ubuntu-24.04
@@ -186,7 +188,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: '1.26.4'
+          go-version: '1.26.10'
           cache: true
       - name: Seed regression tests
         run: go test -mod=readonly -run 'TestFuzzSeedCorpus|TestReliableFreshReattach|TestReliableForgetUsesCaller' -count=1 -v ./...
@@ -206,7 +208,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: '1.26.4'
+          go-version: '1.26.10'
           cache: true
       - name: Install pinned actionlint
         run: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12

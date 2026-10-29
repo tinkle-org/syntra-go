@@ -1,0 +1,42 @@
+connection/server.go
+  s_98140a4e287002::t_3c7bae462c8ea3 190-207
+  s_98140a4e287002::t_db704ffab8a565 6,10
+  s_98140a4e287002::t_448df611e98013 144-145,155-172,174
+SECURITY.md
+  s_98140a4e287002::t_17133e9995acb2 27-30
+  s_98140a4e287002::t_bde6f2c4a4c350 61-62
+  s_98140a4e287002::t_615e6d97218f98 105-106
+AUDIT.md
+  s_98140a4e287002::t_f151821f2af544 277-279
+SC1.md
+  s_98140a4e287002::t_2cf69f435d30f2 219-222
+  s_98140a4e287002::t_5a1234407bbeed 107-111
+transport/websocket/websocket.go
+  s_98140a4e287002::t_399626ae51788a 98-100
+  s_98140a4e287002::t_0548c6f91badf9 30-31
+.github/workflows/scheduled.yml
+  s_98140a4e287002::t_d36403b5449e54 42-45,50-56,61-65,74-77
+connection/client.go
+  s_98140a4e287002::t_5fabb293c784a7 119-120
+securechannel/channel.go
+  s_98140a4e287002::t_30dd8b8c34da02 99-101
+securechannel/channel_test.go
+  s_98140a4e287002::t_2723fb87c684ae 836,840-841
+  s_98140a4e287002::t_8272e57a2146f5 842
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "fb635437576274ef6ea1ccce96ab732fb903f38e",
+  "prompts": {},
+  "sessions": {
+    "s_98140a4e287002": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e7ac8416effe9ZpHZWldbQiZwz",
+        "model": "muse-spark-1.3-contributor"
+      },
+      "human_author": "oscarlaw <oscarlaw2010@gmail.com>"
+    }
+  }
+}

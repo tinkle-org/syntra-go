@@ -71,6 +71,7 @@ type goClientCore struct {
 	negotiated    uint32
 	active        bool
 	closed        bool
+	helloEmitted  bool
 	tracker       *Tracker
 	outcomes      map[uint64]*RpcResult
 	notifications []*Notification
@@ -85,6 +86,11 @@ func (g *goClientCore) helloFrame() ([]byte, error) {
 	if g.closed {
 		return nil, NewRpcError(ErrorCodeFailedPrecondition, "syntra: client closed")
 	}
+	if g.helloEmitted {
+		return nil, NewRpcError(ErrorCodeFailedPrecondition, "syntra: hello already emitted")
+	}
+	g.helloEmitted = true
+	defer func() { g.cfg.credential = nil }()
 	hello := &ClientHello{
 		MinVersion: g.cfg.minVersion,
 		MaxVersion: g.cfg.maxVersion,
@@ -108,7 +114,7 @@ func (g *goClientCore) activate(frame []byte) (*ServerReady, error) {
 	if g.active {
 		return nil, NewRpcError(ErrorCodeFailedPrecondition, "syntra: client already active")
 	}
-	f, err := UnmarshalFrame(frame)
+	f, err := unmarshalSessionFrame(frame)
 	if err != nil {
 		return nil, err
 	}
@@ -120,7 +126,7 @@ func (g *goClientCore) activate(frame []byte) (*ServerReady, error) {
 	}
 	v := f.GetVersion()
 	if v < g.cfg.minVersion || v > g.cfg.maxVersion {
-		return nil, NewRpcError(ErrorCodeUnimplemented, "syntra: server selected version outside proposed range")
+		return nil, NewRpcError(ErrorCodeFailedPrecondition, "syntra: server selected version outside proposed range")
 	}
 	if err := ValidateReady(f.GetReady()); err != nil {
 		return nil, err
@@ -145,7 +151,7 @@ func (g *goClientCore) onFrame(frame []byte) (terminal []uint64, notifications i
 	if !g.active {
 		return nil, 0, NewRpcError(ErrorCodeFailedPrecondition, "syntra: frame before handshake completed")
 	}
-	f, err := UnmarshalFrame(frame)
+	f, err := unmarshalSessionFrame(frame)
 	if err != nil {
 		var rerr *RpcError
 		if asErr(err, &rerr) {
@@ -154,7 +160,7 @@ func (g *goClientCore) onFrame(frame []byte) (terminal []uint64, notifications i
 		return nil, 0, NewRpcError(ErrorCodeInvalidArgument, "syntra: malformed frame")
 	}
 	if f.GetVersion() != g.negotiated {
-		return nil, 0, NewRpcError(ErrorCodeInvalidArgument, "syntra: frame version mismatch")
+		return nil, 0, NewRpcError(ErrorCodeFailedPrecondition, "syntra: frame version mismatch")
 	}
 	switch BodyKindOf(f) {
 	case BodyKindResult:
@@ -188,6 +194,8 @@ func (g *goClientCore) onFrame(frame []byte) (terminal []uint64, notifications i
 		}
 		g.notifications = append(g.notifications, f.GetNotification())
 		return nil, 1, nil
+	case BodyKindHello, BodyKindReady:
+		return nil, 0, NewRpcError(ErrorCodeFailedPrecondition, "syntra: re-handshake on the same connection is forbidden")
 	default:
 		return nil, 0, NewRpcError(ErrorCodeInvalidArgument, "syntra: unexpected frame for client")
 	}
@@ -290,13 +298,18 @@ func (g *goClientCore) close() error {
 		return NewRpcError(ErrorCodeFailedPrecondition, "syntra: client already closed")
 	}
 	g.closed = true
+	g.cfg.credential = nil
+	g.notifications = nil
+	g.outcomes = nil
+	g.tracker = NewTracker()
 	return nil
 }
 
 // hostCall is one outstanding responder-side call.
 type hostCall struct {
-	deadline  time.Time
-	cancelled bool
+	deadline    time.Time
+	cancelled   bool
+	completedAt time.Time
 }
 
 type pendingReq struct {
@@ -308,6 +321,8 @@ type pendingReq struct {
 // shared outbound backlog. Terminal RPC results remain admissible at capacity.
 // Each frame is also bounded by MaxFrameBytes.
 const hostNotificationBacklogLimit = 256
+
+const hostNotificationBacklogBytes = 8 * MaxFrameBytes
 
 // goHostCore is the pure-Go responder core for one connection.
 type goHostCore struct {
@@ -328,7 +343,7 @@ func (g *goHostCore) acceptHello(frame []byte) (uint32, error) {
 	if g.closed {
 		return 0, NewRpcError(ErrorCodeFailedPrecondition, "syntra: host closed")
 	}
-	f, err := UnmarshalFrame(frame)
+	f, err := unmarshalSessionFrame(frame)
 	if err != nil {
 		return 0, err
 	}
@@ -375,7 +390,7 @@ func (g *goHostCore) onFrame(frame []byte) ([][]byte, []uint64, *RpcError) {
 	if g.closed {
 		return nil, nil, NewRpcError(ErrorCodeFailedPrecondition, "syntra: host closed")
 	}
-	f, err := UnmarshalFrame(frame)
+	f, err := unmarshalSessionFrame(frame)
 	if err != nil {
 		// Undecodable bytes carry no routable request ID, so no
 		// per-RPC error can be addressed; fail the connection closed
@@ -392,7 +407,7 @@ func (g *goHostCore) onFrame(frame []byte) ([][]byte, []uint64, *RpcError) {
 		return nil, nil, NewRpcError(ErrorCodeFailedPrecondition, "syntra: frame before handshake completed")
 	}
 	if f.GetVersion() != g.negotiated {
-		return nil, nil, NewRpcError(ErrorCodeInvalidArgument, "syntra: frame version mismatch")
+		return nil, nil, NewRpcError(ErrorCodeFailedPrecondition, "syntra: frame version mismatch")
 	}
 	switch BodyKindOf(f) {
 	case BodyKindRequest:
@@ -482,6 +497,9 @@ func (g *goHostCore) answer(requestID uint64, result *RpcResult) ([]byte, bool, 
 		return nil, false, err
 	}
 	now := time.Now()
+	if !call.completedAt.IsZero() {
+		now = call.completedAt
+	}
 	if !now.Before(call.deadline) {
 		delete(g.outstanding, requestID)
 		g.outbound = append(g.outbound, mustMarshal(NewResultFrame(g.negotiated, requestID, NewWireErrorResult(ErrorCodeDeadlineExceeded, "syntra: deadline exceeded"))))
@@ -523,6 +541,13 @@ func (g *goHostCore) notify(payload []byte) error {
 	if err != nil {
 		return err
 	}
+	bytes := len(raw)
+	for _, frame := range g.outbound {
+		bytes += len(frame)
+	}
+	if bytes > hostNotificationBacklogBytes {
+		return NewRpcError(ErrorCodeResourceExhausted, "syntra: outbound notification byte backlog full")
+	}
 	g.outbound = append(g.outbound, raw)
 	return nil
 }
@@ -550,6 +575,9 @@ func (g *goHostCore) reapExpired(now time.Time) []uint64 {
 	}
 	var expired []uint64
 	for id, call := range g.outstanding {
+		if !call.completedAt.IsZero() && call.completedAt.Before(call.deadline) {
+			continue
+		}
 		if !now.Before(call.deadline) {
 			expired = append(expired, id)
 		}
@@ -561,6 +589,14 @@ func (g *goHostCore) reapExpired(now time.Time) []uint64 {
 	return expired
 }
 
+func (g *goHostCore) recordCompletion(id uint64, at time.Time) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if call := g.outstanding[id]; call != nil && call.completedAt.IsZero() {
+		call.completedAt = at
+	}
+}
+
 func (g *goHostCore) close() error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -568,6 +604,9 @@ func (g *goHostCore) close() error {
 		return NewRpcError(ErrorCodeFailedPrecondition, "syntra: host already closed")
 	}
 	g.closed = true
+	g.pending = nil
+	g.outbound = nil
+	g.outstanding = nil
 	return nil
 }
 
@@ -582,8 +621,7 @@ func mustMarshal(f *Frame) []byte {
 	return raw
 }
 
-// asErr reports whether err is a *RpcError without importing errors
-// into this core file; session.go uses errors.As directly.
+// asErr reports whether err is a *RpcError.
 func asErr(err error, target **RpcError) bool {
 	if err == nil {
 		return false

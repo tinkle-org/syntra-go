@@ -222,7 +222,7 @@ func TestDuplicateBodies(t *testing.T) {
 	})
 }
 
-// TestReservedFields rejects retired numbers 16/17 and names
+// TestReservedFields enforces reserved envelope numbers 16/17 and names
 // event/resume/ack (SNTR-SER-008).
 func TestReservedFields(t *testing.T) {
 	t.Run("field-16", func(t *testing.T) {

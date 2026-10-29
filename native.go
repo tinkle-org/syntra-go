@@ -15,7 +15,7 @@ package syntra
 // The authoritative header is crates/syntra-ffi/include/syntra_production.h.
 // Default Rust builds export no C ABI; the test-fixture feature exports a
 // separate syntra_* loopback ABI for native tests only.
-// CI runs the default tags and this adapter (see repo-validation.yml).
+// CI runs the default tags and this adapter (see .github/workflows/go.yml).
 //
 // Buffer ownership:
 //   - `const uint8_t*` inputs are BORROWED: the library copies what it

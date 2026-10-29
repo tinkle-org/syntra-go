@@ -1,0 +1,54 @@
+name: Benchmarks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmarks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      CGO_ENABLED: '0'
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: '1.26.10'
+          cache: true
+      - name: Root-module wire, session and SC1 samples (report only)
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/syntra-benchmarks"
+          {
+            git rev-parse HEAD
+            go version
+            go test -mod=readonly -run '^$' -bench . -benchmem -count=3 -benchtime=100ms -cpu=1,4 -timeout=10m ./...
+          } | tee "$RUNNER_TEMP/syntra-benchmarks/benchmarks.txt"
+          python3 - "$RUNNER_TEMP/syntra-benchmarks/benchmarks.txt" <<'PY'
+          import pathlib, re, sys
+          output = pathlib.Path(sys.argv[1]).read_text()
+          if re.search(r"--- FAIL:|^FAIL\b|^panic:", output, re.MULTILINE):
+              sys.exit("benchmark output contains a failed sample")
+          PY
+      - name: Upload benchmark samples
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: benchmarks
+          path: ${{ runner.temp }}/syntra-benchmarks/benchmarks.txt
+          if-no-files-found: ignore
+          retention-days: 14

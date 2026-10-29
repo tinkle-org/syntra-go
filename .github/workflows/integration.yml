@@ -1,0 +1,54 @@
+name: Integration
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: tests/integration
+    env:
+      CGO_ENABLED: '0'
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: '1.26.10'
+          cache: true
+          cache-dependency-path: |
+            go.sum
+            tests/integration/go.sum
+      - name: Verify isolated module
+        run: go mod verify
+      - name: Check integration tooling vulnerabilities
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
+          govulncheck -test ./...
+      - name: SC1 integration (Docker required)
+        env:
+          SYNTRA_INTEGRATION_LOG_DIR: ${{ runner.temp }}/syntra-integration-logs
+        run: go test -mod=readonly -count=1 -timeout=10m -v ./...
+      - name: Upload bounded fixture logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: integration-logs
+          path: ${{ runner.temp }}/syntra-integration-logs/*.log
+          if-no-files-found: ignore
+          retention-days: 7

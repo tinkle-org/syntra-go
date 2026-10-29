@@ -202,7 +202,7 @@ func TestDirectedDeliveryTargeted(t *testing.T) {
 	mkHost := func() *Host {
 		t.Helper()
 		h, err := OpenHost(HostConfig{
-			MinVersion: 1, MaxVersion: 1, Policy: policy, Handler: echoHandler,
+			MinVersion: 1, MaxVersion: 1, Policy: policy, Handler: echoHandler, Authorize: AllowAllAuthorize,
 		})
 		if err != nil {
 			t.Fatal(err)

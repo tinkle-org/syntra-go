@@ -3,9 +3,9 @@
 // primitives in syntra.go.
 //
 // A Transport carries exactly one serialized Frame per Send/Recv call in
-// each direction. This binding does not dial TCP/TLS or WebSocket: the
-// host application owns the socket and plugs it in here (length-prefix,
-// binary-message, and close-code bindings per specifications/transports).
+// each direction. The transport/tcp and transport/websocket packages provide
+// bounded secure connectivity; connection orchestrates dialing and serving.
+// Hosts may also supply transports that obey the same complete-frame contract.
 // LoopbackPair provides an in-memory Transport for tests and embedding.
 //
 // Both Client and Host delegate state (handshake machine, correlation,
@@ -33,6 +33,7 @@ import (
 	"time"
 
 	syntrav1 "github.com/tinkle-org/syntra-go/gen/syntra/v1"
+	"google.golang.org/protobuf/encoding/protowire"
 )
 
 // Transport carries serialized Syntra Frames. Each Send transmits exactly
@@ -42,13 +43,32 @@ import (
 // sizes and contents; transports MUST still bound allocation on receive.
 type Transport interface {
 	// Send transmits one serialized Frame. It MUST copy frame if it
-	// retains it.
+	// retains it and return promptly when ctx ends.
 	Send(ctx context.Context, frame []byte) error
 	// Recv returns the next inbound serialized Frame. It returns an
 	// error when the transport is closed and drained or ctx ends.
 	Recv(ctx context.Context) ([]byte, error)
-	// Close releases the transport. It is idempotent.
+	// Close releases the transport and interrupts pending I/O. It is idempotent.
 	Close() error
+}
+
+// ownedTransport gives each running session exactly one terminal close.
+type ownedTransport struct {
+	Transport
+	once sync.Once
+	err  error
+}
+
+func (t *ownedTransport) Close() error {
+	t.once.Do(func() { t.err = t.Transport.Close() })
+	return t.err
+}
+
+func (t *ownedTransport) ChannelIdentity() (ChannelIdentity, bool) {
+	if provider, ok := t.Transport.(ChannelIdentityProvider); ok {
+		return provider.ChannelIdentity()
+	}
+	return ChannelIdentity{}, false
 }
 
 // loopback is an in-memory Transport. Frames cross by value (Send copies)
@@ -178,16 +198,11 @@ func StaticPolicy(principal string, allowEmpty bool) CredentialPolicy {
 // (nil, nil) is a handler bug and is reported as INTERNAL.
 type HandlerFunc func(ctx context.Context, req *RpcRequest) (*RpcResult, error)
 
-// AuthorizeFunc is the optional host-owned per-method policy, evaluated
+// AuthorizeFunc is the host-owned per-method policy, evaluated
 // for every RPC using the connection's bound principal, before handler
 // effects. Implementations must be nonblocking and may re-check
-// expiry/revocation here. A nil Authorize preserves the legacy
-// allow-everything behavior for backward compatibility; set it explicitly
-// for parity with the Rust Host, whose Handler::authorize default is
-// fail-closed deny. Divergence tracking: nil (Go allow) vs default-deny
-// (Rust) is intentional until callers opt into an explicit policy; pass
-// DenyAllAuthorize to match the Rust default, or a principal-aware func
-// to allow selected methods. Only generic Unauthenticated
+// expiry/revocation here. A nil Authorize selects DenyAllAuthorize.
+// Only generic Unauthenticated
 // ("syntra: credential not accepted") and PermissionDenied
 // ("syntra: access denied") codes/messages reach the wire, so policy
 // internals never leak (SNTR-ERR-003). Returning Unauthenticated signals
@@ -207,7 +222,7 @@ func DenyAllAuthorize(ctx context.Context, principal string, method string) erro
 	return NewRpcError(ErrorCodePermissionDenied, "syntra: access denied")
 }
 
-// AllowAllAuthorize documents an explicit opt-in to the legacy permissive
+// AllowAllAuthorize documents an explicit opt-in to the permissive
 // posture (every bound principal may invoke every method). It exists so
 // call sites can state the allow-all choice instead of leaving
 // HostConfig.Authorize nil by accident.
@@ -225,7 +240,8 @@ func AllowAllAuthorize(ctx context.Context, principal string, method string) err
 // after close reports, and report FailedPrecondition once closed.
 type clientCore interface {
 	// helloFrame returns the hello frame to transmit. It fails closed on
-	// invalid config (empty version range, oversize credential).
+	// invalid config (empty version range, oversize credential). The session
+	// calls it once and releases its Go credential references after emission.
 	helloFrame() ([]byte, error)
 	// activate validates the ServerReady frame, pins the negotiated
 	// version, and moves the session to ACTIVE.
@@ -319,7 +335,7 @@ type activatedReady struct {
 // proposed range and returns the selected version. Shared handshake
 // acceptance for both cores (pure-Go default and syntranative native).
 func activateFrame(frame []byte, minVersion, maxVersion uint32) (*activatedReady, error) {
-	f, err := UnmarshalFrame(frame)
+	f, err := unmarshalSessionFrame(frame)
 	if err != nil {
 		return nil, err
 	}
@@ -331,7 +347,7 @@ func activateFrame(frame []byte, minVersion, maxVersion uint32) (*activatedReady
 	}
 	v := f.GetVersion()
 	if v < minVersion || v > maxVersion {
-		return nil, NewRpcError(ErrorCodeUnimplemented, "syntra: server selected version outside proposed range")
+		return nil, NewRpcError(ErrorCodeFailedPrecondition, "syntra: server selected version outside proposed range")
 	}
 	if err := ValidateReady(f.GetReady()); err != nil {
 		return nil, err
@@ -339,38 +355,58 @@ func activateFrame(frame []byte, minVersion, maxVersion uint32) (*activatedReady
 	return &activatedReady{ready: f.GetReady(), frameVersion: v}, nil
 }
 
-// decodeResultFrame validates owned result-frame bytes from a core into
-// the terminal RpcResult. Unknown wire error codes normalize to UNKNOWN
-// (SNTR-ERR-005); a missing outcome is INVALID_ARGUMENT, never success.
-func decodeResultFrame(raw []byte) (*RpcResult, error) {
+// unmarshalSessionFrame gives unsupported runtime envelope versions the
+// connection-state error code. Stateless codec validation retains its own
+// OUT_OF_RANGE contract.
+func unmarshalSessionFrame(raw []byte) (*Frame, error) {
 	f, err := UnmarshalFrame(raw)
-	if err != nil {
-		return nil, err
+	var rpcErr *RpcError
+	if errors.As(err, &rpcErr) && rpcErr.Code == ErrorCodeOutOfRange {
+		return nil, NewRpcError(ErrorCodeFailedPrecondition, "syntra: unsupported session version")
 	}
-	if BodyKindOf(f) != BodyKindResult {
-		return nil, NewRpcError(ErrorCodeInvalidArgument, "syntra: expected result frame")
-	}
-	res := f.GetResult()
-	if err := ValidateResult(res); err != nil {
-		return nil, err
-	}
-	return res, nil
+	return f, err
 }
 
-// decodeNotificationFrame validates owned notification-frame bytes from
-// a core into the event payload.
-func decodeNotificationFrame(raw []byte) (*Notification, error) {
-	f, err := UnmarshalFrame(raw)
-	if err != nil {
-		return nil, err
+func validateActiveSessionFrame(raw []byte, version uint32) error {
+	if err := ValidateFrameSize(len(raw)); err != nil {
+		return err
 	}
-	if BodyKindOf(f) != BodyKindNotification {
-		return nil, NewRpcError(ErrorCodeInvalidArgument, "syntra: expected notification frame")
+	if err := scanFrameTags(raw); err != nil {
+		return err
 	}
-	if f.GetNotification() == nil {
-		return nil, NewRpcError(ErrorCodeInvalidArgument, "syntra: nil notification")
+	// Read only the phase header here. The core immediately performs full
+	// decoding and semantic validation before admitting any effects. Avoid
+	// constructing and copying a second Protobuf message in the session loop.
+	var wireVersion uint64
+	var body protowire.Number
+	for len(raw) != 0 {
+		num, typ, n := protowire.ConsumeTag(raw)
+		raw = raw[n:] // scanFrameTags has validated all tags and values.
+		if num == 1 {
+			v, n := protowire.ConsumeVarint(raw)
+			wireVersion = v
+			raw = raw[n:]
+			continue
+		}
+		if num >= 10 && num <= 15 {
+			body = num
+		}
+		var err error
+		raw, err = skipUnknown(raw, num, typ, 1)
+		if err != nil {
+			return err
+		}
 	}
-	return f.GetNotification(), nil
+	if wireVersion == 0 {
+		return NewRpcError(ErrorCodeInvalidArgument, "syntra: version 0 is never negotiated")
+	}
+	if wireVersion != uint64(version) {
+		return NewRpcError(ErrorCodeFailedPrecondition, "syntra: frame version mismatch")
+	}
+	if body == 10 || body == 11 {
+		return NewRpcError(ErrorCodeFailedPrecondition, "syntra: re-handshake on the same connection is forbidden")
+	}
+	return nil
 }
 
 // resolvedClientConfig is a ClientConfig with defaults applied.
@@ -392,6 +428,8 @@ type ClientConfig struct {
 	MaxVersion uint32
 	// Credential is the opaque hello credential. Empty is an attempt
 	// subject to host policy, not a parse error; oversize fails fast.
+	// OpenClient copies it; callers retain ownership of their input buffer.
+	// Go credential references are released after hello emission or Close.
 	Credential []byte
 	// DefaultTimeout applies when a call passes timeoutMs zero. Zero
 	// selects DefaultRPCTimeout. Negative or above MaxRPCTimeoutMs fails fast.
@@ -412,7 +450,6 @@ func resolveClientConfig(cfg ClientConfig) (resolvedClientConfig, error) {
 	out := resolvedClientConfig{
 		minVersion:   cfg.MinVersion,
 		maxVersion:   cfg.MaxVersion,
-		credential:   cfg.Credential,
 		timeout:      cfg.DefaultTimeout,
 		maxPending:   cfg.MaxConcurrent,
 		notifyBuffer: cfg.NotifyBuffer,
@@ -426,7 +463,7 @@ func resolveClientConfig(cfg ClientConfig) (resolvedClientConfig, error) {
 	if out.minVersion > out.maxVersion {
 		return resolvedClientConfig{}, NewRpcError(ErrorCodeInvalidArgument, "syntra: client min_version exceeds max_version")
 	}
-	if err := ValidateCredentialSize(out.credential); err != nil {
+	if err := ValidateCredentialSize(cfg.Credential); err != nil {
 		return resolvedClientConfig{}, err
 	}
 	if out.timeout == 0 {
@@ -456,6 +493,7 @@ func resolveClientConfig(cfg ClientConfig) (resolvedClientConfig, error) {
 	if out.notifyBuffer < 1 {
 		return resolvedClientConfig{}, NewRpcError(ErrorCodeInvalidArgument, "syntra: notify buffer must be positive")
 	}
+	out.credential = append([]byte(nil), cfg.Credential...)
 	return out, nil
 }
 
@@ -490,6 +528,7 @@ type Client struct {
 	coreCachedDropped atomic.Uint64
 	coreCachedBytes   atomic.Uint64
 	transport         Transport
+	transportOwner    *ownedTransport
 	// Serializes frame ingestion (the only core loss producer) with the
 	// final loss snapshot and destruction. Never held while waiting for Run
 	// or while publishing notifications; Close may interrupt delivery.
@@ -687,12 +726,16 @@ func (c *Client) handshake(ctx context.Context, t Transport) (*ServerReady, erro
 	ctx, stop := context.WithTimeout(ctx, sessionHandshakeTimeout)
 	defer stop()
 	hello, err := c.core.helloFrame()
+	c.mu.Lock()
+	c.cfg.credential = nil
+	c.mu.Unlock()
 	if err != nil {
 		return nil, err
 	}
 	if err := t.Send(ctx, hello); err != nil {
 		return nil, err
 	}
+	hello = nil
 	raw, err := t.Recv(ctx)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -718,7 +761,8 @@ func (c *Client) handshake(ctx context.Context, t Transport) (*ServerReady, erro
 // returns nil only on a clean shutdown (Close or ctx end with no
 // outstanding violation); transport and protocol failures are returned.
 // Call Run once per Client in its own goroutine; concurrent Calls share
-// the pump. The handshake has a five-second deadline, shortened by ctx;
+// the pump. Run owns t and closes it on every terminal path, including
+// handshake failure. The handshake has a five-second deadline, shortened by ctx;
 // that deadline does not limit the activated connection's lifetime.
 func (c *Client) Run(ctx context.Context, t Transport) error {
 	if c == nil {
@@ -733,13 +777,21 @@ func (c *Client) Run(ctx context.Context, t Transport) error {
 		c.mu.Unlock()
 		return NewRpcError(ErrorCodeFailedPrecondition, "syntra: client already running")
 	}
+	if t == nil {
+		c.mu.Unlock()
+		return NewRpcError(ErrorCodeInvalidArgument, "syntra: nil transport")
+	}
 	c.transport = t
+	c.transportOwner = &ownedTransport{Transport: t}
+	t = c.transportOwner
 	c.mu.Unlock()
 
 	// Close also interrupts a handshake blocked in transport I/O.
 	runCtx, stop := context.WithCancel(ctx)
-	defer stop()
+	watchDone := make(chan struct{})
+	defer func() { stop(); <-watchDone }()
 	go func() {
+		defer close(watchDone)
 		select {
 		case <-c.done:
 			stop()
@@ -747,7 +799,9 @@ func (c *Client) Run(ctx context.Context, t Transport) error {
 		}
 	}()
 	defer func() {
+		_ = t.Close()
 		c.mu.Lock()
+		c.cfg.credential = nil
 		closeCore := !c.closed
 		if closeCore {
 			c.closed = true
@@ -766,7 +820,15 @@ func (c *Client) Run(ctx context.Context, t Transport) error {
 		}
 	}()
 	if _, err := c.handshake(runCtx, t); err != nil {
-		return err
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		select {
+		case <-c.done:
+			return nil
+		default:
+			return err
+		}
 	}
 	c.mu.Lock()
 	if c.closed {
@@ -810,18 +872,26 @@ const handlerShutdownGrace = time.Second
 // stream, and reaps expired calls on a tick so budgets fire even when
 // the peer goes silent.
 func (c *Client) pump(ctx context.Context, t Transport) error {
-	pumpCtx, pumpStop := context.WithCancel(context.Background())
-	defer pumpStop()
+	pumpCtx, pumpStop := context.WithCancel(ctx)
+	watchDone := make(chan struct{})
 	go func() {
+		defer close(watchDone)
 		select {
-		case <-ctx.Done():
-			pumpStop()
+		case <-pumpCtx.Done():
 		case <-c.done:
 			pumpStop()
 		}
 	}()
 	recvCh := make(chan recvResult, 1)
+	recvDone := make(chan struct{})
+	defer func() {
+		pumpStop()
+		_ = t.Close()
+		<-recvDone
+		<-watchDone
+	}()
 	go func() {
+		defer close(recvDone)
 		for {
 			raw, err := t.Recv(pumpCtx)
 			select {
@@ -844,6 +914,14 @@ func (c *Client) pump(ctx context.Context, t Transport) error {
 			return nil
 		case r := <-recvCh:
 			if r.err != nil {
+				if ctx.Err() != nil {
+					return nil
+				}
+				select {
+				case <-c.done:
+					return nil
+				default:
+				}
 				if errors.Is(r.err, context.Canceled) || errors.Is(r.err, context.DeadlineExceeded) {
 					return nil
 				}
@@ -867,6 +945,14 @@ func (c *Client) pump(ctx context.Context, t Transport) error {
 			if closed {
 				c.coreLifecycleMu.Unlock()
 				return nil
+			}
+			if err := validateActiveSessionFrame(r.raw, c.core.version()); err != nil {
+				c.coreLifecycleMu.Unlock()
+				var rpcErr *RpcError
+				if errors.As(err, &rpcErr) {
+					c.failWaiters(rpcErr.Code, rpcErr.Message)
+				}
+				return err
 			}
 			terminal, n, fatal := c.core.onFrame(r.raw)
 			c.coreLifecycleMu.Unlock()
@@ -1120,8 +1206,8 @@ func mapContextErr(err error) *RpcError {
 // Close deterministically releases the session: in-flight calls complete
 // with UNAVAILABLE, the notification stream closes, and the core is
 // destroyed exactly once. A second Close reports FailedPrecondition so
-// double-close bugs surface instead of passing. Close does not close the
-// Transport; its owner retains that.
+// double-close bugs surface instead of passing. Close also closes the owned
+// Transport, interrupting pending reads and writes.
 func (c *Client) Close() error {
 	if c == nil {
 		return NewRpcError(ErrorCodeInternal, "syntra: nil client")
@@ -1132,24 +1218,31 @@ func (c *Client) Close() error {
 		return NewRpcError(ErrorCodeFailedPrecondition, "syntra: client already closed")
 	}
 	c.closed = true
+	c.cfg.credential = nil
+	t := c.transportOwner
 	c.failWaitersLocked(ErrorCodeUnavailable, "syntra: client closed")
 	close(c.done)
 	if !c.pumpStarted {
 		close(c.notifyCh)
 	}
 	c.mu.Unlock()
+	if t != nil {
+		_ = t.Close()
+	}
 	return c.closeCore()
 }
 
 // resolvedHostConfig is a HostConfig with defaults applied.
 type resolvedHostConfig struct {
-	minVersion uint32
-	maxVersion uint32
-	policy     CredentialPolicy
-	handler    HandlerFunc
-	authorize  AuthorizeFunc
-	timeout    time.Duration
-	maxPending int
+	minVersion    uint32
+	maxVersion    uint32
+	policy        CredentialPolicy
+	channelPolicy ChannelPolicy
+	handler       HandlerFunc
+	authorize     AuthorizeFunc
+	timeout       time.Duration
+	maxPending    int
+	writeTimeout  time.Duration
 }
 
 // HostConfig configures a Host session factory. Each Serve call opens one
@@ -1161,16 +1254,18 @@ type HostConfig struct {
 	// MaxVersion is the highest version the host emits.
 	MaxVersion uint32
 	// Policy verifies hello credentials and returns the principal to
-	// bind. Nil denies every handshake as Unauthenticated.
+	// bind when ChannelPolicy is unset. Nil denies these handshakes as
+	// Unauthenticated.
 	Policy CredentialPolicy
-	// Handler dispatches validated requests. Nil answers every request
-	// UNIMPLEMENTED (no method is known).
+	// ChannelPolicy verifies a freshly confirmed transport channel identity and
+	// hello credential. When set, it replaces Policy and requires a confirmed
+	// ChannelIdentityProvider. It must return a nonempty principal.
+	ChannelPolicy ChannelPolicy
+	// Handler dispatches authorized, validated requests. Nil answers authorized
+	// requests UNIMPLEMENTED (no method is known).
 	Handler HandlerFunc
-	// Authorize is the optional per-method policy evaluated with the
-	// bound principal before handler effects. Nil preserves the legacy
-	// allow-everything behavior for backward compatibility and diverges
-	// from the Rust Host fail-closed default; set DenyAllAuthorize to
-	// match Rust, or a principal-aware func to allow selected methods.
+	// Authorize is the per-method policy evaluated with the bound principal
+	// before handler effects. Nil selects DenyAllAuthorize.
 	Authorize AuthorizeFunc
 	// DefaultTimeout applies when a request passes timeoutMs zero. Zero
 	// selects DefaultRPCTimeout. Negative or above MaxRPCTimeoutMs fails fast.
@@ -1182,17 +1277,35 @@ type HostConfig struct {
 	// OutOfRange. Excess calls fail with ResourceExhausted while
 	// the connection stays usable.
 	MaxConcurrent int
+	// WriteTimeout bounds each post-handshake transport Send. Zero selects
+	// five seconds. A failed or timed-out write terminates the connection.
+	// One writer sends FIFO snapshots independently of the session loop.
+	// Queued plus active writes are capped at 256 frames and 8 MiB per
+	// connection; saturation terminates Serve with RESOURCE_EXHAUSTED.
+	// Transports must honor their contexts and interrupt I/O on Close.
+	WriteTimeout time.Duration
 }
 
 func resolveHostConfig(cfg HostConfig) (resolvedHostConfig, error) {
 	out := resolvedHostConfig{
-		minVersion: cfg.MinVersion,
-		maxVersion: cfg.MaxVersion,
-		policy:     cfg.Policy,
-		handler:    cfg.Handler,
-		authorize:  cfg.Authorize,
-		timeout:    cfg.DefaultTimeout,
-		maxPending: cfg.MaxConcurrent,
+		minVersion:    cfg.MinVersion,
+		maxVersion:    cfg.MaxVersion,
+		policy:        cfg.Policy,
+		channelPolicy: cfg.ChannelPolicy,
+		handler:       cfg.Handler,
+		authorize:     cfg.Authorize,
+		timeout:       cfg.DefaultTimeout,
+		maxPending:    cfg.MaxConcurrent,
+		writeTimeout:  cfg.WriteTimeout,
+	}
+	if out.authorize == nil {
+		out.authorize = DenyAllAuthorize
+	}
+	if out.writeTimeout == 0 {
+		out.writeTimeout = 5 * time.Second
+	}
+	if out.writeTimeout < 0 {
+		return resolvedHostConfig{}, NewRpcError(ErrorCodeInvalidArgument, "syntra: host write timeout must be positive")
 	}
 	if out.minVersion == 0 {
 		out.minVersion = MinSupportedVersion
@@ -1249,6 +1362,174 @@ type hostConn struct {
 	completed chan *callCancel   // bounded by maxPending, including abandoned workers
 	workers   int                // Serve-owned; released only when the callback actually returns
 	principal string             // bound at handshake; used by Authorize before handler effects
+	version   uint32             // negotiated once during handshake
+	transport Transport          // owned by Serve; Close interrupts I/O
+	writer    *hostWriter        // created after ready; only Serve admits frames
+}
+
+const (
+	hostWriterMaxFrames = 256
+	hostWriterMaxBytes  = 8 << 20
+	hostWriterDrainTime = 200 * time.Millisecond
+	hostWriterJoinTime  = time.Second
+)
+
+// hostWriter is the sole post-handshake sender. enqueue snapshots serialized
+// bytes, so even a core returning borrowed storage cannot change a queued frame.
+// Admission is nonblocking and FIFO. count/bytes include the active Send until
+// it returns; a nil enqueue error means admission, never delivery to the peer.
+type hostWriter struct {
+	transport Transport
+	timeout   time.Duration
+	ctx       context.Context
+	stop      context.CancelFunc
+	frames    chan []byte
+	fatal     chan error
+	done      chan struct{}
+
+	mu        sync.Mutex
+	accepting bool
+	count     int
+	bytes     int
+	failure   error
+	idle      chan struct{} // closed only when every admitted Send has finished
+}
+
+func newHostWriter(t Transport, timeout time.Duration) *hostWriter {
+	ctx, stop := context.WithCancel(context.Background())
+	idle := make(chan struct{})
+	close(idle)
+	w := &hostWriter{
+		transport: t, timeout: timeout, ctx: ctx, stop: stop,
+		frames: make(chan []byte, hostWriterMaxFrames), fatal: make(chan error, 1),
+		done: make(chan struct{}), accepting: true, idle: idle,
+	}
+	go w.run()
+	return w
+}
+
+// failLocked publishes at most one fatal error; callers hold mu.
+func (w *hostWriter) failLocked(err error) {
+	if w.failure == nil {
+		w.failure = err
+		w.accepting = false
+		w.fatal <- err
+	}
+}
+
+func (w *hostWriter) enqueue(frame []byte) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.failure != nil {
+		return w.failure
+	}
+	if !w.accepting {
+		return NewRpcError(ErrorCodeFailedPrecondition, "syntra: host writer admission closed")
+	}
+	if w.count >= hostWriterMaxFrames || len(frame) > hostWriterMaxBytes-w.bytes {
+		err := NewRpcError(ErrorCodeResourceExhausted, "syntra: host write backlog full")
+		w.failLocked(err)
+		return err
+	}
+	if w.count == 0 {
+		w.idle = make(chan struct{})
+	}
+	owned := make([]byte, len(frame))
+	copy(owned, frame)
+	w.count++
+	w.bytes += len(owned)
+	w.frames <- owned // count includes the active write, so this cannot block
+	return nil
+}
+
+func (w *hostWriter) err() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.failure
+}
+
+func (w *hostWriter) run() {
+	defer close(w.done)
+	defer func() {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		w.accepting = false
+		for len(w.frames) > 0 {
+			<-w.frames // release unsent snapshots on any terminal path
+		}
+		if w.count > 0 {
+			w.count, w.bytes = 0, 0
+			close(w.idle)
+		}
+	}()
+	for {
+		select {
+		case <-w.ctx.Done():
+			return
+		case frame := <-w.frames:
+			if w.ctx.Err() != nil || w.err() != nil {
+				return
+			}
+			ctx, stop := context.WithTimeout(w.ctx, w.timeout)
+			err := w.transport.Send(ctx, frame)
+			stop()
+			w.mu.Lock()
+			if err != nil && w.ctx.Err() == nil {
+				w.failLocked(NewRpcError(ErrorCodeUnavailable, fmt.Sprintf("syntra: send: %v", err)))
+			}
+			w.count--
+			w.bytes -= len(frame)
+			if w.count == 0 {
+				close(w.idle)
+			}
+			w.mu.Unlock()
+			if err != nil {
+				return
+			}
+		}
+	}
+}
+
+// drain seals admission and waits for actual Send completions, including the
+// active write. It is used only on terminal paths, after cancelling callbacks.
+func (w *hostWriter) drain(ctx context.Context) error {
+	w.mu.Lock()
+	w.accepting = false
+	idle := w.idle
+	w.mu.Unlock()
+	select {
+	case <-idle:
+		if err := w.err(); err != nil {
+			return err
+		}
+		if w.ctx.Err() != nil {
+			return NewRpcError(ErrorCodeUnavailable, "syntra: host writer stopped before drain")
+		}
+		return nil
+	case <-w.fatal:
+		return w.err()
+	case <-ctx.Done():
+		return NewRpcError(ErrorCodeUnavailable, "syntra: host write drain incomplete")
+	}
+}
+
+// shutdown cancels Send, closes the owned transport, and joins the sole writer.
+// The join has a hard bound for transports violating the cancellation/Close
+// contract; conforming transports leave no writer goroutine behind.
+func (w *hostWriter) shutdown() error {
+	w.mu.Lock()
+	w.accepting = false
+	w.mu.Unlock()
+	w.stop()
+	_ = w.transport.Close()
+	timer := time.NewTimer(hostWriterJoinTime)
+	defer timer.Stop()
+	select {
+	case <-w.done:
+		return nil
+	case <-timer.C:
+		return NewRpcError(ErrorCodeUnavailable, "syntra: host writer did not stop")
+	}
 }
 
 // callCancel is the abandon handle for one in-flight handler. It is a
@@ -1256,13 +1537,14 @@ type hostConn struct {
 // newer entry reusing the same request ID (functions are not comparable
 // in Go; pointers are).
 type callCancel struct {
-	stop   context.CancelFunc
-	id     uint64
-	result chan *RpcResult // one completion; publish before notifying Serve
+	stop        context.CancelFunc
+	id          uint64
+	result      chan *RpcResult // one completion; publish before notifying Serve
+	completedAt time.Time       // guarded by Host.mu; recorded at completion publication
 	// authRevoked marks an Authorize Unauthenticated denial (expired/revoked
-	// bound principal). The per-RPC UNAUTHENTICATED error is sent first,
-	// then Serve terminates the connection per SNTR-AUTH-008/SNTR-ASEC-006
-	// default-close. PermissionDenied denials never set this and keep the
+	// bound principal). Serve cancels other callbacks and attempts a bounded
+	// drain of the per-RPC UNAUTHENTICATED error, then terminates per
+	// SNTR-AUTH-008/SNTR-ASEC-006. PermissionDenied denials keep the
 	// connection usable per SNTR-AUTH-009.
 	authRevoked bool
 }
@@ -1286,14 +1568,14 @@ func OpenHost(cfg HostConfig) (*Host, error) {
 // connection stays usable. When HostConfig.Authorize is set it is checked
 // with the bound principal before handler effects on every call; denials
 // answer generic Unauthenticated/PermissionDenied. PermissionDenied keeps
-// the connection usable; Unauthenticated (expired/revoked binding) sends
-// the per-RPC error then closes the connection by default per
-// SNTR-AUTH-008/SNTR-ASEC-006. A nil Authorize preserves the legacy allow-everything behavior
-// (divergent from the Rust fail-closed default; see AuthorizeFunc). ctx
+// the connection usable; Unauthenticated (expired/revoked binding) cancels
+// callbacks, attempts a bounded drain of the per-RPC error, then closes per
+// SNTR-AUTH-008/SNTR-ASEC-006. A nil Authorize denies every method. ctx
 // end cancels in-flight handlers and closes the connection. Serve returns
 // nil on a clean handshake-completed close and the fatal error otherwise.
 // The entire handshake, including Policy, has a five-second deadline
 // shortened by ctx. Policy and Transport must honor their contexts.
+// Serve owns t and closes it on every terminal path.
 // Transport.Recv MUST return promptly when its context ends; teardown
 // waits at most handlerShutdownGrace for a violating Recv before
 // abandoning the pump (the leaked Recv goroutine exits when Recv finally
@@ -1304,6 +1586,11 @@ func (h *Host) Serve(ctx context.Context, t Transport) error {
 	if h == nil {
 		return NewRpcError(ErrorCodeInternal, "syntra: nil host")
 	}
+	if t == nil {
+		return NewRpcError(ErrorCodeInvalidArgument, "syntra: nil transport")
+	}
+	t = &ownedTransport{Transport: t}
+	defer t.Close()
 	h.mu.Lock()
 	if h.closed {
 		h.mu.Unlock()
@@ -1320,6 +1607,7 @@ func (h *Host) Serve(ctx context.Context, t Transport) error {
 	hc := &hostConn{
 		core: core, cancels: make(map[uint64]*callCancel), wake: make(chan struct{}, 1),
 		stop: stop, completed: make(chan *callCancel, h.cfg.maxPending),
+		transport: t,
 	}
 	h.mu.Lock()
 	if h.closed {
@@ -1331,6 +1619,7 @@ func (h *Host) Serve(ctx context.Context, t Transport) error {
 	h.mu.Unlock()
 	defer func() {
 		stop()
+		_ = t.Close()
 		h.cancelHandlers(hc, nil, true)
 		h.drainHandlers(hc)
 		h.mu.Lock()
@@ -1356,20 +1645,41 @@ func (h *Host) serveHandshake(ctx context.Context, t Transport, hc *hostConn) er
 		}
 		return NewRpcError(ErrorCodeUnavailable, fmt.Sprintf("syntra: handshake recv: %v", err))
 	}
+	hello, uerr := unmarshalSessionFrame(raw)
+	if uerr != nil {
+		return uerr
+	}
+	if BodyKindOf(hello) != BodyKindHello {
+		return NewRpcError(ErrorCodeFailedPrecondition, "syntra: first frame must be hello")
+	}
+	if _, err := NegotiateVersionRanges(hello.GetHello().GetMinVersion(), hello.GetHello().GetMaxVersion(), h.cfg.minVersion, h.cfg.maxVersion); err != nil {
+		return err
+	}
 	version, herr := hc.core.acceptHello(raw)
 	if herr != nil {
 		return herr
 	}
-	_ = version
-	hello, uerr := UnmarshalFrame(raw)
-	if uerr != nil {
-		return uerr
+	hc.version = version
+	var principal string
+	var perr error
+	if h.cfg.channelPolicy != nil {
+		provider, ok := t.(ChannelIdentityProvider)
+		if !ok {
+			return NewRpcError(ErrorCodeUnauthenticated, "syntra: confirmed channel required")
+		}
+		identity, confirmed := provider.ChannelIdentity()
+		if !confirmed {
+			return NewRpcError(ErrorCodeUnauthenticated, "syntra: confirmed channel required")
+		}
+		principal, perr = h.cfg.channelPolicy(ctx, identity, hello.GetHello().GetCredential())
+	} else {
+		if h.cfg.policy == nil {
+			return NewRpcError(ErrorCodeUnauthenticated, "syntra: no credential policy configured")
+		}
+		principal, perr = h.cfg.policy(ctx, hello.GetHello().GetCredential())
 	}
-	policy := h.cfg.policy
-	if policy == nil {
-		return NewRpcError(ErrorCodeUnauthenticated, "syntra: no credential policy configured")
-	}
-	principal, perr := policy(ctx, hello.GetHello().GetCredential())
+	hello = nil
+	raw = nil
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -1379,6 +1689,9 @@ func (h *Host) serveHandshake(ctx context.Context, t Transport, hc *hostConn) er
 			return rerr
 		}
 		return NewRpcError(ErrorCodeInternal, "syntra: credential policy failed")
+	}
+	if principal == "" {
+		return NewRpcError(ErrorCodeUnauthenticated, "syntra: credential not accepted")
 	}
 	readyFrame, aerr := hc.core.authComplete(principal)
 	if aerr != nil {
@@ -1401,27 +1714,35 @@ func (h *Host) serveHandshake(ctx context.Context, t Transport, hc *hostConn) er
 // outbound frames that arise without inbound traffic (expiry results,
 // broadcasts) are flushed on the wake signal and on a reap tick, so a
 // silent peer still observes budgets and broadcasts.
-func (h *Host) serveLoop(ctx context.Context, t Transport, hc *hostConn) error {
+func (h *Host) serveLoop(ctx context.Context, t Transport, hc *hostConn) (serveErr error) {
+	writer := newHostWriter(t, h.cfg.writeTimeout)
+	hc.writer = writer
+	pumpCtx, pumpStop := context.WithCancel(ctx)
+	var recvDone chan struct{}
+	defer func() {
+		if ctx.Err() != nil && serveErr == nil {
+			h.gracefulDrain(ctx, t, hc)
+		}
+		hc.stop()
+		h.cancelHandlers(hc, nil, true)
+		pumpStop()
+		if err := writer.shutdown(); serveErr == nil && err != nil {
+			serveErr = err
+		}
+		if recvDone != nil {
+			// Close and cancellation release conforming readers immediately.
+			// Bound the join for readers that violate their context contract.
+			select {
+			case <-recvDone:
+			case <-time.After(handlerShutdownGrace):
+			}
+		}
+	}()
 	if err := h.flush(ctx, t, hc); err != nil {
 		return err
 	}
-	pumpCtx, pumpStop := context.WithCancel(ctx)
 	recvCh := make(chan recvResult, 1)
-	recvDone := make(chan struct{})
-	defer func() {
-		pumpStop()
-		// Bound teardown: a conforming Transport.Recv returns promptly on
-		// pumpCtx cancellation and this resolves immediately. A Recv that
-		// violates its context contract must not hang Serve forever, so
-		// wait at most the handler drain grace (1s, consistent with
-		// handlerShutdownGrace) before abandoning the pump. The abandoned
-		// Recv goroutine exits when Recv finally returns; it never touches
-		// the closed core or caller transport afterwards.
-		select {
-		case <-recvDone:
-		case <-time.After(handlerShutdownGrace):
-		}
-	}()
+	recvDone = make(chan struct{})
 	go func() {
 		defer close(recvDone)
 		for {
@@ -1439,10 +1760,19 @@ func (h *Host) serveLoop(ctx context.Context, t Transport, hc *hostConn) error {
 	ticker := time.NewTicker(pumpTick)
 	defer ticker.Stop()
 	for {
+		if ctx.Err() == nil {
+			if err := writer.err(); err != nil {
+				return err
+			}
+		}
 		select {
 		case <-ctx.Done():
-			h.gracefulDrain(ctx, t, hc)
 			return nil
+		case err := <-writer.fatal:
+			if ctx.Err() != nil {
+				return nil
+			}
+			return err
 		case cc := <-hc.completed:
 			hc.workers--
 			if err := h.finishReadyHandler(ctx, t, hc, cc); err != nil {
@@ -1474,6 +1804,9 @@ func (h *Host) serveLoop(ctx context.Context, t Transport, hc *hostConn) error {
 				}
 				return NewRpcError(ErrorCodeUnavailable, fmt.Sprintf("syntra: recv: %v", r.err))
 			}
+			if err := validateActiveSessionFrame(r.raw, hc.version); err != nil {
+				return err
+			}
 			responses, cancelIDs, fatal := hc.core.onFrame(r.raw)
 			if fatal != nil {
 				h.cancelHandlers(hc, nil, true)
@@ -1485,12 +1818,12 @@ func (h *Host) serveLoop(ctx context.Context, t Transport, hc *hostConn) error {
 				}
 			}
 			for _, resp := range responses {
-				if serr := t.Send(ctx, resp); serr != nil {
+				if serr := writer.enqueue(resp); serr != nil {
 					h.cancelHandlers(hc, nil, true)
 					if ctx.Err() != nil {
 						return nil
 					}
-					return NewRpcError(ErrorCodeUnavailable, fmt.Sprintf("syntra: send: %v", serr))
+					return serr
 				}
 			}
 			for {
@@ -1511,10 +1844,14 @@ func (h *Host) serveLoop(ctx context.Context, t Transport, hc *hostConn) error {
 	}
 }
 
-// validSuccess reports whether res is a usable success outcome: valid
-// and carrying a selected payload (empty counts; missing does not).
+// validHandlerResult accepts either validated terminal outcome.
+func validHandlerResult(res *RpcResult) bool {
+	return res != nil && ValidateResult(res) == nil
+}
+
+// validSuccess reports whether res carries a validated success payload.
 func validSuccess(res *RpcResult) bool {
-	if res == nil || ValidateResult(res) != nil {
+	if !validHandlerResult(res) {
 		return false
 	}
 	_, ok := res.GetOutcome().(*syntrav1.RpcResult_Payload)
@@ -1523,7 +1860,7 @@ func validSuccess(res *RpcResult) bool {
 
 // dispatch runs at most maxPending callbacks per connection, including
 // callbacks still running after a terminal cancel/deadline. Only Serve
-// touches the core or sends results; workers publish one bounded completion.
+// touches the core or admits result frames; workers publish one bounded completion.
 func (h *Host) dispatch(ctx context.Context, t Transport, hc *hostConn, id uint64, req *RpcRequest) error {
 	// Consume available completions before rejecting a new worker. A
 	// cancelled, non-cooperative callback does NOT free a worker slot.
@@ -1579,13 +1916,18 @@ drain:
 				}
 			}
 		}
+		// Authorizers may return nil after cancellation. Never start handler
+		// effects on a context already cancelled by revocation or teardown.
+		if out == nil && hctx.Err() != nil {
+			out = NewWireErrorResult(mapContextErr(hctx.Err()).Code, "syntra: handler context ended")
+		}
 		if out == nil {
 			if handler == nil {
 				out = NewWireErrorResult(ErrorCodeUnimplemented, "syntra: unknown method")
 			} else {
 				res, herr := handler(hctx, req)
 				switch {
-				case hctx.Err() != nil && !validSuccess(res):
+				case hctx.Err() != nil && !validHandlerResult(res):
 					out = NewWireErrorResult(mapContextErr(hctx.Err()).Code, "syntra: handler context ended")
 				case herr != nil:
 					var rerr *RpcError
@@ -1594,18 +1936,21 @@ drain:
 					} else {
 						out = NewWireErrorResult(ErrorCodeInternal, "syntra: internal error")
 					}
-				case validSuccess(res):
+				case validHandlerResult(res):
 					out = res
 				default:
 					out = NewWireErrorResult(ErrorCodeInternal, "syntra: internal error")
 				}
 			}
 		}
+		h.mu.Lock()
+		cc.completedAt = time.Now()
 		cc.result <- out
+		h.mu.Unlock()
 		stop()
 		// Capacity covers ALL admitted callbacks, even if Serve has
 		// finished its bounded shutdown drain. This never blocks a late
-		// worker or lets it access a destroyed core/caller-owned transport.
+		// worker or lets it access a destroyed core or closed transport.
 		hc.completed <- cc
 	}()
 	return nil
@@ -1613,13 +1958,17 @@ drain:
 
 // finishReadyHandler commits a published completion only while this exact
 // callback still owns its ID. Late callbacks cannot answer a reused ID.
-// An Authorize Unauthenticated completion (expired/revoked binding) sends
-// the per-RPC UNAUTHENTICATED error first, then returns a terminal
-// Unauthenticated error so Serve closes the connection by default
-// (SNTR-AUTH-008, SNTR-ASEC-006).
+// An Authorize Unauthenticated completion cancels other callbacks before a
+// bounded drain of the queued denial. Successful drain returns Unauthenticated;
+// incomplete/failed writes return their error. Serve closes either way.
 func (h *Host) finishReadyHandler(ctx context.Context, t Transport, hc *hostConn, cc *callCancel) error {
 	h.mu.Lock()
 	current := hc.cancels[cc.id] == cc
+	if current && !cc.completedAt.IsZero() {
+		if timed, ok := hc.core.(completionRecorder); ok {
+			timed.recordCompletion(cc.id, cc.completedAt)
+		}
+	}
 	h.mu.Unlock()
 	if !current {
 		return nil
@@ -1630,10 +1979,18 @@ func (h *Host) finishReadyHandler(ctx context.Context, t Transport, hc *hostConn
 		delete(hc.cancels, cc.id)
 		h.mu.Unlock()
 		cc.stop()
+		if cc.authRevoked {
+			h.cancelHandlers(hc, nil, true)
+		}
 		if err := h.answer(ctx, t, hc, cc.id, out); err != nil {
 			return err
 		}
 		if cc.authRevoked {
+			drainCtx, stop := context.WithTimeout(ctx, hostWriterDrainTime)
+			defer stop()
+			if err := hc.writer.drain(drainCtx); err != nil {
+				return err
+			}
 			return NewRpcError(ErrorCodeUnauthenticated, "syntra: credential revoked")
 		}
 		return nil
@@ -1653,8 +2010,8 @@ func (h *Host) answer(ctx context.Context, t Transport, hc *hostConn, id uint64,
 				return err2
 			}
 			if !expired2 && len(frame2) > 0 {
-				if serr := t.Send(ctx, frame2); serr != nil {
-					return hostSendError(ctx, serr)
+				if serr := hc.writer.enqueue(frame2); serr != nil {
+					return serr
 				}
 			}
 			return h.flush(ctx, t, hc)
@@ -1662,23 +2019,14 @@ func (h *Host) answer(ctx context.Context, t Transport, hc *hostConn, id uint64,
 		return err
 	}
 	if !expired && len(frame) > 0 {
-		if err := t.Send(ctx, frame); err != nil {
-			return hostSendError(ctx, err)
+		if err := hc.writer.enqueue(frame); err != nil {
+			return err
 		}
 	}
 	return h.flush(ctx, t, hc)
 }
 
-// A transport-local cancellation/deadline is a failed write unless the
-// connection's own context ended. Never swallow it and keep reading.
-func hostSendError(ctx context.Context, err error) error {
-	if ctx.Err() != nil {
-		return nil
-	}
-	return NewRpcError(ErrorCodeUnavailable, fmt.Sprintf("syntra: send: %v", err))
-}
-
-// flush drains queued outbound frames on the serve pump.
+// flush moves core frames into the bounded FIFO writer without waiting for I/O.
 func (h *Host) flush(ctx context.Context, t Transport, hc *hostConn) error {
 	for {
 		frame, ok := hc.core.nextOutbound()
@@ -1688,16 +2036,32 @@ func (h *Host) flush(ctx context.Context, t Transport, hc *hostConn) error {
 		if len(frame) == 0 {
 			continue
 		}
-		if err := t.Send(ctx, frame); err != nil {
-			return hostSendError(ctx, err)
+		if err := hc.writer.enqueue(frame); err != nil {
+			return err
 		}
 	}
 }
 
-// reapHandlers abandons handlers whose budgets expired; the core already
-// auto-enqueued their DEADLINE_EXCEEDED results.
+// completionRecorder preserves callback completion time in cores that support
+// it. The native v1 ABI has no timestamp input; it arbitrates at answer time.
+type completionRecorder interface {
+	recordCompletion(uint64, time.Time)
+}
+
+// reapHandlers abandons expired handlers after preserving published completions.
 func (h *Host) reapHandlers(_ context.Context, hc *hostConn) {
+	// Publication and reaping share a lock, so a completion published before
+	// this expiry decision cannot be discarded by a randomly selected tick.
+	h.mu.Lock()
+	if timed, ok := hc.core.(completionRecorder); ok {
+		for id, cc := range hc.cancels {
+			if !cc.completedAt.IsZero() {
+				timed.recordCompletion(id, cc.completedAt)
+			}
+		}
+	}
 	expired := hc.core.reapExpired(time.Now())
+	h.mu.Unlock()
 	h.cancelHandlers(hc, expired, false)
 }
 
@@ -1811,6 +2175,7 @@ func (h *Host) NotifyDirected(principal string, payload []byte) error {
 // NotifyAll enqueues payload as a notification on every served
 // connection. With no connections it is a documented no-op. Payloads
 // MUST be opaque application bytes; empty is a valid empty event.
+// Success acknowledges queue admission, not transport or peer delivery.
 // Partial-delivery failures are combined and returned; RpcError values
 // remain unwrappable via errors.As. Only connections with a successful
 // enqueue are signaled.
@@ -1845,28 +2210,21 @@ func (h *Host) NotifyAll(payload []byte) error {
 	return errors.Join(errs...)
 }
 
-// gracefulDrain implements SNTR-HS-006/013 draining for graceful close:
-// flush already-queued outbound frames (terminal results, expiry results,
-// broadcasts) before teardown, then abandon in-flight via cancelHandlers.
-// Already-queued frames use a short bounded background context (the serve
-// ctx is already done, so direct Send would fail instantly). Handler
-// completion draining within the grace window stays in Serve's deferred
-// drainHandlers (bounded by handlerShutdownGrace); this path must not add a
-// second grace wait or Serve teardown would exceed its bound and existing
-// close-interrupt tests would time out.
+// gracefulDrain cancels callbacks and makes a bounded best-effort attempt to
+// send queued frames. A clean Serve shutdown does not acknowledge their delivery.
+// Host.Close/DisconnectPrincipal may already have closed the transport.
 func (h *Host) gracefulDrain(ctx context.Context, t Transport, hc *hostConn) {
 	_ = ctx
-	drainCtx, drainStop := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	drainCtx, drainStop := context.WithTimeout(context.Background(), hostWriterDrainTime)
 	defer drainStop()
-	_ = h.flush(drainCtx, t, hc)
 	h.cancelHandlers(hc, nil, true)
-	// One more best-effort flush for frames queued by reap during cancel.
-	_ = h.flush(drainCtx, t, hc)
+	if h.flush(drainCtx, t, hc) == nil {
+		_ = hc.writer.drain(drainCtx)
+	}
 }
 
 // Close releases the factory: new Serve calls fail fast and served
-// connections are abandoned (their handlers observe ctx cancellation via
-// the Serve ctx, and transports stay owned by their callers). A second
+// connections are closed and their handlers observe ctx cancellation. A second
 // Close reports FailedPrecondition. Close signals shutdown without waiting;
 // callers join their Serve calls to await the bounded callback drain.
 func (h *Host) Close() error {
@@ -1879,9 +2237,43 @@ func (h *Host) Close() error {
 		return NewRpcError(ErrorCodeFailedPrecondition, "syntra: host already closed")
 	}
 	h.closed = true
+	var transports []Transport
 	for hc := range h.conns {
 		hc.stop()
+		transports = append(transports, hc.transport)
 	}
 	h.mu.Unlock()
+	for _, t := range transports {
+		_ = t.Close()
+	}
+	return nil
+}
+
+// DisconnectPrincipal cancels and closes every current connection bound to
+// principal, including idle connections that only receive pushes. It does not
+// prevent future authentication; the authentication policy must reject revoked
+// identities. An empty principal matches no connection.
+func (h *Host) DisconnectPrincipal(principal string) error {
+	if h == nil {
+		return NewRpcError(ErrorCodeInternal, "syntra: nil host")
+	}
+	h.mu.Lock()
+	if h.closed {
+		h.mu.Unlock()
+		return NewRpcError(ErrorCodeFailedPrecondition, "syntra: host closed")
+	}
+	var transports []Transport
+	if principal != "" {
+		for hc := range h.conns {
+			if hc.principal == principal {
+				hc.stop()
+				transports = append(transports, hc.transport)
+			}
+		}
+	}
+	h.mu.Unlock()
+	for _, t := range transports {
+		_ = t.Close()
+	}
 	return nil
 }

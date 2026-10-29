@@ -188,12 +188,12 @@ func (s *Server) ServeTCP(ctx context.Context, listener net.Listener) (err error
 }
 
 // isTemporaryAcceptError reports whether an Accept error is transient and
-// worth retrying with backoff. It recognizes timeouts and temporary network
-// errors as well as transient syscall resource conditions.
+// worth retrying with backoff. It recognizes timeouts as well as transient
+// syscall resource conditions.
 func isTemporaryAcceptError(err error) bool {
 	var ne net.Error
 	if errors.As(err, &ne) {
-		if ne.Timeout() || ne.Temporary() {
+		if ne.Timeout() {
 			return true
 		}
 	}

@@ -95,6 +95,7 @@ func secureHTTPClient(original *http.Client) (*http.Client, error) {
 		rt = http.DefaultTransport
 	}
 	if standard, ok := rt.(*http.Transport); ok {
+		//lint:ignore SA1019 DialTLS is deprecated but must still be rejected because it bypasses TLSClientConfig.
 		if standard.DialTLSContext != nil || standard.DialTLS != nil {
 			return nil, securechannel.ErrConfig
 		}

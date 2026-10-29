@@ -96,6 +96,9 @@ type StaticKey struct {
 
 func (StaticKey) String() string   { return "[server static key]" }
 func (StaticKey) GoString() string { return "[server static key]" }
+func (StaticKey) Format(s fmt.State, _ rune) {
+	_, _ = io.WriteString(s, "[server static key]")
+}
 
 func GenerateStaticKey() (StaticKey, error) {
 	k, err := GenerateKey()

@@ -833,9 +833,12 @@ func TestConfigurationAndKeyDiagnostics(t *testing.T) {
 			t.Errorf("*Key formatting with %s was not redacted", verb)
 		}
 	}
-	for _, verb := range []string{"%v", "%+v", "%#v", "%s"} {
+	for _, verb := range []string{"%v", "%+v", "%#v", "%s", "%q", "%x", "%X", "%d", "%032x"} {
 		if got := fmt.Sprintf(verb, f.server.StaticKey); got != "[server static key]" {
 			t.Errorf("StaticKey formatting with %s was not redacted", verb)
+		}
+		if got := fmt.Sprintf(verb, &f.server.StaticKey); got != "[server static key]" {
+			t.Errorf("*StaticKey formatting with %s was not redacted", verb)
 		}
 	}
 	if Bootstrap.String() != "bootstrap" || Returning.String() != "returning" || Mode(255).String() != "invalid" || TCP.String() != "tcp" || WS.String() != "ws" || WSS.String() != "wss" || Carrier(255).String() != "invalid" {

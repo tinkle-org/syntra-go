@@ -24,8 +24,10 @@ The draft does not replace upstream's production TLS baseline.
   explicit permissive choice.
 - `ChannelPolicy` replaces ordinary credential policy and requires freshly
   confirmed transport evidence. Hosts must verify the explicit hello
-  credential separately, bind the intended principal (the example requires
-  the same principal as the channel), recheck current enrollment and admission
+  credential separately, bind the intended principal (in returning mode the
+  example requires the same principal as the channel; bootstrap mode admits
+  via `ClientHello.credential` without requiring a channel principal or
+  enrollment record), recheck current enrollment and admission
   before ready, and authorize every method. Empty credentials never imply
   channel-principal acceptance. A public handle, M1 or diagnostic connection
   ID grants no authority by itself.
@@ -56,7 +58,8 @@ The draft does not replace upstream's production TLS baseline.
   independently owned lifetime and must be closed. These helpers do not
   reconnect, replay RPCs, retry enrollment or fall back to another carrier/mode.
 - WSS dialing enforces TLS 1.3 and certificate verification for inspectable
-  standard HTTP transports; custom RoundTrippers own their TLS policy.
+  standard HTTP transports and rejects custom TLS dial hooks (`DialTLSContext`,
+  `DialTLS`) as unsupported; custom RoundTrippers own their TLS policy.
   Accepting servers own TLS configuration, origin policy and secure proxy
   deployment. Forwarded headers do not change `Accept`'s `r.TLS` carrier binding.
 - SC1 protects authenticated payload records, not traffic length, timing or
@@ -99,8 +102,8 @@ The clean reachable-code result applies to the analyzed root-module paths and
 toolchain, not every dependency function, build variant or future application.
 The separate integration module has its own dependency graph and
 [scan report](tests/integration/README.md#integration-vulnerability-scan), which
-currently records three reachable test-helper vulnerabilities; the root scan
-does not cover that tooling.
+records zero reachable vulnerabilities on Go 1.26.10, including the test-only
+harness dependencies; the root scan does not cover that tooling.
 The root scan's reported `x/crypto/ssh` code is unused by the analyzed root
 paths; that result did not require an x/crypto version change. Re-scan when
 reachable code, dependencies or the vulnerability database changes. The

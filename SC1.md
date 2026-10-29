@@ -104,9 +104,11 @@ Control ping/pong messages stay outside SC1 application data; `Transport.Ping`
 requires a concurrent `Recv` to process the pong.
 
 `websocket.Dial` accepts explicit `ws://` or `wss://` URLs and refuses redirects.
-For inspectable `*http.Transport` clients it clones TLS settings, requires
-certificate verification and enforces TLS 1.3 or newer. A custom RoundTripper
-owns its TLS policy. Servers configure TLS themselves. `Accept` uses `r.TLS`
+For inspectable `*http.Transport` clients it rejects custom TLS dial hooks
+(`DialTLSContext`, `DialTLS`), then clones TLS settings, requires
+certificate verification and enforces TLS 1.3 or newer. Custom TLS dial hooks
+are unsupported; a custom RoundTripper owns its TLS policy. Servers configure
+TLS themselves. `Accept` uses `r.TLS`
 to distinguish WS from WSS and does not trust forwarded headers to change the
 authenticated carrier. Configure origin admission through `OriginPatterns`;
 the default retains the library's same-origin checks.
@@ -214,8 +216,10 @@ automatically assign an RPC identity. `HostConfig.ChannelPolicy`, when set,
 replaces `Policy`, requires fresh channel confirmation, and sees the explicit
 `ClientHello.credential`. An empty credential never implicitly means “use the
 channel principal.” The host verifies its root/application identity separately,
-checks that it is the **same principal**, and checks current channel validity
-and admission policy **before ServerReady**. The periodic checker is not a
+checks in returning mode that it is the **same principal** as the channel, and
+checks current channel validity and admission policy **before ServerReady**.
+Bootstrap mode admits via `ClientHello.credential` without requiring a channel
+principal or enrollment record. The periodic checker is not a
 substitute for this admission check. Every method still needs `Authorize`;
 nil selects `DenyAllAuthorize`.
 

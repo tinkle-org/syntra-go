@@ -116,6 +116,8 @@ func connect(ctx context.Context, t syntra.Transport, cfg syntra.ClientConfig) (
 		close(c.done)
 	}()
 	if err := core.WaitReady(ctx); err != nil {
+		c.cancel()
+		<-c.done
 		_ = c.Close()
 		if ctx.Err() != nil {
 			return nil, ctx.Err()

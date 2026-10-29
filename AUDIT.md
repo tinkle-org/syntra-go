@@ -274,8 +274,8 @@ builds must use the patched toolchain. Re-run scans after changes to code paths,
 dependencies or vulnerability data. Original benchmark measurements remain
 labeled Go 1.26.4 in [BENCHMARKS.md](BENCHMARKS.md).
 
-The separate integration module's `govulncheck -test ./...` result is not clean:
-its agent records three reachable test-helper dependency vulnerabilities on
-Go 1.26.10. See [that scan record](tests/integration/README.md#integration-vulnerability-scan).
+The separate integration module's `govulncheck -test ./...` result is clean on
+Go 1.26.10: zero reachable vulnerabilities, including the test-only harness
+dependencies. See [that scan record](tests/integration/README.md#integration-vulnerability-scan).
 It has a different dependency graph from the root production module and is not
 covered by the root scan's zero-reachable result.

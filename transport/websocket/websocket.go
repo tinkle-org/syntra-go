@@ -27,7 +27,8 @@ type Options struct {
 
 // Dial accepts only explicit ws:// or wss:// URLs. Redirects are refused.
 // Inspectable HTTP transports are cloned, require certificate verification,
-// and use TLS >= 1.3; custom RoundTrippers own their TLS security policy.
+// and use TLS >= 1.3; custom TLS dial hooks are unsupported and custom
+// RoundTrippers own their TLS security policy.
 // Establishment and the eventual connection share one Lifetime budget measured
 // from entry; HandshakeTimeout and HTTPClient.Timeout also bound establishment.
 func Dial(ctx context.Context, address string, cfg securechannel.ClientConfig, opts Options) (*ordered.Transport, error) {
@@ -94,6 +95,9 @@ func secureHTTPClient(original *http.Client) (*http.Client, error) {
 		rt = http.DefaultTransport
 	}
 	if standard, ok := rt.(*http.Transport); ok {
+		if standard.DialTLSContext != nil || standard.DialTLS != nil {
+			return nil, securechannel.ErrConfig
+		}
 		tr := standard.Clone()
 		if tr.TLSClientConfig == nil {
 			tr.TLSClientConfig = &tls.Config{}

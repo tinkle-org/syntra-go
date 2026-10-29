@@ -3,9 +3,11 @@ package connection
 import (
 	"bufio"
 	"context"
+	"errors"
 	"net"
 	"net/http"
 	"sync"
+	"syscall"
 	"time"
 
 	syntra "github.com/tinkle-org/syntra-go"
@@ -139,6 +141,8 @@ func (s *Server) ServeTCP(ctx context.Context, listener net.Listener) (err error
 		s.initiateClose()
 		return ctx.Err()
 	}
+	backoff := 5 * time.Millisecond
+	const maxBackoff = time.Second
 	for {
 		raw, acceptErr := listener.Accept()
 		if acceptErr != nil {
@@ -148,8 +152,26 @@ func (s *Server) ServeTCP(ctx context.Context, listener net.Listener) (err error
 			if s.ctx.Err() != nil {
 				return nil
 			}
-			return ordered.ErrIO
+			if errors.Is(acceptErr, net.ErrClosed) {
+				return nil
+			}
+			if !isTemporaryAcceptError(acceptErr) {
+				return ordered.ErrIO
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-s.ctx.Done():
+				return nil
+			case <-time.After(backoff):
+			}
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+			continue
 		}
+		backoff = 5 * time.Millisecond
 		entry := s.admit(raw)
 		if entry == nil {
 			_ = raw.Close()
@@ -163,6 +185,24 @@ func (s *Server) ServeTCP(ctx context.Context, listener net.Listener) (err error
 			}
 		}()
 	}
+}
+
+// isTemporaryAcceptError reports whether an Accept error is transient and
+// worth retrying with backoff. It recognizes timeouts and temporary network
+// errors as well as transient syscall resource conditions.
+func isTemporaryAcceptError(err error) bool {
+	var ne net.Error
+	if errors.As(err, &ne) {
+		if ne.Timeout() || ne.Temporary() {
+			return true
+		}
+	}
+	if errors.Is(err, syscall.EMFILE) || errors.Is(err, syscall.ENFILE) ||
+		errors.Is(err, syscall.ECONNABORTED) || errors.Is(err, syscall.ENOMEM) ||
+		errors.Is(err, syscall.EAGAIN) {
+		return true
+	}
+	return false
 }
 
 // WebSocketHandler returns a WS/WSS handler with shared connection/handshake

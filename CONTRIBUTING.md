@@ -1,55 +1,43 @@
 # Contributing to Syntra Go
 
-Run commands from the repository root. **Go 1.23.0 is the module floor**; CI's
-current and recommended production toolchain is **Go 1.26.10**. The floor is an
-API/build compatibility constraint, not a secure-runtime recommendation.
-Production binaries require a security-patched toolchain. Current pins are
-Protobuf v1.36.6, flynn/noise v1.1.0,
-coder/websocket v1.8.15, x/crypto v0.38.0 and x/sys v0.33.0. Keep dependency
-versions and checksums consistent unless updating them is part of the change.
+Use the repository root for the commands below. The module floor is Go 1.23.0;
+CI checks Go 1.23.12 compatibility and uses Go 1.26.10 for current verification.
+Use a security-patched toolchain for deployed applications. Record `go version`
+with reported results.
 
-Read [SC1.md](SC1.md) for the implementation-specific draft-1 contract and
-[AUDIT.md](AUDIT.md) for completed local reviews and open gaps. Keep claims tied
-to evidence: this channel is neither accepted upstream nor independently
-audited. Reference upstream specification commit
-[`e27fa275f647ccc925b7cf79eb2dd332f20a3d02`](https://github.com/tinkle-org/syntra/tree/e27fa275f647ccc925b7cf79eb2dd332f20a3d02)
-when discussing draft requirements, and identify a new reviewed pin when that
-reference changes.
+Read [CONNECTION.md](CONNECTION.md) before changing connection or session
+behavior. Syntra 1.0 includes Noise encryption. The protobuf `Frame` is an
+internal envelope. The core and socket-free runtime can use application-supplied
+ordered record I/O or optional managed networking selected by imports. Managed
+networking uses Go goroutines/netpoll and explicit ownership and quotas.
 
-## Checks
+## Local checks
 
 ```sh
 export GOTOOLCHAIN=go1.26.10
-gofmt -l .                         # must print nothing
+go version
+gofmt -l .
 CGO_ENABLED=0 go build -mod=readonly ./...
-go test -mod=readonly -count=1 ./...
 CGO_ENABLED=0 go test -mod=readonly -count=1 ./...
 go vet -mod=readonly ./...
 go test -mod=readonly -race -count=1 ./...
 go mod verify
-git diff --exit-code -- go.mod go.sum
+git diff --check
 ```
 
-The race detector requires CGO and a C compiler, but the default-tag tests
-still exercise the pure-Go backend. Native tests require a compatible Rust
-production library; follow [README.md](README.md#optional-native-backend).
+`gofmt -l .` should print nothing. The race detector requires CGO and a C
+compiler for instrumentation. The SDK itself builds with CGO disabled. The
+SDK tests include in-memory fixtures and real loopback TCP, WS, WSS, HTTP, HTTPS,
+and proxy integrations. They require local sockets but no Docker or external
+services.
 
-Compatibility: CI tests Go **1.23.12** and **1.26.10**, using `GOTOOLCHAIN=local`
-to prevent silent upgrades, plus compile-only `GOOS/GOARCH` targets. To check
-the minimum locally, run `GOTOOLCHAIN=go1.23.12 go test -mod=readonly ./...`.
-That lane verifies API/build compatibility only; it does not recommend Go 1.23
-for production security. Use Go 1.26.10 for current security verification.
-Use `go version` and `go env GOTOOLCHAIN` to record which toolchain actually ran.
+For minimum-version compatibility:
 
-Root tests and benchmarks do not require Docker. Timing boundaries, accounting
-and commands are in [BENCHMARKS.md](BENCHMARKS.md). Container integration tooling
-has a separate module documented in
-[tests/integration/README.md](tests/integration/README.md) and is not run by root
-`go test ./...`. Follow its own tooling instructions and record
-the actual peer revisions; a same-implementation container round trip does
-not establish independent cross-language SC1 interoperability.
+```sh
+GOTOOLCHAIN=go1.23.12 CGO_ENABLED=0 go test -mod=readonly -count=1 ./...
+```
 
-Security checks:
+Security analysis uses the selected toolchain and its standard library:
 
 ```sh
 export GOTOOLCHAIN=go1.26.10
@@ -59,109 +47,89 @@ go install honnef.co/go/tools/cmd/staticcheck@2025.1.1
 staticcheck ./...
 ```
 
-CI checks the default build with `staticcheck ./...` and the native build with
-`staticcheck -tags syntranative ./...` in the job that provisions its Rust
-library and linker environment. Rebuild analysis tools with the selected Go
-toolchain. `govulncheck` gates reachable
-vulnerabilities. The Go 1.26.10 scan reported zero reachable vulnerabilities
-and 20 additional vulnerabilities in required modules that were not reachable
-in the analyzed call graph. Recheck when dependencies or reachable code paths
-change; dependency presence and code reachability are different scan findings.
-See [SECURITY.md](SECURITY.md#dependencies-and-assurance) for the toolchain result.
+These are reproduction commands, not a recorded clean scan. Record the source
+revision, working-tree state, toolchain, command and output when publishing a
+result. See [AUDIT.md](AUDIT.md).
 
-Fuzz and negative tests:
+## Schemas and generated output
+
+Use Buf CLI 1.59.0. `buf.gen.yaml` pins the remote Go plugin to v1.36.6
+revision 1 with `paths=source_relative`; the protobuf runtime is also v1.36.6.
+Edit schemas under `proto/` and regenerate output under `gen/`. Do not edit
+generated Go files by hand.
 
 ```sh
-go test -mod=readonly -run 'TestFuzzSeedCorpus' -count=1 -v ./...
+buf format --diff --exit-code
+buf lint
+buf build
+python3 scripts/check-go-package.py
+buf generate --template buf.gen.yaml
+python3 -m unittest discover -s scripts -p 'test_*.py' -v
+python3 scripts/check-generated.py
+```
+
+The drift check generates into a temporary directory and compares the complete
+generated file set and bytes. It requires Python 3, Buf, and access to the remote
+plugin service. CI checks Buf `FILE` compatibility against the pull request base,
+excluding `FILE_SAME_GO_PACKAGE`. `scripts/check-go-package.py` enforces the
+canonical `go_package` option in every compiled schema descriptor. Inspect
+schema and generated-code diffs together.
+
+## Focused verification
+
+Add a regression for observable behavior when changing protocol or lifecycle
+semantics. Use neutral payloads and local fixtures. Exercise applicable size
+bounds, fragmented records, invalid authentication, cancellation, stalled I/O,
+readiness, and shutdown paths. Preserve buffer ownership and record ordering.
+Application callbacks and record I/O must honor cancellation; tests should join
+the workers they start.
+
+Recovery changes need runtime attachment and explicit negotiation tests,
+including `ClientConfig.Prepare`, the immutable pre-Run inbox, and
+`HostConfig.Recovery` connection binding and teardown. Exercise connection and
+principal isolation, generation/checkpoint continuity, full-state CAS conflicts,
+lost confirmations, and unknown persistence outcomes. Persistence and source
+callbacks remain application-owned contracts.
+
+Managed networking changes need real loopback coverage for idle push without
+RPCs, notification loss and generation fencing, reconnect and fresh recovery
+negotiation, authentication/proxy refusal without fallback, pause/offline/wake,
+shared FIFO admission, finite quotas, and incomplete shutdown retaining work.
+Keep TLS provider tests on the exact supplied stream; exercise TLS 1.3,
+`http/1.1`, authority validation, and rejection before carrier bytes. HTTP/HTTPS
+candidate tests must cover default rejection and per-config opt-in on both peers.
+
+```sh
+go test -mod=readonly -race -count=1 ./network ./routes ./proxy ./transport/...
+go test -mod=readonly -count=1 -run '^TestHTTPCandidatePolicyIsScoped$' -v ./securechannel
+go test -mod=readonly -count=1 -run '^Example' -v ./connection
+```
+
+The required `network-integration` CI job runs those networking packages with
+the race detector. It parses `go test -json` events to require actual run/pass
+events for each selected package and named integration cases, including both
+candidate carriers and every direct/proxy HTTP route in both authentication
+modes. Missing or skipped required coverage fails. `dependency-isolation` checks
+the root and `securechannel` production dependency graphs for optional networking
+and socket/TLS imports, and verifies execution of
+`TestHTTPCandidatePolicyIsScoped` and its four carrier/mode subtests.
+
+```sh
+go test -mod=readonly -run TestFuzzSeedCorpus -count=1 ./...
 go test -mod=readonly -fuzz=FuzzUnmarshalFrame -fuzztime=30s .
 go test -mod=readonly -fuzz=FuzzDuplicateContent -fuzztime=30s .
 go test -mod=readonly -fuzz=FuzzParseContext -fuzztime=30s ./securechannel
 go test -mod=readonly -fuzz=FuzzContextRoundTrip -fuzztime=30s ./securechannel
 ```
 
-PR CI runs 30s core smoke runs; weekly Scheduled runs 5m core campaigns.
-Run the SC1 context targets explicitly when touching their parsers. Conformance
-vectors in `conformance/` must keep passing. Local fixture tests, carrier
-integration tests, native-core checks and true independent Rust wire interop
-are separate evidence; name the level actually exercised.
+CI runs build, test, vet, race, generation, compatibility, security analysis,
+fuzz smoke, and workflow lint checks. `ci-success` aggregates the required Go
+jobs, including network integration and dependency isolation. Scheduled checks
+run longer fuzz campaigns and security analysis. Configure fuzz targets only
+after their functions exist in the selected package; package tests also execute
+the existing fuzz seed corpora.
+Benchmarks are report-only; see [BENCHMARKS.md](BENCHMARKS.md).
 
-Workflows (all actions SHA-pinned, `contents: read`, timeouts, concurrency
-cancel for PRs):
-
-- `Go` – fast required PR/main checks (`pure-go`, `generated-go`,
-  `native-go`, `compat`, `security`, `fuzz-smoke`, `actionlint`,
-  aggregator `ci-success`). Require `ci-success`
-  in the main-branch ruleset; do not require individual jobs.
-- `CodeQL` – Go analysis on push/main/PR/weekly (optional, does not gate).
-- `Scheduled` – weekly extended fuzz/security.
-- `Integration` – separate Docker-based connectivity/fault checks; see
-  [tests/integration/README.md](tests/integration/README.md).
-- `Benchmarks` – report-only `-bench . ./...` samples across root-module packages,
-  including wire/session, securechannel and transport cases; see
-  [BENCHMARKS.md](BENCHMARKS.md).
-- `Release Please` – push-to-main-only automation using conventional commits.
-  Merging a release PR pushes the root `vX.Y.Z` tag and opens the GitHub
-  Release; the Go proxy and pkg.go.dev index from the tag. No binaries are
-  published and PRs cannot trigger it. It authenticates with the built-in
-  `GITHUB_TOKEN` (no secret setup required); because pushes made with
-  `GITHUB_TOKEN` do not trigger other workflows, checks on release PRs run
-  once the PR opens.
-
-A `dependency-review` gate is intentionally absent: the action reports the
-repository does not support it until an admin enables Dependency graph
-(Settings → Code security). Re-add the gate once supported; Dependabot and
-`govulncheck` cover updates and reachable vulnerabilities meanwhile.
-
-Dependabot updates `gomod` and `github-actions` weekly; update SHAs via
-Dependabot PRs after review, never floating tags.
-
-Use neutral opaque payloads and local test fixtures. For behavior changes,
-include a focused regression that asserts observable behavior. Report existing
-test failures separately rather than changing semantics to make unrelated
-checks pass. Describe which backend and checks you exercised in your pull request.
-
-For channel changes, preserve fresh RNG use, exact context bytes, carrier
-binding, record ordering, bounds, cancellation and abortive close ownership.
-Exercise fragmented prefixes/messages, partial I/O, invalid tags, stalled
-writes and revocation as appropriate. Keep host callbacks context-aware and
-verify policy before handler effects. Exercise `connection` readiness, bounded
-server admission through the ready write and owned shutdown when changing
-orchestration. Writer tests must preserve FIFO snapshot ownership, active-plus-
-queued count/byte accounting, loop progress during stalls, bounded terminal
-drains and cancellation/join behavior. SC1 issuance/delivery/ack recovery,
-rotation, subscription routing and reliable execution-terminal proofs remain
-open integration work; do not describe them as implemented merely because a
-primitive/helper regression passes. Go/Noise/native secret erasure and native
-completion-time limitations must remain explicit until evidence changes.
-
-## Schema and generated code
-
-Read [MIGRATION.md](MIGRATION.md) for source provenance and import mappings.
-Schema and fixture updates should record their upstream source revision.
-Normative protocol changes belong in the upstream
-RFC/specification process first.
-
-Use Buf CLI 1.59.0 with the remote Go plugin v1.36.6 revision 1 configured in
-`buf.gen.yaml`. Generated files are committed and must not be hand-edited.
-Keep the logical proto import mappings complete when adding schema files;
-changing `go_package` in the snapshots is not an import-path migration step.
-
-```sh
-buf format --diff --exit-code
-buf lint
-buf build
-python3 scripts/check-generated.py
-```
-
-The drift script needs Python 3 and remote plugin access and only writes to a
-temporary directory. To intentionally regenerate committed Go output, run
-`buf generate --template buf.gen.yaml`, then inspect the resulting diff.
-Wire compatibility and cross-language conformance remain upstream concerns;
-the local fixture tests and byte-drift check cover only their stated scope.
-
-## Reports and releases
-
-Open ordinary Go implementation issues and pull requests in
-[`tinkle-org/syntra-go`](https://github.com/tinkle-org/syntra-go).
-Follow [SECURITY.md](SECURITY.md) for private vulnerability reports.
-There are no releases yet. Future releases use repository-root `vX.Y.Z` tags.
+Describe the exercised paths and actual results in pull requests. Report
+unrelated failures separately. Use [SECURITY.md](SECURITY.md) for private
+vulnerability reports.

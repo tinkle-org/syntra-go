@@ -11,7 +11,7 @@ import (
 )
 
 func TestConfigBounds(t *testing.T) {
-	maxTimeout := time.Duration(MaxRPCTimeoutMs) * time.Millisecond
+	maxTimeout := maxConfigTimeout
 	for _, timeout := range []time.Duration{0, time.Nanosecond, maxTimeout} {
 		if _, err := resolveClientConfig(ClientConfig{DefaultTimeout: timeout, MaxConcurrent: MaxConcurrentRPCs}); err != nil {
 			t.Fatal(err)
@@ -21,20 +21,20 @@ func TestConfigBounds(t *testing.T) {
 		}
 	}
 	for _, timeout := range []time.Duration{maxTimeout + time.Nanosecond, time.Duration(1<<32) * time.Millisecond} {
-		if _, err := resolveClientConfig(ClientConfig{DefaultTimeout: timeout}); callCode(t, err) != ErrorCodeOutOfRange {
+		if _, err := resolveClientConfig(ClientConfig{DefaultTimeout: timeout}); callCode(t, err) != ErrorCodeInvalidArgument {
 			t.Fatalf("client timeout %v: %v", timeout, err)
 		}
-		if _, err := resolveHostConfig(HostConfig{DefaultTimeout: timeout}); callCode(t, err) != ErrorCodeOutOfRange {
+		if _, err := resolveHostConfig(HostConfig{DefaultTimeout: timeout}); callCode(t, err) != ErrorCodeInvalidArgument {
 			t.Fatalf("host timeout %v: %v", timeout, err)
 		}
 	}
-	if _, err := resolveClientConfig(ClientConfig{MaxConcurrent: MaxConcurrentRPCs + 1}); callCode(t, err) != ErrorCodeOutOfRange {
+	if _, err := resolveClientConfig(ClientConfig{MaxConcurrent: MaxOutstandingRPCs + 1}); callCode(t, err) != ErrorCodeInvalidArgument {
 		t.Fatalf("client concurrency: %v", err)
 	}
 	if cfg, err := resolveHostConfig(HostConfig{MaxConcurrent: MaxHostConcurrentRPCs}); err != nil || cfg.maxPending != MaxHostConcurrentRPCs {
 		t.Fatalf("host concurrency 256: %v %+v", err, cfg)
 	}
-	if _, err := resolveHostConfig(HostConfig{MaxConcurrent: MaxHostConcurrentRPCs + 1}); callCode(t, err) != ErrorCodeOutOfRange {
+	if _, err := resolveHostConfig(HostConfig{MaxConcurrent: MaxHostConcurrentRPCs + 1}); callCode(t, err) != ErrorCodeInvalidArgument {
 		t.Fatalf("host concurrency: %v", err)
 	}
 }

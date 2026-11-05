@@ -1,11 +1,9 @@
-// Reliable-session contract for the Go binding: validation plus bounded
-// in-memory managers mirroring syntra-core::reliable and
-// syntra-runtime::reliable.
+// Reliable-session validation and bounded in-memory control state.
 //
 // OPTIONAL capability syntra.reliable-session/1, post-ACTIVE generic-RPC
 // control, no envelope changes, reserved values preserved, app payloads
 // opaque (equality only), no exactly-once claims, no custom crypto
-// (crypto/rand lookup handles only), production traffic requires TLS.
+// (crypto/rand lookup handles only). Network connections use Syntra encryption.
 package syntra
 
 import (
@@ -234,7 +232,7 @@ func CheckDuplicateContent(expectedMethod string, expectedPayload []byte, actual
 	return nil
 }
 
-// ReconcileOutcome mirrors the Rust contract.
+// ReconcileOutcome describes retained delivery state.
 type ReconcileOutcome string
 
 const (
@@ -292,8 +290,8 @@ type tombstoneEntry struct {
 	retainedAt time.Time
 	// digest retains the request identity (method, payload) for
 	// duplicate-content validation while the tombstone is live.
-	// Fixed-size FNV-1a 64-bit digest plus lengths (mirroring Rust
-	// ContentDigest), count-bounded by MaxTombstones, so no additional
+	// Fixed-size FNV-1a 64-bit digest plus lengths, count-bounded by
+	// MaxTombstones, so no additional
 	// byte budget is required (total overhead bounded).
 	// hasContent false means the tombstone was created without prior
 	// request content (never-seen DID); the first live resend adopts
@@ -309,8 +307,8 @@ type forgottenEntry struct {
 }
 
 // contentDigest is the bounded content identity for terminal markers,
-// mirroring Rust ContentDigest: method/payload lengths plus FNV-1a 64-bit
-// hash. Fixed size and count-bounded, so tombstone and forgotten markers
+// comprising method/payload lengths plus a FNV-1a 64-bit hash.
+// Fixed size and count-bounded, so tombstone and forgotten markers
 // remain bounded without charging the shared retained-byte budget (which
 // continues to cover pending + retained only, preserving
 // Forget-releases-bytes for different DIDs). Lengths are checked explicitly
@@ -755,8 +753,7 @@ func (m *ReliableManager) CheckIdle(now time.Time, sid SessionID) (bool, error) 
 // RecordResult retains a terminal outcome (duplicate-content checked).
 // The caller passes the attachment epoch it holds; stale/zero/future epochs
 // are rejected with FAILED_PRECONDITION before ANY mutation or activity
-// refresh (mirroring Rust record_result expected_epoch fencing and Go
-// NoteDispatch epoch ordering (now, sid, epoch, did, ...)).
+// refresh. NoteDispatch uses the same epoch fencing.
 // Activity (lastActivity) is refreshed only when accepting a terminal result:
 // new insert, expired-marker replacement, and idempotent live duplicate.
 // Failed admission (epoch mismatch, content mismatch, budget exhaustion,
@@ -1048,7 +1045,7 @@ func (m *ReliableManager) Reconcile(now time.Time, sid SessionID, did DeliveryID
 
 // pushSignalLocked queues one lifecycle signal, bounding the control queue.
 // Callers MUST hold m.mu. Full queues drop the signal with backpressure
-// (matching the Rust control-queue bound) rather than growing unbounded.
+// rather than growing unbounded.
 func (m *ReliableManager) pushSignalLocked(sid SessionID, sig SessionSignal) error {
 	if len(m.signals) >= m.bounds.MaxControlQueue {
 		return NewRpcError(ErrorCodeResourceExhausted, "syntra: control queue full; back off")
@@ -1061,7 +1058,7 @@ func (m *ReliableManager) pushSignalLocked(sid SessionID, sig SessionSignal) err
 }
 
 // Detach clears the active connection when it matches (idempotent; unknown
-// sessions are a no-op, mirroring the Rust runtime).
+// sessions are a no-op).
 func (m *ReliableManager) Detach(sid SessionID, connectionID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1201,8 +1198,7 @@ func (m *ReliableManager) RecordTombstone(now time.Time, sid SessionID, did Deli
 	// Capture content for future resend validation: prefer pending
 	// (executing work), else the expired retained just observed, else copy
 	// a live forgotten digest for consistency, else content-less (the first
-	// live resend after tombstoning will define it). Mirrors Rust
-	// record_tombstone content priority.
+	// live resend after tombstoning will define it).
 	if pending, ok := st.pending[did]; ok {
 		digest = digestContent(pending.method, pending.payload)
 		hasContent = true

@@ -1,15 +1,19 @@
 # Syntra Go
 
-Go implementation of Syntra v1 with generated Protobuf types, bounded codecs,
-client/host sessions, reliable-session and recovery helpers, and experimental
-SC1 draft-1 channels over TCP, WebSocket and secure WebSocket.
+Syntra Go is a pure-Go SDK for Syntra 1.0 (`syntra.1.0`). It provides a core and
+socket-free session runtime, encrypted connections, credential-based session
+admission, concurrent RPCs, notifications, and optional typed update recovery.
+Import `network`, `routes`, `proxy`, and the carrier packages to add managed
+networking. The networking layer uses ordinary Go goroutines and Go's netpoll
+support; it does not create its own reactor or scheduler runtime.
 
-**SC1 is an implementation-specific draft, not an accepted upstream profile or
-an independently audited secure channel.** Read [SC1.md](SC1.md) for the exact
-wire format and runnable examples, and [AUDIT.md](AUDIT.md) for implementation
-evidence, limitations and unresolved upstream questions. The core `Frame`
-schema is unchanged. Schema and fixture provenance is in
-[MIGRATION.md](MIGRATION.md).
+Noise encryption is integral to Syntra 1.0. The generated protobuf `Frame` is
+the internal envelope carried inside encrypted records. Encoding a `Frame`
+alone does not establish a Syntra connection or define a plaintext protocol.
+
+Applications can supply ordered record I/O or use the built-in carriers and
+managed clients/listeners. Trusted key provisioning, credential verification,
+per-method authorization, identity, and persistence belong to the application.
 
 ## Install
 
@@ -17,253 +21,174 @@ schema is unchanged. Schema and fixture provenance is in
 go get github.com/tinkle-org/syntra-go
 ```
 
+The module requires Go 1.23.0 or later. CI uses Go 1.26.10 for current checks and
+Go 1.23.12 for compatibility. Build deployed applications with a security-patched
+toolchain. The compatibility floor is not a runtime security recommendation.
+
+## Make a call
+
+This helper takes an application callback that establishes `ordered.MessageIO`,
+a provisioned encryption configuration, and an explicit hello credential. One
+budget covers carrier setup, encryption, authentication and readiness. The peer
+must serve `/example.Echo/Echo` and authorize that method. `connection.Connect`
+owns the supplied I/O and returns a ready client; the helper makes one call and
+closes the client.
+
 ```go
+package example
+
 import (
-    syntra "github.com/tinkle-org/syntra-go"
-    syntrav1 "github.com/tinkle-org/syntra-go/gen/syntra/v1"
+	"context"
+	"time"
+
+	syntra "github.com/tinkle-org/syntra-go"
+	"github.com/tinkle-org/syntra-go/connection"
+	"github.com/tinkle-org/syntra-go/securechannel"
+	"github.com/tinkle-org/syntra-go/transport/ordered"
 )
+
+func Echo(ctx context.Context, setup func(context.Context) (ordered.MessageIO, error),
+	encryption securechannel.ClientConfig, credential []byte,
+) ([]byte, error) {
+	budget, err := ordered.NewEstablishmentBudget(nil, 15*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	establish, cancel := budget.Context(ctx)
+	defer cancel()
+
+	records, err := setup(establish)
+	if err != nil {
+		return nil, err
+	}
+	client, err := connection.Connect(establish, records, encryption,
+		syntra.ClientConfig{Credential: credential}, ordered.Options{Budget: budget})
+	if err != nil {
+		return nil, err
+	}
+	defer client.Close()
+	return client.Call(ctx, "/example.Echo/Echo", []byte("hello"), 1000)
+}
 ```
 
-Use **Go 1.26.10** for production builds and current verification. The module's
-**Go 1.23.0** floor and CI's Go 1.23.12 lane establish API/build compatibility;
-they are not a secure-runtime recommendation. Production binaries must be built
-with a security-patched toolchain. The Go 1.26.10 scan found zero reachable
-vulnerabilities in the analyzed root module; see [SECURITY.md](SECURITY.md#dependencies-and-assurance).
+The final argument to `Call` is the requested timeout in milliseconds. Zero
+selects the configured default. Cancellation and timeouts do not roll back
+application effects or establish that retrying is safe.
 
-Select the recommended toolchain for the commands below with
-`export GOTOOLCHAIN=go1.26.10`. Current dependency pins are:
+See [CONNECTION.md](CONNECTION.md) for the I/O contract, host setup, readiness,
+ownership, and limits.
 
-| Dependency | Version |
-| --- | --- |
-| `google.golang.org/protobuf` | v1.36.6 |
-| `github.com/flynn/noise` | v1.1.0 |
-| `github.com/coder/websocket` | v1.8.15 |
-| `golang.org/x/crypto` (indirect) | v0.38.0 |
-| `golang.org/x/sys` (indirect) | v0.33.0 |
+## Packages and session APIs
 
-There are no releases yet; future releases use root `vX.Y.Z` tags.
+- `network.New(network.DefaultConfig())` creates a bounded owner for managed
+  clients and listeners. `Network.Client` supervises reconnects;
+  `ListenTCP`, `ListenWS`, `ListenWSS`, `ListenHTTP`, and `ListenHTTPS` own
+  listeners, admission, sessions, and teardown.
+- `routes` builds allowlisted, one-endpoint-per-attempt connectors with fresh
+  security inputs. `proxy` provides explicit bounded tunnels and hop credentials.
+- `transport/tcp`, `transport/websocket`, and `transport/http` implement carriers;
+  `transport/tlsstream` wraps owned streams using application TLS or its
+  `StandardProvider`. `transport/stream` supplies shared stream I/O gates.
+- `connection` composes encryption and session readiness with `Connect` and
+  `Accept`. `NewServer` optionally owns a host and bounds admitted connections.
+- The root `syntra` package contains frame validation and codecs, `OpenClient`,
+  `Client.Run`, `Client.WaitReady`, `Client.Call`, `OpenHost`, and `Host.Serve`.
+- `securechannel` implements the protocol's Noise handshake, identity evidence,
+  encrypted records, and bounded frame assembly.
+- `transport/ordered` connects that encryption to application-owned
+  `MessageIO` and exposes a frame-level `syntra.Transport` to sessions.
+- `gen/syntra/v1` contains generated protobuf messages for internal envelopes
+  and typed recovery payloads.
 
-## Default: pure Go
+The root and `securechannel` dependency graphs exclude the optional networking
+packages. The standard carrier codes are TCP `1`, WS `2` (loopback only), and
+WSS `3`. HTTP `4` and HTTPS `5` are explicit candidates: both peers must set
+`AllowHTTPCandidate` on their own security configuration. Default validation,
+parsing, encoding, and handshakes reject those candidates. Cross-carrier route
+selection requires an explicit policy and excludes WS. See
+[managed networking](CONNECTION.md#managed-networking) for setup and ownership.
 
-The default build needs neither CGO nor a native library. `go get` fetches Go
-sources only; this module never downloads native binaries. In this build,
-`NativeAvailable()` returns false and `CheckABI()` returns nil.
+`HostConfig.ChannelPolicy` verifies confirmed channel evidence and the explicit
+hello credential, returning the principal to bind to the session. When it is
+configured, it replaces `HostConfig.Policy`. A channel principal does not
+automatically authenticate the hello credential. Missing credential policy
+denies admission; missing `HostConfig.Authorize` denies every method.
+
+`HostConfig.Authorize` runs for every method before handler effects. Handlers
+receive a context bounded by the call budget and must stop and join their own
+work when it ends. Return `NewSuccessResult` for success or a typed `RpcError`
+with safe public text for a method failure.
+
+`Host.NotifyDirected` targets all connections of a principal. `Host.NotifyAll`
+broadcasts to active connections. Successful enqueue is not a delivery
+acknowledgement. Running clients receive live updates automatically through
+`Notifications()` even when no RPC is issued. Ordinary notifications use a
+bounded, lossy queue; `LossTotals` and `WaitLossChange` expose loss observations.
+Managed clients continuously drain that queue and expose generation-bound
+`NextNotification(ctx)`, with dropped-count and dropped-byte totals. Those
+generation-local counters are not durable recovery checkpoints.
+
+## Optional update recovery
+
+Recovery uses typed RPC and notification payloads within the same encrypted
+protocol. Set `HostConfig.Recovery` to a `RecoveryService`; the runtime opens and
+manages a recovery session for each authenticated connection. On the client,
+`NewRecoveryClient` attaches one immutable inbox before `Client.Run`. With
+`connection.Connect`, construct it in `ClientConfig.Prepare`. After readiness,
+explicitly negotiate `syntra.update-recovery/1` to enable recovery traffic.
+Managed clients use a configured recovery factory and pre-Run preparer to attach
+and negotiate a fresh recovery profile for every connection generation;
+`CoreReady` and `RecoveryNegotiated` are separate states.
+
+The APIs cover subscriptions, replay, catch-up, confirmation, snapshot transfer,
+and unsubscribe. `RecoveryInbox` routes recovery traffic before the ordinary
+lossy notification queue. Host sessions bind handles to one authenticated
+connection and recheck stream authorization and generation. See
+[CONNECTION.md](CONNECTION.md#attaching-update-recovery) for setup and lifecycle.
+
+The application implements `RecoverySource` for stream history, issued-checkpoint
+validation, publication ordering, and immutable snapshots. It implements
+`RecoveryPersistence` to commit the full opaque application state with its
+position. `PersistenceScope` contains the principal namespace and stable stream;
+`DurableRecord` contains generation `G`, checkpoint, and full application state.
+`Commit` compares the expected generation/checkpoint and updates the whole record
+atomically. A nil expected position requires absence; an exact full-record
+duplicate is a no-op.
+
+Persist a batch or complete snapshot before confirming it. `RecoveryProgress`
+keeps locally durable, confirm-sent, and peer-acknowledged positions separate.
+`CommitUnknown` requires reload and reconciliation on a fresh connection. The
+bounded `MemoryRecoveryStore` is volatile. Recovery does not provide exactly-once
+application effects or make arbitrary RPC replay safe.
+The SDK treats application state and payloads as opaque bytes and imports no
+application-domain schemas.
+
+## Development
 
 ```sh
 CGO_ENABLED=0 go build -mod=readonly ./...
 CGO_ENABLED=0 go test -mod=readonly -count=1 ./...
+go vet -mod=readonly ./...
+go test -mod=readonly -race -count=1 ./...
+go test -mod=readonly -race -count=1 ./network ./routes ./proxy ./transport/...
 ```
 
-## APIs and scope
-
-| Area | APIs / source |
-|---|---|
-| Wire types | `gen/syntra/v1/*.pb.go`, with core aliases such as `Frame`, `RpcRequest`, and `RpcResult` in package `syntra` |
-| Protocol core | `syntra.go`: bounds, `RpcError`, frame/handshake/RPC validation, encoding/decoding, handshake machine, correlation tracking |
-| Sessions | `Transport`, `LoopbackPair`, `OpenClient`, `Client.Run`, `Client.Call`, `OpenHost`, `Host.Serve`, `HandlerFunc` and explicit authorization in `session.go` |
-| Notifications | `Host.NotifyAll`, `Host.NotifyDirected`, `Client.Notifications`, `LossTotals`, `WaitLossChange` |
-| Channel authentication | `ChannelIdentityProvider`, `ChannelIdentity`, `ChannelPolicy`, `Host.DisconnectPrincipal` |
-| Ready-to-call connections | `connection.DialTCP`, `DialWebSocket`, `Connect`, `Client.Wait`/`Done`/`Close`; low-level `syntra.Client.WaitReady` |
-| Admission-controlled servers | `connection.NewServer`, `Server.ServeTCP`, `WebSocketHandler`, `ServerOptions`, `Server.Close` |
-| Socket-free SC1 | `securechannel.Begin`, `Initiator.Finish`, `Respond`, `Channel`, `Context`, `AppendContext`, `ServerConfig.Check` |
-| Ordered encrypted frames | `transport/ordered.Options`, `Transport.Send`, `Recv`, `Close`, optional carrier `Ping` |
-| TCP carrier | `transport/tcp.Client`, `Server`, `Dial` |
-| WS/WSS carrier | `transport/websocket.Accept`, `Dial`, `Options` |
-| Reliable sessions | `ReliableManager`, identity/epoch validation, leases, and bounded in-memory control state in `reliable.go` |
-| Recovery helpers | `DurableStore`, `MemoryStore`, `DuplicateCache`, `StagedSnapshot`, and `CheckpointReconciler` in `recovery.go` |
-| Core backends | `native_purego.go` by default; `native.go` with `-tags syntranative` |
-
-`Transport.Send` and `Recv` exchange exactly one serialized `Frame` at a time.
-The supplied SC1 adapters add encrypted record framing and bounded socket I/O.
-Applications may supply another `Transport` that meets the same boundary,
-cancellation, close and receive-allocation contracts. Upstream's production
-TLS baseline remains in effect; this experimental draft does not supersede it.
-
-Credential verification is host-owned. `CredentialPolicy` verifies opaque
-hello bytes and returns a nonempty principal; a nil policy rejects admission.
-For SC1, `HostConfig.ChannelPolicy` replaces that policy and requires freshly
-confirmed channel evidence. It must explicitly verify the hello credential,
-the current enrollment and the intended principal binding. A channel principal
-does not implicitly authorize an empty hello credential.
-
-`HostConfig.Authorize` runs before every method's handler effects. **Nil selects
-`DenyAllAuthorize`.** Use a principal-aware policy, or `AllowAllAuthorize` for an
-explicit allow-all deployment. `StaticPolicy` is a test/example convenience,
-not a credential verifier. A permission denial leaves the connection usable;
-an expired/revoked binding reported as `UNAUTHENTICATED` cancels other callbacks,
-attempts a 200ms drain of the queued RPC error, then closes the connection.
-`DisconnectPrincipal` closes current matching
-connections, including idle push-only connections; admission policy must also
-deny future connections.
-
-### Connect and call
-
-Use `connection.NewServer(hostConfig, channelConfig, connection.ServerOptions{})`
-and `server.ServeTCP(ctx, listener)` to accept TCP connections. `NewServer`
-requires an explicit `ChannelPolicy`; nil `Authorize` still denies methods.
-The client is ready to call when dialing succeeds:
-
-```go
-client, err := connection.DialTCP(ctx, address, channelConfig,
-    syntra.ClientConfig{Credential: credential}, ordered.Options{})
-if err != nil {
-    return err
-}
-defer client.Close()
-result, err := client.Call(ctx, "/example.Echo/Echo", []byte("hello"), 1000)
-```
-
-Imports are `github.com/tinkle-org/syntra-go/connection`, the root package as
-`syntra`, and `github.com/tinkle-org/syntra-go/transport/ordered`. The complete
-[executable example in SC1.md](SC1.md#executable-example-explicit-same-principal-policy)
-includes provisioning fixtures, an explicit same-principal channel/root policy,
-`ServerConfig.Check` before ready and per-method authorization. It also shows
-`DialWebSocket` with `Server.WebSocketHandler`.
-
-Dialing has a **10-second total establishment budget**, including socket/upgrade,
-SC1 and core readiness, shortened by the caller's context. Each SC1/core
-handshake retains its own five-second limit. The returned client's lifetime is
-independent of the dial context: always close it; use `Wait` or `Done` to observe
-termination. There is no automatic reconnect, RPC replay or fallback.
-
-`ServerOptions` defaults to **128 connections and 16 handshakes**, with maxima
-of 4,096 and 256. Connection admission includes handshakes; the handshake slot
-is held through SC1, core hello/policy and the ready write. Shutdown joins owned
-listeners, raw handshake sockets and sessions within a default/max **five-second**
-budget. WS/WSS callers also own HTTP header limits/timeouts, TLS configuration
-and HTTP shutdown. See [SC1.md](SC1.md#connection-orchestration) for ownership
-and lower-level `Connect`/`WaitReady` APIs.
-
-After hello/ready, each host connection uses an asynchronous FIFO writer.
-Queued plus active writes are bounded to **256 frames and 8 MiB**; saturation
-terminates `Serve` with `RESOURCE_EXHAUSTED`. The session loop continues
-cancellation, deadline and dispatch work during a socket stall. Each write
-defaults to a five-second timeout; shutdown cancels/closes I/O and joins the
-writer with a one-second bound, subject to the transport's close contract.
-
-Application payload schemas, identity systems, messenger subscriptions,
-presence, JSON gateways, service discovery and gRPC clients are outside the
-module's scope. There is no HTTP/HTTPS request-response transport planned;
-HTTP is used for the WebSocket upgrade. UDP is deferred. Reliable-session
-helpers do not claim exactly-once effects or make arbitrary RPC retries safe.
-Recovery cursors and payloads stay opaque; the helpers are not a complete
-subscription/recovery service.
-
-### Resource and compatibility behavior
-
-- A serialized frame is limited to 1 MiB, including envelope overhead. A
-  payload at the separate 1 MiB payload limit can therefore fail encoding.
-  Failed request encoding does not reserve a call slot or start its timer.
-- The pure-Go host admits a notification only while its per-connection shared
-  outbound backlog has fewer than 256 frames and the resulting serialized
-  backlog is at most 8 MiB. Saturation rejects the newest notification with
-  `RESOURCE_EXHAUSTED`; terminal RPC results remain admissible to that core
-  queue. The separate host-writer cap covers all queued/active outbound frames,
-  including terminal results. Its 8 MiB budget is distinct from the core's
-  8 MiB notification admission budget.
-  `NotifyAll` and `NotifyDirected` aggregate per-connection enqueue failures
-  with `errors.Join` (inspectable with `errors.As`); only successful enqueues
-  wake their pumps. No matching connections is a no-op, and successful enqueue
-  is not acknowledgement or delivery. `NotifyDirected` isolates principals,
-  not individual subscriptions belonging to the same principal.
-- SC1 limits ciphertext records to 65,535 bytes and plaintext to 65,519 bytes;
-  the encrypted frame stream may span records. Lifetime is at most 24 hours
-  or 2^32 records per direction. Pending transport operations default to 32
-  per direction, configurable up to 1,024. See [SC1.md](SC1.md) for exact clocks,
-  cancellation requirements and revocation checks.
-- Unknown fields alongside a known body are tolerated. Unknown top-level
-  content without a known body yields `UNIMPLEMENTED`; a genuinely empty body
-  yields `INVALID_ARGUMENT`. Body tags are 10–15; 16–17 remain reserved. The
-  upstream distinction between unknown bodies and metadata remains unresolved
-  in upstream RFC 0001 B5. Reserved tags 16–17, duplicate body/outcome fields,
-  malformed unknown fields and nesting beyond depth 32 are rejected by the
-  bounded codec on decode and emission; opaque payload bytes are not parsed.
-
-## Optional native backend
-
-`-tags syntranative` selects the CGO adapter to the Rust production
-core. It requires CGO, a C compiler, and a compatible `syntra-ffi` library built
-with `--features production`. The adapter declares the C ABI inline in
-`native.go`, so compiling Go does not require a C header checkout or include
-path. The authoritative ABI header lives with the Rust implementation at
-`crates/syntra-ffi/include/syntra_production.h`.
-
-With a compatible Rust checkout at sibling `../syntra-rs`, run these commands
-from this repository root. `LIBDIR` is absolute so the linker and loader see
-the same directory even when Go executes package tests elsewhere:
-
-```sh
-SYNTRA_RS="$(realpath ../syntra-rs)"
-CARGO_TARGET_DIR="$SYNTRA_RS/target" cargo +1.88.0 build --manifest-path "$SYNTRA_RS/Cargo.toml" --locked -p syntra-ffi --features production
-LIBDIR="$SYNTRA_RS/target/debug"
-```
-
-Linux:
-
-```sh
-CGO_ENABLED=1 CGO_LDFLAGS="-L$LIBDIR" \
-  LD_LIBRARY_PATH="$LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-  go test -mod=readonly -tags syntranative -count=1 ./...
-```
-
-Darwin:
-
-```sh
-CGO_ENABLED=1 CGO_LDFLAGS="-L$LIBDIR" \
-  DYLD_LIBRARY_PATH="$LIBDIR${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" \
-  go test -mod=readonly -tags syntranative -count=1 ./...
-```
-
-The tag alone does not supply the library. `CheckABI()` verifies production ABI
-version 1. Owned output buffers are released through `syntra_ffi_free`; handles
-are closed once. FFI-layer status failures and per-RPC error frames remain
-separate. The test-fixture loopback ABI is not the production adapter ABI.
-Native CI builds the production library from
-[`syntra-rs` commit `fca1063515d3966be71e9844346e7cbc53769c76`](https://github.com/tinkle-org/syntra-rs/commit/fca1063515d3966be71e9844346e7cbc53769c76)
-and runs the native-tagged tests and race detector. Keep this immutable pin
-in sync through reviewed changes when the native dependency is updated.
-
-SC1 carriers remain Go implementations with either core backend. ABI v1
-does not accept handler-completion timestamps or expose explicit post-hello
-credential release. The pure-Go completion-publication fix therefore does
-not establish identical native deadline arbitration or secret lifetime;
-see [AUDIT.md](AUDIT.md#remaining-gaps-and-audited-todos).
-
-## Generate and check
-
-Generated files are committed under `gen/`. Use Buf CLI **1.59.0**, the remote
-Go plugin **v1.36.6 revision 1**, and `paths=source_relative`, as pinned in
-`buf.gen.yaml`. All eight logical schema paths have explicit Go import mappings
-to this module. The `.proto` snapshots and embedded descriptors intentionally
-retain their original `go_package` option; do not rewrite them by hand.
+Generation uses Buf 1.59.0 and the Go protobuf plugin v1.36.6 revision 1. The
+protobuf runtime is v1.36.6. Generated output is committed under `gen/`.
 
 ```sh
 buf generate --template buf.gen.yaml
+python3 scripts/check-go-package.py
 python3 scripts/check-generated.py
 ```
 
-The drift check uses Python's standard library and generates into a temporary
-directory, then compares the complete `.pb.go` file set and bytes. It requires
-Buf and access to its remote plugin service, but no local `protoc` or Rust.
-`session.proto` and `capabilities.proto` produce descriptor-only Go files.
+CI checks Buf `FILE` compatibility except `FILE_SAME_GO_PACKAGE`; the local
+package check enforces canonical `go_package` options in compiled descriptors.
+The required network integration lane uses real loopback sockets without Docker,
+checks structured test execution, and runs alongside dependency-isolation and
+default candidate-rejection checks.
 
-Run from the repository root:
-
-```sh
-gofmt -l .                         # must print nothing
-go test -mod=readonly -count=1 ./...
-CGO_ENABLED=0 go test -mod=readonly -count=1 ./...
-go vet -mod=readonly ./...
-go test -mod=readonly -race -count=1 ./...
-```
-
-CI uses Go **1.26.10**, with Go **1.23.12** for API/build compatibility only.
-Root tests and benchmarks require no Docker. See
-[BENCHMARKS.md](BENCHMARKS.md) for timing boundaries and benchmark commands;
-separate container tooling is documented in
-[tests/integration/README.md](tests/integration/README.md).
-
-Tests include Protobuf vectors, schema fixtures, unit regressions and local
-carrier integration tests. Same-library Noise checks and native-core tests
-are not independent Rust SC1 interoperability or a security audit. See
-[CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
+Read [CONTRIBUTING.md](CONTRIBUTING.md) for checks,
+[BENCHMARKS.md](BENCHMARKS.md) for measurement boundaries,
+[SECURITY.md](SECURITY.md) for security responsibilities and private reports,
+and [AUDIT.md](AUDIT.md) for verification scope and evidence limits.

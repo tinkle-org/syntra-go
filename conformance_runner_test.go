@@ -2,8 +2,8 @@
 // `interop`).
 //
 // Exercises selected cases described in conformance/runner/scenarios.yaml
-// with the pure-Go or production Rust FFI core. Recovery tests run separately.
-// Interop compares executed Rust/Go decodes of shared corpus bytes; it does
+// with the Syntra core. Recovery tests run separately.
+// Interop compares executed decodes of shared corpus bytes; it does
 // not establish a live cross-language connection.
 package syntra
 
@@ -344,31 +344,22 @@ func TestRunnerDuplicateRequestThroughTransport(t *testing.T) {
 		t.Fatal("no ready")
 	}
 	ft := &faultTransport{Transport: b, faults: runnerDuplicateFaults(t)}
-	runnerSend(t, ctx, ft, NewRequestFrame(1, 7, &RpcRequest{Method: "/example.Echo/Echo", Payload: []byte("held"), TimeoutMs: 4000}))
+	runnerSend(t, ctx, b, NewRequestFrame(1, 7, &RpcRequest{Method: "/example.Echo/Echo", Payload: []byte("held"), TimeoutMs: 4000}))
 	select {
 	case <-started:
 	case <-ctx.Done():
 		t.Fatal("handler did not start")
 	}
-	rejected := runnerRecv(t, ctx, b)
-	if rejected.GetRequestId() != 7 || rejected.GetResult().GetError().GetCode() != ErrorCodeFailedPrecondition {
-		t.Fatalf("duplicate rejection = %v", rejected)
+	runnerSend(t, ctx, ft, NewRequestFrame(1, 7, &RpcRequest{Method: "/example.Echo/Echo", Payload: []byte("held"), TimeoutMs: 4000}))
+	if raw, err := b.Recv(ctx); err == nil {
+		t.Fatalf("duplicate ID must close without an offending-ID result: %x", raw)
 	}
 	if dispatched.Load() != 1 {
 		t.Fatal("duplicate request dispatched twice")
 	}
 	close(release)
-	original := runnerRecv(t, ctx, b)
-	if original.GetRequestId() != 7 || string(original.GetResult().GetPayload()) != "held" {
-		t.Fatalf("original = %v", original)
-	}
-	runnerSend(t, ctx, b, NewRequestFrame(1, 8, &RpcRequest{Method: "/example.Echo/Echo", Payload: []byte("follow"), TimeoutMs: 4000}))
-	follow := runnerRecv(t, ctx, b)
-	if follow.GetRequestId() != 8 || string(follow.GetResult().GetPayload()) != "follow" {
-		t.Fatalf("follow-up = %v", follow)
-	}
 	_, requests, results := ft.counts()
-	if requests != 1 || results != 0 || dispatched.Load() != 2 {
+	if requests != 1 || results != 0 || dispatched.Load() != 1 {
 		t.Fatalf("duplicates req=%d result=%d dispatch=%d", requests, results, dispatched.Load())
 	}
 	quiet, stop := context.WithTimeout(ctx, 20*time.Millisecond)
@@ -531,12 +522,13 @@ func TestRunnerDuplicateResultDeduped(t *testing.T) {
 type stallSendTransport struct {
 	Transport
 	release chan struct{}
+	enabled atomic.Bool
 }
 
 func (s *stallSendTransport) Send(ctx context.Context, frame []byte) error {
 	// Stall request frames until release or ctx end (simulates a stalled
 	// socket); handshake/ready already completed before wrapping.
-	if fr, err := UnmarshalFrame(frame); err == nil && BodyKindOf(fr) == BodyKindRequest {
+	if fr, err := UnmarshalFrame(frame); err == nil && s.enabled.Load() && BodyKindOf(fr) == BodyKindRequest {
 		select {
 		case <-s.release:
 		case <-ctx.Done():
@@ -558,7 +550,8 @@ func TestRunnerCallBudgetBoundsStalledSend(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	runDone := make(chan error, 1)
-	go func() { runDone <- c.Run(ctx, a) }()
+	stall := &stallSendTransport{Transport: a, release: make(chan struct{})}
+	go func() { runDone <- c.Run(ctx, stall) }()
 	h, err := OpenHost(testHostConfig())
 	if err != nil {
 		t.Fatal(err)
@@ -571,25 +564,8 @@ func TestRunnerCallBudgetBoundsStalledSend(t *testing.T) {
 	if _, err := c.Call(warm, "/example.Echo/Echo", []byte("warmup"), 1000); err != nil {
 		t.Fatalf("handshake not ready: %v", err)
 	}
-	// Wrap the client transport so the next request Send stalls.
-	stalled, ok := c.transport.(*loopback)
-	if !ok {
-		t.Fatalf("client transport not loopback; cannot stall")
-	}
-	_ = stalled
-	// Stall at the Transport level by replacing c.transport with a blocker.
-	// c.transport is set during Run; swap it under lock for the test call.
-	c.mu.Lock()
-	orig := c.transport
-	stall := &stallSendTransport{Transport: orig, release: make(chan struct{})}
-	c.transport = stall
-	c.mu.Unlock()
-	defer func() {
-		close(stall.release)
-		c.mu.Lock()
-		c.transport = orig
-		c.mu.Unlock()
-	}()
+	stall.enabled.Store(true)
+	defer close(stall.release)
 	start := time.Now()
 	_, err = c.Call(context.Background(), "/example.Echo/Echo", []byte("x"), 100)
 	if callCode(t, err) != ErrorCodeDeadlineExceeded {
@@ -600,7 +576,7 @@ func TestRunnerCallBudgetBoundsStalledSend(t *testing.T) {
 	}
 }
 
-func TestRunnerNativeHostExpiryExactlyOnce(t *testing.T) {
+func TestRunnerHostExpiryExactlyOnce(t *testing.T) {
 	// Host expiry emits exactly one DEADLINE_EXCEEDED terminal result.
 	cfg, err := resolveHostConfig(testHostConfig())
 	if err != nil {
@@ -660,17 +636,13 @@ func TestRunnerNativeHostExpiryExactlyOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, _, fatal := core.onFrame(late); fatal != nil {
-		// Native host rejects inbound result frames as invalid argument;
-		// pure-Go tolerates them. Both mean no second result is emitted.
-		if fatal.Code != ErrorCodeInvalidArgument {
-			t.Fatalf("late result fatal = %v", fatal)
-		}
+		t.Fatalf("late result fatal = %v", fatal)
 	}
 	if frame, ok := core.nextOutbound(); ok {
 		t.Fatalf("late answer emitted second result: %v", frame)
 	}
-	if _, expired, err := core.answer(41, NewSuccessResult([]byte("late"))); err == nil && !expired {
-		t.Fatal("late answer for reaped id accepted")
+	if raw, _, err := core.answer(41, NewSuccessResult([]byte("late"))); err != nil || len(raw) != 0 {
+		t.Fatalf("late answer was not ignored: bytes=%d err=%v", len(raw), err)
 	}
 	if frame, ok := core.nextOutbound(); ok {
 		t.Fatalf("late answer emitted second result: %v", frame)

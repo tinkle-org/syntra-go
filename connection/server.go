@@ -1,68 +1,167 @@
 package connection
 
 import (
-	"bufio"
 	"context"
-	"errors"
-	"net"
-	"net/http"
 	"sync"
-	"syscall"
 	"time"
 
 	syntra "github.com/tinkle-org/syntra-go"
 	"github.com/tinkle-org/syntra-go/securechannel"
 	"github.com/tinkle-org/syntra-go/transport/ordered"
-	"github.com/tinkle-org/syntra-go/transport/tcp"
-	ws "github.com/tinkle-org/syntra-go/transport/websocket"
 )
 
-// ServerOptions controls shared admission and shutdown, plus adapter limits.
-// A Server's channel carrier is fixed at construction; use separate Servers
-// for TCP, WS, and WSS. Zero selects the documented defaults.
+// Accept takes ownership of carrier, including on failure, establishes an
+// encrypted channel, and serves it on host until ctx ends or the session stops.
+// It blocks for the connection lifetime and joins carrier cleanup before return.
+// The caller owns host and may use it concurrently for other connections.
+// Configure host with an explicit ChannelPolicy and per-method Authorize policy.
+//
+// opts.Budget may include earlier carrier setup, as described by Connect. That
+// same deadline bounds host policy and the Ready write, then is retired without
+// limiting the activated session. Canceling ctx still stops the active session.
+func Accept(ctx context.Context, carrier ordered.MessageIO, channelcfg securechannel.ServerConfig, host *syntra.Host, opts ordered.Options) error {
+	if carrier == nil {
+		return ErrConfig
+	}
+	if host == nil {
+		_ = carrier.Close()
+		return ErrConfig
+	}
+	opts, err := establishmentOptions(opts)
+	if err != nil {
+		_ = carrier.Close()
+		return publicError(err)
+	}
+	t, err := ordered.Server(ctx, carrier, channelcfg, opts)
+	if err != nil {
+		return publicError(err)
+	}
+	defer t.Close()
+	establish, stopEstablish := t.EstablishmentContext(ctx)
+	lifetime, stopLifetime := context.WithCancel(ctx)
+	ready := &readyTransport{Transport: t, budget: opts.Budget, establish: establish, done: make(chan struct{}), phase: make(chan context.Context, 1)}
+	defer func() {
+		if ready.stopPhase != nil {
+			ready.stopPhase()
+		}
+	}()
+	watchDone := make(chan struct{})
+	go func() {
+		defer close(watchDone)
+		defer stopEstablish()
+		for {
+			select {
+			case phase := <-ready.phase:
+				establish = phase
+			case <-ready.done:
+				return
+			case <-establish.Done():
+				ready.mu.Lock()
+				if !ready.ready {
+					stopLifetime()
+				}
+				ready.mu.Unlock()
+				return
+			}
+		}
+	}()
+	err = host.Serve(lifetime, ready)
+	ready.mu.Lock()
+	if !ready.ready {
+		if ctxErr := establishmentError(ctx, t); ctxErr != nil {
+			err = ctxErr
+		}
+	}
+	ready.mu.Unlock()
+	stopLifetime()
+	stopEstablish()
+	<-watchDone
+	return publicError(err)
+}
+
+// Host's first successful Send is Ready. Serialize readiness with the deadline
+// watcher so an expired attempt cannot activate, or cancel an active lifetime.
+type readyTransport struct {
+	*ordered.Transport
+	budget    *ordered.EstablishmentBudget
+	establish context.Context
+	mu        sync.Mutex
+	ready     bool
+	done      chan struct{}
+	phaseOnce sync.Once
+	phase     chan context.Context
+	stopPhase context.CancelFunc
+}
+
+func (t *readyTransport) Recv(ctx context.Context) ([]byte, error) {
+	t.phaseOnce.Do(func() {
+		// Host's runtime handshake context carries its configured timeout.
+		// Capture its remaining budget in the channel's trusted clock domain.
+		timeout := 5 * time.Second
+		if deadline, ok := ctx.Deadline(); ok {
+			timeout = max(time.Nanosecond, time.Until(deadline))
+		}
+		phase, cancel := t.Transport.EstablishmentContextWithTimeout(t.establish, timeout)
+		t.stopPhase = cancel
+		t.phase <- phase
+	})
+	return t.Transport.Recv(ctx)
+}
+
+func (t *readyTransport) Send(ctx context.Context, frame []byte) error {
+	t.mu.Lock()
+	if !t.ready {
+		if err := establishmentError(ctx, t.Transport); err != nil {
+			t.mu.Unlock()
+			return err
+		}
+	}
+	t.mu.Unlock()
+	err := t.Transport.Send(ctx, frame)
+	if err != nil {
+		return err
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if !t.ready {
+		if err := establishmentError(t.establish, t.Transport); err != nil {
+			return err
+		}
+		t.budget.Release()
+		if err := t.budget.Check(); err != nil {
+			return err
+		}
+		t.ready = true
+		close(t.done)
+	}
+	return nil
+}
+
+// ServerOptions bounds admitted carriers, including pending handshakes.
 type ServerOptions struct {
-	MaxConnections  int           // default 128, maximum 4096; includes handshakes
-	MaxHandshakes   int           // default 16, maximum 256; includes core hello/policy
-	ShutdownTimeout time.Duration // default 5s, may be shortened, maximum 5s
-	TCP             ordered.Options
-	WebSocket       ws.Options // includes OriginPatterns for the HTTP upgrade
+	MaxConnections  int           // zero selects 128; maximum 4096
+	ShutdownTimeout time.Duration // zero selects 5s; maximum 5s
 }
 
-// Server owns the Host, listeners passed to ServeTCP, and admitted connections,
-// including raw sockets in SC1 handshakes. It is safe for concurrent use.
-// Construct with NewServer; do not copy it or replace Host. Host is exposed for
-// NotifyAll/DisconnectPrincipal; shut down through Server.Close to also release
-// listeners and pre-handshake sockets. Host callbacks must honor their contexts.
+// Server owns its Host and carriers passed to Accept. It is safe concurrently;
+// construct with NewServer and do not copy it or replace Host. Use Host for
+// broadcasts and principal disconnection, and Server.Close for owned shutdown.
 type Server struct {
-	Host          *syntra.Host
-	channel       securechannel.ServerConfig
-	opts          ServerOptions
-	ctx           context.Context
-	cancel        context.CancelFunc
-	once          sync.Once
-	mu            sync.Mutex
-	closed        bool
-	handshakes    int
-	conns         map[*serverConn]struct{}
-	listeners     map[net.Listener]struct{}
-	drained       chan struct{}
-	drainedClosed bool
-	done          chan struct{}
-	err           error
+	Host    *syntra.Host
+	channel securechannel.ServerConfig
+	opts    ServerOptions
+	ctx     context.Context
+	cancel  context.CancelFunc
+	once    sync.Once
+	mu      sync.Mutex
+	closed  bool
+	conns   map[*ownedCarrier]struct{}
+	drained chan struct{}
+	done    chan struct{}
 }
 
-type serverConn struct {
-	s           *Server
-	raw         net.Conn // registered before SC1, including immediately on WS hijack
-	transport   syntra.Transport
-	handshaking bool
-}
-
-// NewServer validates configuration and builds the owned Host. ChannelPolicy is
-// required: channel authentication never implicitly enables anonymous RPCs.
-// Channel enrollment lookup and lifecycle rechecks use channelcfg unchanged.
-// The server lives until Close or a ServeTCP context ends. For WebSocket-only
-// servers the caller must explicitly Close it.
+// NewServer builds an owned Host with an explicit ChannelPolicy. Nil Authorize
+// retains the core's deny-all default. Carrier setup remains the embedder's job.
 func NewServer(hostcfg syntra.HostConfig, channelcfg securechannel.ServerConfig, opts ServerOptions) (*Server, error) {
 	if hostcfg.ChannelPolicy == nil || channelcfg.Validate() != nil {
 		return nil, ErrConfig
@@ -70,24 +169,11 @@ func NewServer(hostcfg syntra.HostConfig, channelcfg securechannel.ServerConfig,
 	if opts.MaxConnections == 0 {
 		opts.MaxConnections = 128
 	}
-	if opts.MaxHandshakes == 0 {
-		opts.MaxHandshakes = 16
-	}
 	if opts.ShutdownTimeout == 0 {
 		opts.ShutdownTimeout = ShutdownTimeout
 	}
-	if opts.MaxConnections < 1 || opts.MaxConnections > 4096 || opts.MaxHandshakes < 1 || opts.MaxHandshakes > 256 || opts.ShutdownTimeout < 0 || opts.ShutdownTimeout > ShutdownTimeout {
+	if opts.MaxConnections < 1 || opts.MaxConnections > 4096 || opts.ShutdownTimeout < 0 || opts.ShutdownTimeout > ShutdownTimeout {
 		return nil, ErrConfig
-	}
-	var err error
-	if channelcfg.Carrier == securechannel.TCP {
-		opts.TCP, err = opts.TCP.Normalize()
-	} else {
-		opts.WebSocket.Limits, err = opts.WebSocket.Limits.Normalize()
-		opts.WebSocket.OriginPatterns = append([]string(nil), opts.WebSocket.OriginPatterns...)
-	}
-	if err != nil {
-		return nil, err
 	}
 	host, err := syntra.OpenHost(hostcfg)
 	if err != nil {
@@ -95,247 +181,56 @@ func NewServer(hostcfg syntra.HostConfig, channelcfg securechannel.ServerConfig,
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Server{Host: host, channel: channelcfg, opts: opts, ctx: ctx, cancel: cancel,
-		conns: make(map[*serverConn]struct{}), listeners: make(map[net.Listener]struct{}),
-		drained: make(chan struct{}), done: make(chan struct{})}, nil
+		conns: make(map[*ownedCarrier]struct{}), drained: make(chan struct{}), done: make(chan struct{})}, nil
 }
 
-// ServeTCP takes ownership of listener. Admission is checked before starting a
-// connection goroutine; excess sockets are immediately closed. Canceling ctx,
-// Close, or a listener error stops this server and joins its connections within
-// the configured shutdown budget. A custom listener may supply any net.Conn;
-// its I/O and Close must obey the net package's cancellation/deadline contract.
-func (s *Server) ServeTCP(ctx context.Context, listener net.Listener) (err error) {
-	if listener == nil {
+// Accept admits and serves one caller-supplied carrier, blocking until it stops.
+// Ownership transfers even on rejection. Cancellation ends this connection;
+// Close stops all admitted connections. Options and Budget are per connection.
+func (s *Server) Accept(ctx context.Context, carrier ordered.MessageIO, opts ordered.Options) error {
+	if carrier == nil {
 		return ErrConfig
 	}
-	if s.channel.Carrier != securechannel.TCP {
-		_ = listener.Close()
-		return ErrConfig
-	}
+	owned := &ownedCarrier{MessageIO: carrier}
 	s.mu.Lock()
+	var err error
 	if s.closed {
-		s.mu.Unlock()
-		_ = listener.Close()
-		return ErrClosed
+		err = ErrClosed
+	} else if len(s.conns) >= s.opts.MaxConnections {
+		err = ordered.ErrBusy
+	} else {
+		s.conns[owned] = struct{}{}
 	}
-	if _, exists := s.listeners[listener]; exists {
-		s.mu.Unlock()
-		return ErrConfig
-	}
-	s.listeners[listener] = struct{}{}
 	s.mu.Unlock()
-	stop := context.AfterFunc(ctx, s.initiateClose)
-	defer stop()
-	defer func() {
-		_ = listener.Close()
-		// Signal completion before joining, so shutdown never waits on itself.
-		s.mu.Lock()
-		delete(s.listeners, listener)
-		s.checkDrainedLocked()
-		s.mu.Unlock()
-		if closeErr := s.Close(); closeErr != nil && (err == nil || err == context.Canceled) {
-			err = closeErr
-		}
-	}()
-	if ctx.Err() != nil {
-		s.initiateClose()
-		return ctx.Err()
-	}
-	backoff := 5 * time.Millisecond
-	const maxBackoff = time.Second
-	for {
-		raw, acceptErr := listener.Accept()
-		if acceptErr != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			if s.ctx.Err() != nil {
-				return nil
-			}
-			if errors.Is(acceptErr, net.ErrClosed) {
-				return nil
-			}
-			if !isTemporaryAcceptError(acceptErr) {
-				return ordered.ErrIO
-			}
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-s.ctx.Done():
-				return nil
-			case <-time.After(backoff):
-			}
-			backoff *= 2
-			if backoff > maxBackoff {
-				backoff = maxBackoff
-			}
-			continue
-		}
-		backoff = 5 * time.Millisecond
-		entry := s.admit(raw)
-		if entry == nil {
-			_ = raw.Close()
-			continue
-		}
-		go func() {
-			defer entry.release()
-			t, handshakeErr := tcp.Server(s.ctx, raw, s.channel, s.opts.TCP)
-			if handshakeErr == nil {
-				entry.serve(t)
-			}
-		}()
-	}
-}
-
-// isTemporaryAcceptError reports whether an Accept error is transient and
-// worth retrying with backoff. It recognizes timeouts as well as transient
-// syscall resource conditions.
-func isTemporaryAcceptError(err error) bool {
-	var ne net.Error
-	if errors.As(err, &ne) {
-		if ne.Timeout() {
-			return true
-		}
-	}
-	if errors.Is(err, syscall.EMFILE) || errors.Is(err, syscall.ENFILE) ||
-		errors.Is(err, syscall.ECONNABORTED) || errors.Is(err, syscall.ENOMEM) ||
-		errors.Is(err, syscall.EAGAIN) {
-		return true
-	}
-	return false
-}
-
-// WebSocketHandler returns a WS/WSS handler with shared connection/handshake
-// admission and the configured OriginPatterns. After upgrade the server's
-// lifecycle, NOT r.Context(), owns Host.Serve. The handler remains until that
-// connection is joined. The caller owns http.Server: configure ReadHeaderTimeout,
-// MaxHeaderBytes and TLS there, and call Server.Close as well as HTTP shutdown
-// (net/http does not shut down hijacked WebSockets).
-func (s *Server) WebSocketHandler() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.channel.Carrier != securechannel.WS && s.channel.Carrier != securechannel.WSS {
-			http.Error(w, "invalid carrier", http.StatusBadRequest)
-			return
-		}
-		entry := s.admit(nil)
-		if entry == nil {
-			http.Error(w, "connection admission unavailable", http.StatusServiceUnavailable)
-			return
-		}
-		defer entry.release()
-		t, err := ws.Accept(s.ctx, &trackingWriter{ResponseWriter: w, entry: entry}, r, s.channel, s.opts.WebSocket)
-		if err == nil {
-			entry.serve(t)
-		}
-	})
-}
-
-func (s *Server) admit(raw net.Conn) *serverConn {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed || len(s.conns) >= s.opts.MaxConnections || s.handshakes >= s.opts.MaxHandshakes {
-		return nil
-	}
-	e := &serverConn{s: s, raw: raw, handshaking: true}
-	s.conns[e] = struct{}{}
-	s.handshakes++
-	return e
-}
-
-func (e *serverConn) finishHandshake() {
-	e.s.mu.Lock()
-	if e.handshaking {
-		e.handshaking = false
-		e.s.handshakes--
-	}
-	e.s.mu.Unlock()
-}
-
-func (e *serverConn) serve(t syntra.Transport) {
-	e.s.mu.Lock()
-	closed := e.s.closed
-	if !closed {
-		e.transport = t
-	}
-	e.s.mu.Unlock()
-	if closed {
-		_ = t.Close()
-		return
-	}
-	_ = e.s.Host.Serve(e.s.ctx, &readyTransport{Transport: t, ready: e.finishHandshake})
-}
-
-func (e *serverConn) release() {
-	e.s.mu.Lock()
-	raw, transport := e.raw, e.transport
-	e.s.mu.Unlock()
-	if raw != nil {
-		_ = raw.Close()
-	}
-	if transport != nil {
-		_ = transport.Close()
-	}
-	e.s.mu.Lock()
-	if e.handshaking {
-		e.s.handshakes--
-	}
-	delete(e.s.conns, e)
-	e.s.checkDrainedLocked()
-	e.s.mu.Unlock()
-}
-
-// The Host's first successful Send is ServerReady. Keep handshake admission
-// through policy and the ready write, without changing core session internals.
-type readyTransport struct {
-	syntra.Transport
-	ready func()
-	once  sync.Once
-}
-
-func (t *readyTransport) Send(ctx context.Context, frame []byte) error {
-	err := t.Transport.Send(ctx, frame)
-	if err == nil {
-		t.once.Do(t.ready)
-	}
-	return err
-}
-
-func (t *readyTransport) ChannelIdentity() (syntra.ChannelIdentity, bool) {
-	if p, ok := t.Transport.(syntra.ChannelIdentityProvider); ok {
-		return p.ChannelIdentity()
-	}
-	return syntra.ChannelIdentity{}, false
-}
-
-type trackingWriter struct {
-	http.ResponseWriter
-	entry *serverConn
-}
-
-func (w *trackingWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
-func (w *trackingWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
-	conn, rw, err := http.NewResponseController(w.ResponseWriter).Hijack()
 	if err != nil {
-		return nil, nil, err
+		_ = owned.Close()
+		return err
 	}
-	w.entry.s.mu.Lock()
-	closed := w.entry.s.closed
-	if !closed {
-		w.entry.raw = conn
-	}
-	w.entry.s.mu.Unlock()
-	if closed {
-		_ = conn.Close()
-		return nil, nil, net.ErrClosed
-	}
-	return conn, rw, nil
+	defer func() {
+		_ = owned.Close()
+		s.mu.Lock()
+		delete(s.conns, owned)
+		if s.closed && len(s.conns) == 0 {
+			close(s.drained)
+		}
+		s.mu.Unlock()
+	}()
+	lifetime, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(s.ctx, cancel)
+	defer stop()
+	defer cancel()
+	return Accept(lifetime, owned, s.channel, s.Host, opts)
 }
 
-func (s *Server) checkDrainedLocked() {
-	if s.closed && !s.drainedClosed && len(s.conns) == 0 && len(s.listeners) == 0 {
-		s.drainedClosed = true
-		close(s.drained)
-	}
+type ownedCarrier struct {
+	ordered.MessageIO
+	once sync.Once
+	err  error
+}
+
+func (c *ownedCarrier) Close() error {
+	c.once.Do(func() { c.err = c.MessageIO.Close() })
+	return c.err
 }
 
 func (s *Server) initiateClose() {
@@ -343,66 +238,56 @@ func (s *Server) initiateClose() {
 		s.mu.Lock()
 		s.closed = true
 		s.cancel()
-		// Snapshot resources under the lock; no socket or adapter I/O under it.
-		var closers []func()
-		for listener := range s.listeners {
-			closers = append(closers, func() { _ = listener.Close() })
+		carriers := make([]*ownedCarrier, 0, len(s.conns))
+		for c := range s.conns {
+			carriers = append(carriers, c)
 		}
-		for e := range s.conns {
-			raw, transport := e.raw, e.transport
-			closers = append(closers, func() {
-				if raw != nil {
-					_ = raw.Close()
-				}
-				if transport != nil {
-					_ = transport.Close()
-				}
-			})
+		if len(s.conns) == 0 {
+			close(s.drained)
 		}
-		closers = append(closers, func() { _ = s.Host.Close() })
-		s.checkDrainedLocked()
 		s.mu.Unlock()
-		go s.shutdown(closers)
+		go func() {
+			var joins sync.WaitGroup
+			for _, c := range carriers {
+				joins.Add(1)
+				go func() { defer joins.Done(); _ = c.Close() }()
+			}
+			_ = s.Host.Close()
+			joins.Wait()
+			<-s.drained
+			_ = s.Host.Wait(context.Background())
+			close(s.done)
+		}()
 	})
 }
 
-func (s *Server) shutdown(closers []func()) {
-	defer close(s.done)
-	timer := time.NewTimer(s.opts.ShutdownTimeout)
-	defer timer.Stop()
-	finished := make(chan struct{}, len(closers))
-	// Fan out within the admitted bound: one slow callback/adapter cannot
-	// postpone closing any other socket. No unbounded WaitGroup waiter.
-	for _, closeResource := range closers {
-		go func() { closeResource(); finished <- struct{}{} }()
-	}
-	drained := s.drained
-	for pending := len(closers); pending > 0 || drained != nil; {
-		select {
-		case <-finished:
-			pending--
-		case <-drained:
-			drained = nil
-		case <-timer.C:
-			s.mu.Lock()
-			s.err = ErrShutdownTimeout
-			s.mu.Unlock()
-			return
-		}
-	}
-}
-
-// Close synchronously stops admission, cancels the lifecycle, closes listeners,
-// raw sockets and active adapters, wakes Host.Serve, and joins within the budget.
-// It is idempotent. Callbacks and external net.Conns must honor cancellation;
-// ErrShutdownTimeout reports an incomplete join. Done closes on either outcome.
+// Close stops admission, cancels connections, closes carriers and Host, then
+// joins within the configured timeout. It is concurrent and idempotent. On
+// timeout the join owner remains active; Done signals eventual completion.
 func (s *Server) Close() error {
 	s.initiateClose()
-	<-s.done
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.err
+	ctx, cancel := context.WithTimeout(context.Background(), s.opts.ShutdownTimeout)
+	defer cancel()
+	if s.Wait(ctx) != nil {
+		return ErrShutdownTimeout
+	}
+	return nil
 }
 
-// Done closes when the bounded shutdown has completed, including on timeout.
+// Done closes once owned connections and shutdown cleanup have actually joined.
 func (s *Server) Done() <-chan struct{} { return s.done }
+
+// Wait observes shutdown completion. Canceling ctx only stops this wait.
+func (s *Server) Wait(ctx context.Context) error {
+	select {
+	case <-s.done:
+		return nil
+	default:
+	}
+	select {
+	case <-s.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}

@@ -22,19 +22,28 @@ const (
 )
 
 // Update/recovery profile payloads for ordered delivery, bounded replay,
-// snapshot recovery, and committed progress (SYN-URP-001..007,
-// SYN-URP-010..026; SYN-URP-008/009 reserved).
+// snapshot recovery, and committed progress.
 //
-// DRAFT proposal under RFC 0006, not accepted shipping authority. These
-// comments describe proposed validation; generated codecs alone do not
-// enforce it. No conformance or release claim may cite the draft as authority.
+// The `syntra.update-recovery/1` capability is optional on the wire and
+// explicitly negotiated after ACTIVE, independently on every connection.
+// Generated codecs alone do not enforce the validation described below.
 //
 // All payloads are versioned bytes carried inside the existing request,
-// result, and notification envelopes with no envelope changes. Each
-// subscription is one independent logical stream with one continuity
-// generation. Checkpoints, handles, selectors, markers, and boundaries are
-// opaque bytes. Confirmation proves only persistence through the
-// application persistence point. Bounds below are deployment-documented
+// result, and notification envelopes. A subscription is one delivery instance
+// routed by a fresh connection-scoped handle H. Principal P, stream S, and
+// continuity generation G belong to the provider-resolved scope (P, S);
+// checkpoints bind to (P, S, G). G changes only on true provider history loss
+// or an explicit shared rebase, never from subscriber-local overflow, ordinary
+// retention-window pruning, or targeted revocation termination without
+// policy-driven history reset. Every recovery round is identified by
+// connection + handle and holds one fixed boundary. Subscribe accepts yield
+// fresh handles and newly captured boundaries. Checkpoints, handles,
+// selectors, markers, and boundaries are opaque bytes. Confirmation proves
+// only persistence through the application persistence point. Locally durable
+// checkpoints, Confirm sent, and peer-acknowledged checkpoints are distinct
+// progress observations. Resume uses the durable known-safe checkpoint, which
+// may be newer than the last acknowledged checkpoint.
+// Bounds below are deployment-documented
 // defaults: at most 64 subscriptions per connection, at most 256 per
 // principal, at most 16 pending profile calls per connection, at most
 // 262144 queued notification bytes per stream, at most 1048576 per
@@ -44,7 +53,7 @@ const (
 // effective deadline 5 s where the request carries no explicit bounded
 // deadline.
 //
-// Canonical generic RPC methods (SNTR-RPC-001, exactly two slashes) are:
+// Canonical generic RPC methods (exactly two slashes) are:
 // `/syntra.v1.UpdateRecovery/Negotiate`,
 // `/syntra.v1.UpdateRecovery/Subscribe`,
 // `/syntra.v1.UpdateRecovery/Replay`,
@@ -63,7 +72,7 @@ const (
 // `RecoveryBatchTrailer` with matching profile_version, inside the existing
 // `Notification.payload` with no envelope changes.
 //
-// Wire compatibility (SNTR-SER-003, SNTR-VER-004): unknown Protobuf fields
+// Wire compatibility: unknown Protobuf fields
 // inside profile payloads MUST be ignored on receipt unless a field comment
 // explicitly marks that field `Critical`. Fields explicitly marked
 // `Ignorable` in their comments MUST be ignored on receipt. Defined fields
@@ -72,9 +81,10 @@ const (
 // versions) missing or mismatched MUST be rejected with FAILED_PRECONDITION,
 // never silently applied. Checkpoint/boundary/marker fields follow per-field
 // emptiness rules, not a blanket non-empty rule: `start_checkpoint` empty
-// means initial (SYN-URP-022), `continuation_marker` empty means first request
-// or no further page (SYN-URP-022), `terminate_reason` empty means no
-// termination unless the terminated outcome is selected (SYN-URP-026), and
+// means initial (initial subscriptions skip Replay and start live at the
+// subscribed boundary), `continuation_marker` empty means first request
+// or no further page, `terminate_reason` empty means no
+// termination unless the terminated outcome is selected, and
 // predecessor/result/boundary emptiness is governed by each field comment.
 // Unknown profile operations (method strings) MUST be rejected
 // with UNIMPLEMENTED.
@@ -83,11 +93,11 @@ type RecoveryNegotiateRequest struct {
 	// profile_version is the profile payload version. Valid value is 1.
 	// Required.
 	ProfileVersion uint32 `protobuf:"varint,1,opt,name=profile_version,json=profileVersion,proto3" json:"profile_version,omitempty"`
-	// min_version is the lowest offered profile version. Valid value is 1
-	// in this draft. Required.
+	// min_version is the lowest offered profile version. Valid value is 1.
+	// Required.
 	MinVersion uint32 `protobuf:"varint,2,opt,name=min_version,json=minVersion,proto3" json:"min_version,omitempty"`
-	// max_version is the highest offered profile version. Valid value is 1
-	// in this draft, MUST be >= min_version. Required.
+	// max_version is the highest offered profile version. Valid value is 1,
+	// MUST be >= min_version. Required.
 	MaxVersion uint32 `protobuf:"varint,3,opt,name=max_version,json=maxVersion,proto3" json:"max_version,omitempty"`
 	// capability is the ASCII capability identifier. Non-empty, at most 256
 	// bytes. Required.
@@ -161,7 +171,7 @@ type RecoveryNegotiateResponse struct {
 	// Required.
 	ProfileVersion uint32 `protobuf:"varint,1,opt,name=profile_version,json=profileVersion,proto3" json:"profile_version,omitempty"`
 	// selected_version is the highest overlap within the offered range.
-	// Valid value is 1 in this draft. Required.
+	// Valid value is 1. Required.
 	SelectedVersion uint32 `protobuf:"varint,2,opt,name=selected_version,json=selectedVersion,proto3" json:"selected_version,omitempty"`
 	// max_subscriptions_per_connection is the confirmed bound. Required.
 	MaxSubscriptionsPerConnection uint32 `protobuf:"varint,3,opt,name=max_subscriptions_per_connection,json=maxSubscriptionsPerConnection,proto3" json:"max_subscriptions_per_connection,omitempty"`
@@ -255,8 +265,13 @@ type RecoverySubscribeRequest struct {
 	// stream_selector selects the stream. Opaque bytes, non-empty, at most 1024 bytes.
 	// Required.
 	StreamSelector []byte `protobuf:"bytes,2,opt,name=stream_selector,json=streamSelector,proto3" json:"stream_selector,omitempty"`
-	// start_checkpoint is the confirmed checkpoint to continue from. Opaque bytes,
-	// empty means initial, otherwise at most 4096 bytes.
+	// start_checkpoint is the checkpoint to resume from. Opaque bytes, empty
+	// means initial, otherwise at most 4096 bytes. Must equal the initiator's
+	// durable known-safe checkpoint: the latest checkpoint whose represented
+	// application effects and (P, S, G) binding are durable or reconcilable under
+	// the application's declared persistence contract. It may be newer than the
+	// last peer-acknowledged checkpoint when an acknowledgement or its response
+	// was lost, and it is never fabricated.
 	StartCheckpoint []byte `protobuf:"bytes,3,opt,name=start_checkpoint,json=startCheckpoint,proto3" json:"start_checkpoint,omitempty"`
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
@@ -323,7 +338,12 @@ type RecoverySubscribeResponse struct {
 	// subscription_handle identifies the targeted stream. Opaque bytes, non-empty,
 	// at most 256 bytes. Required.
 	SubscriptionHandle []byte `protobuf:"bytes,2,opt,name=subscription_handle,json=subscriptionHandle,proto3" json:"subscription_handle,omitempty"`
-	// generation is the continuity generation of the stream. Required.
+	// generation is the continuity generation G of the provider-resolved scope
+	// (P, S) observed by this delivery instance. G changes only on true provider
+	// history loss or an explicit shared rebase within that scope, never for
+	// subscriber-local overflow, ordinary retention-window pruning, per-stream
+	// termination, or plain reconnection. Checkpoints bind to (P, S, G).
+	// Required.
 	Generation uint64 `protobuf:"varint,3,opt,name=generation,proto3" json:"generation,omitempty"`
 	// catchup_boundary is the fixed boundary captured at subscribe accept where
 	// recovered history meets live delivery. Opaque bytes, non-empty, at most
@@ -516,7 +536,7 @@ func (x *RecoveryUnsubscribeResponse) GetGeneration() uint64 {
 	return 0
 }
 
-// RecoveryReplayRequest asks for bounded replay from a confirmed checkpoint.
+// RecoveryReplayRequest asks for bounded replay from a durable known-safe checkpoint.
 type RecoveryReplayRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// profile_version is the profile payload version. Valid value is 1.
@@ -524,10 +544,11 @@ type RecoveryReplayRequest struct {
 	// subscription_handle identifies the targeted stream. Opaque bytes, non-empty,
 	// at most 256 bytes.
 	SubscriptionHandle []byte `protobuf:"bytes,2,opt,name=subscription_handle,json=subscriptionHandle,proto3" json:"subscription_handle,omitempty"`
-	// from_checkpoint is the confirmed checkpoint to replay from. Opaque bytes,
-	// non-empty, at most 4096 bytes. On the first request it is the last
-	// confirmed checkpoint; on continuation it MUST equal the previous page's
-	// result_checkpoint.
+	// from_checkpoint is the checkpoint replay starts from. Opaque bytes,
+	// non-empty, at most 4096 bytes. On the first Replay request it MUST be the
+	// initiator's durable known-safe checkpoint, which may be newer than the
+	// last acknowledged checkpoint but is never fabricated. Each continuation
+	// request carries the previous page's result_checkpoint.
 	FromCheckpoint []byte `protobuf:"bytes,3,opt,name=from_checkpoint,json=fromCheckpoint,proto3" json:"from_checkpoint,omitempty"`
 	// max_batches bounds batches in one page. Valid range is 1 to 64.
 	MaxBatches uint32 `protobuf:"varint,4,opt,name=max_batches,json=maxBatches,proto3" json:"max_batches,omitempty"`
@@ -724,6 +745,18 @@ func (x *RecoveryReplayPage) GetBatchPayloads() [][]byte {
 }
 
 // RecoveryReplayComplete signals the stream has reached live.
+//
+// A round is identified by connection + subscription handle, begins with
+// Subscribe, and holds one fixed boundary. Replay pages are delivered exactly
+// one per correlated RpcResult, never as page Notifications. This completion
+// travels only as the RecoveryNotification replay_complete arm. A same-handle
+// second round or marker reset is not permitted: after a new gap the initiator
+// retires the handle, clears held state, and subscribes again for a fresh
+// handle and newly captured boundary. The boundary never moves during a round.
+// On a bounded exact retry of the preceding request with a fresh RPC request
+// ID, the host returns the retained completion verbatim without rerunning
+// application effects or advancing pagination. Retired-handle completions
+// have no effect even when their boundary bytes equal the current round's.
 type RecoveryReplayComplete struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// profile_version is the profile payload version. Valid value is 1.
@@ -731,7 +764,10 @@ type RecoveryReplayComplete struct {
 	// subscription_handle identifies the targeted stream. Opaque bytes, non-empty,
 	// at most 256 bytes.
 	SubscriptionHandle []byte `protobuf:"bytes,2,opt,name=subscription_handle,json=subscriptionHandle,proto3" json:"subscription_handle,omitempty"`
-	// generation is the continuity generation of the stream.
+	// generation is the continuity generation of the provider-resolved (P, S)
+	// scope for this round. It changes only on true provider history loss or
+	// explicit shared rebase, never for local overflow, retention pruning, or
+	// targeted revocation termination.
 	Generation uint64 `protobuf:"varint,3,opt,name=generation,proto3" json:"generation,omitempty"`
 	// live_boundary_checkpoint is the checkpoint where replay met live. Opaque
 	// bytes, at most 4096 bytes.
@@ -799,6 +835,12 @@ func (x *RecoveryReplayComplete) GetLiveBoundaryCheckpoint() []byte {
 }
 
 // RecoveryCatchUpRequest triggers catch-up streaming over the existing connection.
+//
+// A recovery round chooses Replay or CatchUp, never both concurrently.
+// CatchUp streams from the start checkpoint already bound by Subscribe. The
+// retained acceptance and the round's completion are re-emitted verbatim on a
+// bounded exact retry with a fresh RPC request ID, without rerunning
+// application effects, moving the fixed boundary, or restarting.
 type RecoveryCatchUpRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// profile_version is the profile payload version. Valid value is 1.
@@ -864,7 +906,8 @@ type RecoveryCatchUpAccepted struct {
 	// subscription_handle identifies the targeted stream. Opaque bytes, non-empty,
 	// at most 256 bytes. Required.
 	SubscriptionHandle []byte `protobuf:"bytes,2,opt,name=subscription_handle,json=subscriptionHandle,proto3" json:"subscription_handle,omitempty"`
-	// generation is the continuity generation of the stream. Required.
+	// generation is the continuity generation of the provider-resolved (P, S)
+	// scope for this round. Required.
 	Generation uint64 `protobuf:"varint,3,opt,name=generation,proto3" json:"generation,omitempty"`
 	// catchup_boundary is the fixed boundary being approached. Opaque bytes, at
 	// most 4096 bytes.
@@ -941,7 +984,13 @@ type RecoverySnapshotOfferRequest struct {
 	// at most 256 bytes. Required.
 	SubscriptionHandle []byte `protobuf:"bytes,2,opt,name=subscription_handle,json=subscriptionHandle,proto3" json:"subscription_handle,omitempty"`
 	// generation is the continuity generation at offer time. Required.
-	// Binds the offer to the current generation for supersede fencing.
+	// Binds the offer to the current generation for supersede fencing. The host
+	// binds the issued snapshot handle X to (P, S, H, G, S0), where H is the
+	// subscription handle and S0 is the snapshot boundary. At most one distinct
+	// snapshot handle is offered under H; exact offer retries under the active
+	// handle return the retained descriptor. Superseding an offer retires H and
+	// requires a fresh Subscribe before a new handle is issued, even when the
+	// new boundary equals the old S0 and the generation is unchanged.
 	Generation    uint64 `protobuf:"varint,3,opt,name=generation,proto3" json:"generation,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -1010,7 +1059,12 @@ type RecoverySnapshotDescriptor struct {
 	// at most 256 bytes.
 	SnapshotHandle []byte `protobuf:"bytes,3,opt,name=snapshot_handle,json=snapshotHandle,proto3" json:"snapshot_handle,omitempty"`
 	// boundary_checkpoint is the provider-proven boundary subsequent batches chain
-	// from. Opaque bytes, at most 4096 bytes.
+	// from. Opaque bytes, at most 4096 bytes. The host and provider coordinate a
+	// recoverable binding of this boundary S0 to (P, S, G) and the snapshot
+	// contents before descriptor exposure. S0 stays resumable with host
+	// validation even if the initiator durably installs and then loses
+	// SnapshotConfirm or its response; that binding is independent of per-handle
+	// reply caching.
 	BoundaryCheckpoint []byte `protobuf:"bytes,4,opt,name=boundary_checkpoint,json=boundaryCheckpoint,proto3" json:"boundary_checkpoint,omitempty"`
 	// total_pages bounds pages in this offer. Valid range is 1 to 256.
 	TotalPages uint32 `protobuf:"varint,5,opt,name=total_pages,json=totalPages,proto3" json:"total_pages,omitempty"`
@@ -1176,7 +1230,11 @@ func (x *RecoverySnapshotChunk) GetBoundaryCheckpoint() []byte {
 	return nil
 }
 
-// RecoverySnapshotComplete marks transfer of all pages in the offer.
+// RecoverySnapshotComplete is a local transfer/installation record derived by
+// the initiator. There is no wire transmission for completion: no request
+// method, result slot, or RecoveryNotification arm carries it. Transfer
+// completion comes from complete index coverage 0..N-1 and bounded byte
+// accounting; these counts describe that local record.
 type RecoverySnapshotComplete struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// profile_version is the profile payload version. Valid value is 1.
@@ -1269,7 +1327,10 @@ type RecoverySnapshotInstalled struct {
 	SubscriptionHandle []byte `protobuf:"bytes,2,opt,name=subscription_handle,json=subscriptionHandle,proto3" json:"subscription_handle,omitempty"`
 	// boundary_checkpoint is the confirmed boundary. Opaque bytes, at most 4096 bytes.
 	BoundaryCheckpoint []byte `protobuf:"bytes,3,opt,name=boundary_checkpoint,json=boundaryCheckpoint,proto3" json:"boundary_checkpoint,omitempty"`
-	// generation is the continuity generation after installation.
+	// generation is the unchanged current generation of the provider-resolved
+	// (P, S) scope. Installation is application-local: it does not rebase the
+	// provider, increment G, or yield a replacement checkpoint token. Unrelated
+	// subscribers keep their own checkpoints.
 	Generation    uint64 `protobuf:"varint,4,opt,name=generation,proto3" json:"generation,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -1420,9 +1481,16 @@ type RecoveryConfirmRequest struct {
 	// rejected with FAILED_PRECONDITION.
 	Generation uint64 `protobuf:"varint,3,opt,name=generation,proto3" json:"generation,omitempty"`
 	// checkpoint is the batch result checkpoint being confirmed. Opaque bytes,
-	// non-empty, at most 4096 bytes. Required. Re-presenting the same bytes is
-	// idempotent and MUST return confirmed without side effects or generation
-	// change (SYN-URP-025).
+	// non-empty, at most 4096 bytes. Required. Host validation of an issued
+	// checkpoint is distinct from accepting an unoffered Confirm on an active
+	// handle. The host accepts Confirm only for bytes issued as a committable
+	// batch result for this handle and generation under its recoverable issued
+	// binding to (P, S, G). Other bytes MUST be rejected with FAILED_PRECONDITION
+	// without advancing. Within that precondition the host may accept a valid
+	// checkpoint without a previous confirmation record after a lost
+	// acknowledgement. Re-presenting the same issued bytes with a fresh RPC
+	// request ID is idempotent and MUST return confirmed without side effects
+	// or generation change.
 	Checkpoint    []byte `protobuf:"bytes,4,opt,name=checkpoint,proto3" json:"checkpoint,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -1488,7 +1556,8 @@ func (x *RecoveryConfirmRequest) GetCheckpoint() []byte {
 
 // RecoverySnapshotConfirmRequest confirms a snapshot boundary checkpoint
 // (snapshot variant) on `/syntra.v1.UpdateRecovery/SnapshotConfirm`.
-// Yields RecoverySnapshotInstalled with the new generation.
+// Yields RecoverySnapshotInstalled carrying the unchanged current generation.
+// Installation is application-local and does not rebase the provider or change G.
 type RecoverySnapshotConfirmRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// profile_version is the profile payload version. Valid value is 1.
@@ -1497,17 +1566,19 @@ type RecoverySnapshotConfirmRequest struct {
 	// subscription_handle identifies the targeted stream. Opaque bytes, non-empty,
 	// at most 256 bytes. Required.
 	SubscriptionHandle []byte `protobuf:"bytes,2,opt,name=subscription_handle,json=subscriptionHandle,proto3" json:"subscription_handle,omitempty"`
-	// generation is the continuity generation at confirm time (pre-install).
-	// Required. MUST equal the current generation before a first install.
-	// Draft retained-install retry exception (SYN-URP-025): after successful
-	// installation, an exact duplicate for the same authorized subscription,
-	// profile version, pre-install generation, and boundary bytes MAY carry
-	// that pre-install generation only while its installed response is retained
-	// and the current generation still equals that response's installed
-	// generation. The host MUST return the original RecoverySnapshotInstalled
-	// without reinstalling or advancing generation. Supersede, termination,
-	// later continuity change, or retention expiry invalidates this exception;
-	// other stale-generation requests MUST fail with FAILED_PRECONDITION.
+	// generation is the current continuity generation G of the provider-resolved
+	// (P, S) scope. Required. It MUST equal the current generation for a first
+	// install and for retained retries. After successful installation, an exact
+	// duplicate for the same authorized subscription, profile version, CURRENT
+	// generation, and boundary bytes MAY be retried on the current connection
+	// with a fresh RPC request ID while the installed response is retained, G is
+	// unchanged, and no supersede, termination, later scoped continuity change, or
+	// reply-cache expiry has ended eligibility. The host MUST return the original
+	// RecoverySnapshotInstalled (same unchanged G) without reinstalling or
+	// advancing generation. Only after retry eligibility ends, including on
+	// reply-cache expiry, use a fresh authenticated connection, renegotiation,
+	// and fresh handle and boundary. Never fabricate an earlier generation,
+	// repeat installation, or infer a post-install token.
 	Generation uint64 `protobuf:"varint,3,opt,name=generation,proto3" json:"generation,omitempty"`
 	// boundary_checkpoint is the offered boundary being confirmed. Opaque bytes,
 	// non-empty, at most 4096 bytes. Required. MUST equal the offered
@@ -1589,7 +1660,10 @@ type RecoveryConfirmResponse struct {
 	SubscriptionHandle []byte `protobuf:"bytes,2,opt,name=subscription_handle,json=subscriptionHandle,proto3" json:"subscription_handle,omitempty"`
 	// confirmed_checkpoint is the persisted checkpoint. Opaque bytes, at most
 	// 4096 bytes. Required; echoes the request checkpoint on success including
-	// idempotent retries.
+	// idempotent retries. It records only peer-acknowledged progress: sending a
+	// Confirm does not acknowledge. A locally durable or merely sent checkpoint
+	// is tracked separately by the initiator and may be newer or older than this
+	// response.
 	ConfirmedCheckpoint []byte `protobuf:"bytes,3,opt,name=confirmed_checkpoint,json=confirmedCheckpoint,proto3" json:"confirmed_checkpoint,omitempty"`
 	// generation is the continuity generation of the stream. Required.
 	// Unchanged by batch confirms.
@@ -1664,7 +1738,11 @@ type RecoveryBatch struct {
 	// subscription_handle identifies the targeted stream. Opaque bytes, non-empty,
 	// at most 256 bytes.
 	SubscriptionHandle []byte `protobuf:"bytes,2,opt,name=subscription_handle,json=subscriptionHandle,proto3" json:"subscription_handle,omitempty"`
-	// generation is the continuity generation of the stream.
+	// generation is the continuity generation G of the provider-resolved (P, S)
+	// scope for this batch. A changed G on new batches signals true provider
+	// history loss or an explicit shared rebase. G is not incremented for
+	// subscriber-local overflow, retention-window pruning, or targeted revocation
+	// termination with a history-keeping policy.
 	Generation uint64 `protobuf:"varint,3,opt,name=generation,proto3" json:"generation,omitempty"`
 	// predecessor_checkpoint is the checkpoint this batch continues from. Opaque
 	// bytes, at most 4096 bytes.
@@ -1762,7 +1840,10 @@ type RecoveryBatchTrailer struct {
 	// subscription_handle identifies the targeted stream. Opaque bytes, non-empty,
 	// at most 256 bytes.
 	SubscriptionHandle []byte `protobuf:"bytes,2,opt,name=subscription_handle,json=subscriptionHandle,proto3" json:"subscription_handle,omitempty"`
-	// generation is the continuity generation of the stream.
+	// generation is the continuity generation of the provider-resolved (P, S)
+	// scope for this trailer. It is the OLD generation carried with
+	// next_generation on true provider history loss or explicit shared rebase,
+	// and the CURRENT (unchanged) generation on local-queue termination.
 	Generation uint64 `protobuf:"varint,3,opt,name=generation,proto3" json:"generation,omitempty"`
 	// boundary_checkpoint is the catch-up or snapshot boundary. Opaque bytes, at
 	// most 4096 bytes.
@@ -1780,7 +1861,8 @@ type RecoveryBatchTrailer struct {
 	Outcome isRecoveryBatchTrailer_Outcome `protobuf_oneof:"outcome"`
 	// terminate_reason carries the required machine-readable reason when the
 	// terminated outcome is selected. Opaque bytes, non-empty when terminated,
-	// at most 256 bytes. Empty means no termination.
+	// at most 256 bytes. Empty means no termination. ASCII `local-queue-exhausted`
+	// denotes local queue exhaustion, mutually exclusive with continuity loss.
 	TerminateReason []byte `protobuf:"bytes,9,opt,name=terminate_reason,json=terminateReason,proto3" json:"terminate_reason,omitempty"`
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
@@ -1899,8 +1981,12 @@ type isRecoveryBatchTrailer_Outcome interface {
 }
 
 type RecoveryBatchTrailer_NextGeneration struct {
-	// next_generation carries the new generation on continuity loss. Selected
-	// only on continuity loss with a nonzero new generation.
+	// next_generation carries the nonzero new generation Gnext of the
+	// provider-resolved (P, S) scope on true provider history loss or an explicit
+	// shared rebase, with the trailer's generation carrying the old G. Selected
+	// ONLY on that shared scoped continuity change, never on subscriber-local
+	// saturation, ordinary retention-window pruning, or initiator-manufactured
+	// values. Local saturation uses terminated at the current generation.
 	NextGeneration uint64 `protobuf:"varint,5,opt,name=next_generation,json=nextGeneration,proto3,oneof"`
 }
 
@@ -1919,6 +2005,10 @@ type RecoveryBatchTrailer_Terminated struct {
 	// terminated is selected with true when the host ends the targeted
 	// subscription. The trailer carries the typed terminal signal so the host
 	// can terminate one stream even when there is no outstanding invocation.
+	// Subscriber-local saturation uses this outcome at the CURRENT generation
+	// with terminate_reason = ASCII `local-queue-exhausted` and no
+	// next_generation. Local queue overflow does not rebase the provider or
+	// invalidate other subscribers' checkpoints.
 	Terminated bool `protobuf:"varint,8,opt,name=terminated,proto3,oneof"`
 }
 
@@ -2218,7 +2308,7 @@ const file_syntra_v1_recovery_profile_proto_rawDesc = "" +
 	"\x05batch\x18\x02 \x01(\v2\x18.syntra.v1.RecoveryBatchH\x00R\x05batch\x12L\n" +
 	"\x0freplay_complete\x18\x03 \x01(\v2!.syntra.v1.RecoveryReplayCompleteH\x00R\x0ereplayComplete\x12;\n" +
 	"\atrailer\x18\x04 \x01(\v2\x1f.syntra.v1.RecoveryBatchTrailerH\x00R\atrailerB\x0e\n" +
-	"\fnotificationB?Z=github.com/tinklehq/syntra/bindings/go/gen/syntra/v1;syntrav1b\x06proto3"
+	"\fnotificationB8Z6github.com/tinkle-org/syntra-go/gen/syntra/v1;syntrav1b\x06proto3"
 
 var (
 	file_syntra_v1_recovery_profile_proto_rawDescOnce sync.Once

@@ -1,19 +1,5 @@
 package syntra
 
-// Recovery helpers for the Go binding: durable position/effects atomicity,
-// bounded duplicate suppression, staged snapshots, and independently
-// scheduled bounded checkpoint reconciliation.
-//
-// These mirror the Rust recovery drivers (crates/syntra-runtime/src/
-// recovery/{store,cache,snapshot,driver,reconcile}.rs) so both stacks share
-// one contract:
-//   - persist position+effects atomically, confirm only on success;
-//   - answer duplicates from a bounded cache without re-applying effects;
-//   - stage snapshots without interpretation and install only when complete;
-//   - route batches to exactly one subscription (never NotifyAll broadcast);
-//   - reconcile missing final updates on an independent schedule without
-//     requiring another update (idle peers converge).
-
 import (
 	"sort"
 	"sync"
@@ -55,16 +41,14 @@ func (e *StoreError) Error() string {
 	return "syntra: " + ErrorCodeName(e.Code) + ": " + e.Message
 }
 
-// DurableStore persists positions with durable position/effects atomicity:
-// StoreAtomic either records both the position and its effects digest or
-// records neither and returns an error. Load returns the last atomically
-// stored position.
+// DurableStore is a position/metadata helper. An effects digest does not persist
+// application effects. Use RecoveryPersistence for full-state recovery commits.
 type DurableStore interface {
 	Load(stream string) *CommittedPosition
 	StoreAtomic(pos CommittedPosition, effectsDigest []byte) error
 }
 
-// MemoryStore is an in-memory DurableStore for drivers, embeds, and tests.
+// MemoryStore is a bounded volatile position/metadata helper, not durable storage.
 // FailNext injects exactly one Unavailable failure on the next write;
 // FailAlways fails every write until cleared.
 type MemoryStore struct {
@@ -73,14 +57,15 @@ type MemoryStore struct {
 	digests    map[string][]byte
 	FailNext   bool
 	FailAlways bool
+	MaxRecords int
 }
 
 // NewMemoryStore returns an empty store.
 func NewMemoryStore() *MemoryStore {
-	return &MemoryStore{positions: make(map[string]CommittedPosition), digests: make(map[string][]byte)}
+	return &MemoryStore{positions: make(map[string]CommittedPosition), digests: make(map[string][]byte), MaxRecords: 256}
 }
 
-// Load returns the last durably stored position for stream, or nil. The
+// Load returns the last recorded position for stream, or nil. The
 // returned position deep-copies committed bytes so callers can never alias
 // (or mutate) store state.
 func (s *MemoryStore) Load(stream string) *CommittedPosition {
@@ -101,13 +86,19 @@ func (s *MemoryStore) Load(stream string) *CommittedPosition {
 // StoreAtomic records pos and effectsDigest atomically, or records nothing
 // on injected failure. The caller must not confirm on error. Both the
 // position's committed bytes and the digest are deep-copied so later caller
-// mutation cannot alias durable state.
+// mutation cannot alias retained state. Recording a digest is not persistence of effects.
 func (s *MemoryStore) StoreAtomic(pos CommittedPosition, effectsDigest []byte) error {
 	if s == nil {
 		return &StoreError{Code: ErrorCodeInternal, Message: "syntra: nil store"}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if len(pos.Stream) == 0 || len(pos.Stream) > 1024 || pos.Generation == 0 || !recoveryCP(pos.Committed) || len(effectsDigest) > 4096 {
+		return recoveryInvalid()
+	}
+	if _, ok := s.positions[pos.Stream]; !ok && (s.MaxRecords <= 0 || len(s.positions) >= s.MaxRecords) {
+		return recoveryLimit()
+	}
 	if s.FailAlways || s.FailNext {
 		s.FailNext = false
 		return &StoreError{Code: ErrorCodeUnavailable, Message: "syntra: persistence unavailable"}
@@ -151,7 +142,7 @@ func (c *DuplicateCache) Contains(key []byte) bool {
 // Insert records a confirmed result. Duplicate inserts are no-ops. Beyond
 // capacity the oldest entry is evicted first.
 func (c *DuplicateCache) Insert(key []byte) {
-	if c == nil || c.capacity <= 0 {
+	if c == nil || c.capacity <= 0 || len(key) > 16384 {
 		return
 	}
 	c.mu.Lock()
@@ -206,6 +197,9 @@ func NewStagedSnapshot(handle, boundary []byte, totalPages, pageMax int) (*Stage
 	if len(boundary) == 0 {
 		return nil, NewRpcError(ErrorCodeInvalidArgument, "syntra: snapshot boundary must be non-empty")
 	}
+	if !recoveryHandle(handle) || len(boundary) > 4096 {
+		return nil, recoveryInvalid()
+	}
 	return &StagedSnapshot{
 		handle:   append([]byte(nil), handle...),
 		boundary: append([]byte(nil), boundary...),
@@ -234,6 +228,9 @@ func (s *StagedSnapshot) StagePage(index int, bytes, boundary []byte) error {
 	if len(bytes) > s.pageMax {
 		return NewRpcError(ErrorCodeResourceExhausted, "syntra: snapshot page exceeds bound")
 	}
+	if len(bytes) == 0 {
+		return recoveryInvalid()
+	}
 	if s.filled[index] {
 		if string(s.pages[index]) != string(bytes) {
 			return NewRpcError(ErrorCodeInvalidArgument, "syntra: snapshot page conflict")
@@ -254,11 +251,15 @@ func (s *StagedSnapshot) Install() ([]byte, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var out []byte
+	total := 0
 	for i := 0; i < s.total; i++ {
 		if !s.filled[i] {
 			return nil, NewRpcError(ErrorCodeFailedPrecondition, "syntra: snapshot incomplete")
 		}
+		total += len(s.pages[i])
+	}
+	out := make([]byte, 0, total)
+	for i := 0; i < s.total; i++ {
 		out = append(out, s.pages[i]...)
 	}
 	return out, nil
@@ -280,6 +281,8 @@ type ReconcilerConfig struct {
 	TickInterval time.Duration
 	// MaxStreamsPerTick caps streams that may report per tick.
 	MaxStreamsPerTick int
+	// MaxStreams bounds retained observations. Zero selects 256.
+	MaxStreams int
 }
 
 // CheckpointReconciler discovers missing final updates without requiring
@@ -302,6 +305,9 @@ func NewCheckpointReconciler(cfg ReconcilerConfig) *CheckpointReconciler {
 	if cfg.MaxStreamsPerTick <= 0 {
 		cfg.MaxStreamsPerTick = 16
 	}
+	if cfg.MaxStreams <= 0 {
+		cfg.MaxStreams = 256
+	}
 	return &CheckpointReconciler{config: cfg, observed: make(map[string]Checkpoint)}
 }
 
@@ -310,14 +316,26 @@ func NewCheckpointReconciler(cfg ReconcilerConfig) *CheckpointReconciler {
 // then goes idle. Base and Result bytes are deep-copied so later caller
 // mutation cannot alias reconciler state.
 func (r *CheckpointReconciler) NoteObserved(cp Checkpoint) {
+	_ = r.TryNoteObserved(cp)
+}
+
+// TryNoteObserved records an observation or reports a bound without mutation.
+func (r *CheckpointReconciler) TryNoteObserved(cp Checkpoint) error {
 	if r == nil {
-		return
+		return recoveryInvalid()
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if len(cp.Stream) == 0 || len(cp.Stream) > 1024 || cp.Generation == 0 || len(cp.Base) > 4096 || len(cp.Result) > 4096 {
+		return recoveryInvalid()
+	}
+	if _, ok := r.observed[cp.Stream]; !ok && len(r.observed) >= r.config.MaxStreams {
+		return recoveryLimit()
+	}
 	cp.Base = append([]byte(nil), cp.Base...)
 	cp.Result = append([]byte(nil), cp.Result...)
 	r.observed[cp.Stream] = cp
+	return nil
 }
 
 // Forget stops tracking a stream.

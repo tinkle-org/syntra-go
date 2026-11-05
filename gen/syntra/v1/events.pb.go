@@ -21,13 +21,13 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
-// Notification is the published uncorrelated event name (SNTR-EVENT-001..008).
+// Notification carries an uncorrelated event.
 // It does not imply processing, durability, replay, or delivery acknowledgment.
-// Subscriptions use application-defined RPCs. Core stream state, cursors,
-// ReplayRequest/ReplayResponse, and acknowledgments await a capability RFC.
+// Subscriptions use application-defined RPCs or explicitly negotiated profiles.
+// Stream state, cursors, replay, and acknowledgments are not core envelope fields.
 type Notification struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// payload is opaque application bytes; empty is valid (SNTR-WIRE-007).
+	// payload is opaque application bytes; empty is valid.
 	Payload       []byte `protobuf:"bytes,1,opt,name=payload,proto3" json:"payload,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -76,7 +76,7 @@ const file_syntra_v1_events_proto_rawDesc = "" +
 	"\n" +
 	"\x16syntra/v1/events.proto\x12\tsyntra.v1\"(\n" +
 	"\fNotification\x12\x18\n" +
-	"\apayload\x18\x01 \x01(\fR\apayloadB?Z=github.com/tinklehq/syntra/bindings/go/gen/syntra/v1;syntrav1b\x06proto3"
+	"\apayload\x18\x01 \x01(\fR\apayloadB8Z6github.com/tinkle-org/syntra-go/gen/syntra/v1;syntrav1b\x06proto3"
 
 var (
 	file_syntra_v1_events_proto_rawDescOnce sync.Once

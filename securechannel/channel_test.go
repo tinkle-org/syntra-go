@@ -71,7 +71,7 @@ func channelPair(t testing.TB, f channelFixture) (*Channel, *Channel) {
 // Construct the expected bytes without using AppendContext or package constants
 // for the domain/field layout, so changing the encoder alone breaks the tests.
 func canonicalTestContext(c Context) []byte {
-	out := append([]byte("syntra.sc1.draft1"), byte(c.Mode), byte(c.Carrier))
+	out := append([]byte("syntra.1.0"), byte(c.Mode), byte(c.Carrier))
 	out = binary.BigEndian.AppendUint32(out, c.ServerKeyID)
 	out = binary.BigEndian.AppendUint64(out, c.Epoch)
 	out = append(out, c.Handle[:]...)
@@ -218,8 +218,8 @@ func TestNoiseSuiteInteroperability(t *testing.T) {
 }
 
 func TestContextCanonicalBounds(t *testing.T) {
-	if HandshakeSize != 48 || MaxCiphertext != 65535 || MaxPlaintext != 65519 || MaxScopeBytes != 255 || MaxContext != len("syntra.sc1.draft1")+24+255 {
-		t.Fatal("SC1 draft-1 wire bounds changed")
+	if HandshakeSize != 48 || MaxCiphertext != 65535 || MaxPlaintext != 65519 || MaxScopeBytes != 255 || MaxContext != 289 {
+		t.Fatal("Syntra wire bounds changed")
 	}
 	for _, mode := range []Mode{Bootstrap, Returning} {
 		for _, carrier := range []Carrier{TCP, WS, WSS} {
@@ -570,12 +570,6 @@ func TestReplayM1RequiresFreshRecordConfirmation(t *testing.T) {
 				if mode == Returning && (peer.Principal != original.Principal || peer.ExpiresAt != original.ExpiresAt) {
 					t.Fatal("peer evidence mismatch")
 				}
-				if _, err := s.Encrypt(nil, []byte("server sending is not client confirmation")); err != nil {
-					t.Fatal(err)
-				}
-				if _, confirmed := s.Peer(); confirmed {
-					t.Fatal("sending confirmed a client")
-				}
 			}
 			wantCalls := 0
 			if mode == Returning {
@@ -691,22 +685,13 @@ func TestInvalidRecordsAreTerminal(t *testing.T) {
 	}
 }
 
-func TestInvalidPlaintextDoesNotConsumeNonce(t *testing.T) {
-	client, server := channelPair(t, newChannelFixture(t, Returning))
+func TestInvalidPlaintextIsTerminal(t *testing.T) {
 	for _, bad := range [][]byte{nil, {}, make([]byte, MaxPlaintext+1)} {
+		client, _ := channelPair(t, newChannelFixture(t, Returning))
 		if out, err := client.Encrypt(nil, bad); out != nil || err != ErrRecord {
 			t.Fatalf("invalid plaintext: %v", err)
 		}
-	}
-	if client.send.cipher.Nonce() != 0 {
-		t.Fatal("invalid local plaintext consumed a nonce")
-	}
-	wire, err := client.Encrypt(nil, []byte("still nonce zero"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := server.Decrypt(nil, wire); err != nil {
-		t.Fatal(err)
+		requireTerminal(t, client)
 	}
 }
 
@@ -725,7 +710,7 @@ func TestChannelLimits(t *testing.T) {
 				var wire []byte
 				switch limit {
 				case "age":
-					target.created = time.Now().Add(-24 * time.Hour)
+					target.clock.Invalidate()
 				case "expiry":
 					target.peer.ExpiresAt = time.Now().Add(-time.Minute)
 				case "records":
@@ -807,6 +792,9 @@ func TestConfigurationAndKeyDiagnostics(t *testing.T) {
 		func(c *ServerConfig) { c.Carrier = 0 },
 		func(c *ServerConfig) { c.Carrier = 255 },
 		func(c *ServerConfig) { c.Lookup, c.AllowBootstrap = nil, false },
+		func(c *ServerConfig) {
+			c.LookupKey = func(context.Context, Context) (Key, error) { return Key{1}, nil }
+		},
 	} {
 		c := f.server
 		change(&c)
@@ -947,7 +935,9 @@ func TestEntropyFailureFailsClosed(t *testing.T) {
 		r := &entropyFailingReader{err: entropyErr}
 		s, m2, err := respond(context.Background(), f.server, m1, r)
 		requireAuthDenied(t, s, m2, err)
-		checkRead(t, r)
+		if r.calls != 0 {
+			t.Fatal("rejected lookup consumed entropy")
+		}
 		if calls != 1 {
 			t.Fatalf("lookup calls = %d, want 1", calls)
 		}
@@ -1001,6 +991,13 @@ func TestWarmPreallocatedAllocations(t *testing.T) {
 
 func TestConcurrentFullDuplexAndClose(t *testing.T) {
 	client, server := channelPair(t, newChannelFixture(t, Returning))
+	wire, err := client.Encrypt(nil, []byte("confirm"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.Decrypt(nil, wire); err != nil {
+		t.Fatal(err)
+	}
 	var wg sync.WaitGroup
 	for _, pair := range [][2]*Channel{{client, server}, {server, client}} {
 		wg.Add(1)

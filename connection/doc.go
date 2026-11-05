@@ -1,19 +1,23 @@
-// Package connection orchestrates SC1 adapters and Syntra sessions for callers
-// that need a ready-to-call client or a bounded, admission-controlled server.
-// It performs no application RPCs, stores no enrollment data, and never retries
-// or falls back to another carrier or security mode.
+// Package connection composes encrypted ordered-message carriers with Syntra
+// sessions. Embedders supply ordered.MessageIO implementations; Connect returns
+// a ready client and Accept serves a carrier on a caller-owned Host. NewServer
+// optionally owns the Host, bounds admission, and joins accepted carriers.
 //
-// DialTCP and DialWebSocket return only after core ServerReady validation. Their
-// contexts bound establishment (ten seconds total by default, shortened by the
-// caller); the owned Client.Run lifetime is independent. Always defer Close on
-// a successful client. Wait observes terminal run errors without requiring an
-// application-owned error watcher. Connect provides the same ownership for an
-// already established syntra.Transport obeying its cancellation contract.
+// Create ordered.EstablishmentBudget before carrier setup, use Budget.Context
+// for that setup, then pass the same pointer in ordered.Options.Budget. Each
+// budget belongs to one attempt. Encryption, hello, policy, and Ready retain
+// the original absolute deadline. If Budget is omitted, the attempt starts at
+// Connect or Accept. A trusted elapsed clock can be injected when constructing
+// the budget for platforms requiring embedder-managed lifecycle continuity.
 //
-// NewServer builds its Host from an explicit ChannelPolicy. Authorize retains
-// the core's deny-all default. Configure enrollment Lookup and fail-closed
-// lifecycle checks on securechannel.ServerConfig. Server.Close owns the Host,
-// listeners and admitted sockets, including half-handshakes. For HTTP carriers,
-// configure the caller-owned http.Server's header limits, header timeout, and
-// TLS policy, and close the connection Server when shutting down HTTP.
+// Connect's context controls establishment. Successful clients own independent
+// run lifetimes: always Close them. Wait observes terminal errors and Done marks
+// completed cleanup. Accept's context controls its whole connection lifetime.
+// All supplied carriers must bound reads, honor contexts, and promptly interrupt
+// both I/O directions on Close. Shutdown timeouts retain the cleanup owner.
+//
+// Configure an explicit Host ChannelPolicy to bind the confirmed channel and
+// hello credential to an application principal. Per-method Authorize remains
+// deny-all unless configured, for example with syntra.AllowAllAuthorize.
+// Carrier routing and enrollment checks belong in securechannel configuration.
 package connection

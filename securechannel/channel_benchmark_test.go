@@ -92,8 +92,8 @@ func BenchmarkHandshakeAndConfirm(b *testing.B) {
 				if _, ok := server.Peer(); !ok {
 					b.Fatal("server not confirmed")
 				}
-				if _, ok := client.Peer(); !ok {
-					b.Fatal("client not confirmed")
+				if _, ok := client.Peer(); ok {
+					b.Fatal("initiator issued responder identity")
 				}
 				client.Close()
 				server.Close()
@@ -113,6 +113,13 @@ func BenchmarkRecordWarm(b *testing.B) {
 					client, server := channelPair(b, newChannelFixture(b, mode))
 					sender, receiver := client, server
 					if direction == "server-to-client" {
+						confirmation, err := client.Encrypt(nil, []byte("confirm"))
+						if err != nil {
+							b.Fatal(err)
+						}
+						if _, err := server.Decrypt(nil, confirmation); err != nil {
+							b.Fatal(err)
+						}
 						sender, receiver = server, client
 					}
 					plaintext := bytes.Repeat([]byte{0x5a}, size)

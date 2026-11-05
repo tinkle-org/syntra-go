@@ -1,4 +1,4 @@
-// Package ordered binds SC1 records to an ordered, message-oriented carrier.
+// Package ordered binds Syntra records to an ordered, message-oriented carrier.
 package ordered
 
 import (
@@ -12,7 +12,7 @@ import (
 	"github.com/tinkle-org/syntra-go/securechannel"
 )
 
-const MaxFrame = 1 << 20
+const MaxFrame = securechannel.MaxFrame
 
 var (
 	ErrClosed   = errors.New("ordered: closed")
@@ -33,24 +33,33 @@ type MessageIO interface {
 }
 
 // Options are per-connection limits. Zero selects the documented defaults;
-// time limits may be shortened, but cannot exceed 5s (24h for Lifetime).
+// time limits may be shortened from their defaults: attempt 15s, Noise and
+// encrypted hello 5s shared, writes 10s, records/frames 30s, lifetime 24h.
 // MaxPending includes the active operation in each direction (default 32,
 // maximum 1024). Admission beyond that limit fails immediately with ErrBusy.
 type Options struct {
+	AttemptTimeout   time.Duration
 	HandshakeTimeout time.Duration
 	WriteTimeout     time.Duration
 	FrameTimeout     time.Duration
 	RecordTimeout    time.Duration
 	Lifetime         time.Duration
 	MaxPending       int
+	Budget           *EstablishmentBudget
 }
 
 func (o Options) Normalize() (Options, error) {
-	for _, p := range []*time.Duration{&o.HandshakeTimeout, &o.WriteTimeout, &o.FrameTimeout, &o.RecordTimeout} {
-		if *p == 0 {
-			*p = 5 * time.Second
+	for _, limit := range []struct {
+		value   *time.Duration
+		maximum time.Duration
+	}{
+		{&o.AttemptTimeout, 15 * time.Second}, {&o.HandshakeTimeout, 5 * time.Second},
+		{&o.WriteTimeout, 10 * time.Second}, {&o.FrameTimeout, 30 * time.Second}, {&o.RecordTimeout, 30 * time.Second},
+	} {
+		if *limit.value == 0 {
+			*limit.value = limit.maximum
 		}
-		if *p < 0 || *p > 5*time.Second {
+		if *limit.value < 0 || *limit.value > limit.maximum {
 			return Options{}, ErrOptions
 		}
 	}
@@ -69,29 +78,60 @@ func (o Options) Normalize() (Options, error) {
 	return o, nil
 }
 
+func setup(ctx context.Context, opts Options) (Options, *securechannel.Clock, time.Duration, time.Duration, error) {
+	o, err := opts.Normalize()
+	if err != nil {
+		return Options{}, nil, 0, 0, err
+	}
+	b := o.Budget
+	if b == nil {
+		b, err = NewEstablishmentBudget(nil, o.AttemptTimeout)
+	}
+	if err != nil {
+		return Options{}, nil, 0, 0, err
+	}
+	clock, attempt, phase, err := b.claim(o)
+	if err == nil {
+		err = elapsedError(ctx, clock, phase)
+	}
+	if err != nil {
+		return Options{}, nil, 0, 0, err
+	}
+	o.Budget = b
+	return o, clock, attempt, phase, nil
+}
+
 // Client performs M1/M2 and takes ownership of carrier, including on failure.
 func Client(ctx context.Context, carrier MessageIO, cfg securechannel.ClientConfig, opts Options) (*Transport, error) {
-	o, err := opts.Normalize()
+	o, clock, attempt, phase, err := setup(ctx, opts)
 	if err != nil {
 		carrier.Close()
 		return nil, err
 	}
-	started := time.Now()
-	ctx, cancel := context.WithTimeout(ctx, min(o.HandshakeTimeout, o.Lifetime))
+	ctx, cancel := elapsedContext(ctx, clock, phase)
 	defer cancel()
-	i, first, err := securechannel.Begin(cfg)
+	i, first, err := securechannel.BeginWithClock(cfg, clock)
 	if err != nil {
 		carrier.Close()
 		return nil, err
 	}
 	defer i.Close()
 	defer clear(first)
-	if err = carrier.WriteMessage(ctx, first); err != nil {
+	if err = elapsedError(ctx, clock, phase); err == nil {
+		err = carrier.WriteMessage(ctx, first)
+	}
+	if err == nil {
+		err = elapsedError(ctx, clock, phase)
+	}
+	if err != nil {
 		carrier.Close()
 		return nil, publicError(ctx, err)
 	}
 	var reply [securechannel.HandshakeSize]byte
 	m, err := carrier.ReadMessage(ctx, reply[:0])
+	if err == nil {
+		err = elapsedError(ctx, clock, phase)
+	}
 	if err != nil {
 		carrier.Close()
 		return nil, publicError(ctx, err)
@@ -102,23 +142,23 @@ func Client(ctx context.Context, carrier MessageIO, cfg securechannel.ClientConf
 		carrier.Close()
 		return nil, err
 	}
-	if ctx.Err() != nil {
+	if err = elapsedError(ctx, clock, phase); err != nil {
 		ch.Close()
 		carrier.Close()
-		return nil, ctx.Err()
+		return nil, err
 	}
-	o.Lifetime -= time.Since(started)
-	if o.Lifetime <= 0 {
-		ch.Close()
-		carrier.Close()
-		return nil, context.DeadlineExceeded
+	t := newTransport(carrier, ch, nil, o)
+	t.establish(attempt, phase, false)
+	if err := t.checkTime(); err != nil {
+		t.Close()
+		return nil, err
 	}
-	return newTransport(carrier, ch, nil, o), nil
+	return t, nil
 }
 
 // Server performs M1/M2. Identity remains unconfirmed until Decrypt succeeds.
 func Server(ctx context.Context, carrier MessageIO, cfg securechannel.ServerConfig, opts Options) (*Transport, error) {
-	o, err := opts.Normalize()
+	o, clock, attempt, phase, err := setup(ctx, opts)
 	if err != nil {
 		carrier.Close()
 		return nil, err
@@ -127,41 +167,49 @@ func Server(ctx context.Context, carrier MessageIO, cfg securechannel.ServerConf
 		carrier.Close()
 		return nil, securechannel.ErrConfig
 	}
-	started := time.Now()
-	ctx, cancel := context.WithTimeout(ctx, min(o.HandshakeTimeout, o.Lifetime))
+	ctx, cancel := elapsedContext(ctx, clock, phase)
 	defer cancel()
 	var first [securechannel.MaxContext + securechannel.HandshakeSize]byte
 	m, err := carrier.ReadMessage(ctx, first[:0])
+	if err == nil {
+		err = elapsedError(ctx, clock, phase)
+	}
 	if err != nil {
 		carrier.Close()
 		return nil, publicError(ctx, err)
 	}
-	ch, reply, err := securechannel.Respond(ctx, cfg, m)
+	ch, reply, err := securechannel.RespondWithClock(ctx, cfg, m, clock)
 	clear(first[:])
 	if err != nil {
 		carrier.Close()
 		return nil, err
 	}
 	defer clear(reply)
-	if err = carrier.WriteMessage(ctx, reply); err != nil {
+	if err = elapsedError(ctx, clock, phase); err == nil {
+		err = carrier.WriteMessage(ctx, reply)
+	}
+	if err == nil {
+		err = elapsedError(ctx, clock, phase)
+	}
+	if err != nil {
 		ch.Close()
 		carrier.Close()
 		return nil, publicError(ctx, err)
 	}
-	if ctx.Err() != nil {
+	if err = elapsedError(ctx, clock, phase); err != nil {
 		ch.Close()
 		carrier.Close()
-		return nil, ctx.Err()
-	}
-	o.Lifetime -= time.Since(started)
-	if o.Lifetime <= 0 {
-		ch.Close()
-		carrier.Close()
-		return nil, context.DeadlineExceeded
+		return nil, err
 	}
 	// Lifecycle rechecks need public routing and Lookup, not the static secret.
 	cfg.StaticKey = securechannel.StaticKey{}
-	return newTransport(carrier, ch, &cfg, o), nil
+	t := newTransport(carrier, ch, &cfg, o)
+	t.establish(attempt, phase, true)
+	if err := t.checkTime(); err != nil {
+		t.Close()
+		return nil, err
+	}
+	return t, nil
 }
 
 // Transport owns its cipher and bounded reusable record scratch. Returned
@@ -172,27 +220,40 @@ type Transport struct {
 	server  *securechannel.ServerConfig
 	opts    Options
 
-	mu        sync.Mutex // bounded admitted callers only; never held over I/O/waiting
-	closed    bool
-	ops       sync.WaitGroup
-	once      sync.Once
-	confirmed sync.Once
-	confirm   chan struct{}
+	mu                                                sync.Mutex // bounded admitted callers only; never held over I/O/waiting
+	closed                                            bool
+	localStop                                         bool
+	suspended                                         bool
+	terminal                                          error
+	attemptDeadline, helloDeadline, readinessDeadline time.Duration
+	establishing, helloPending, responder             bool
+	readinessStarted                                  bool
+	lastRecordAt                                      time.Duration
+	ops                                               sync.WaitGroup
+	confirmed                                         sync.Once
+	confirm                                           chan struct{}
+	peerGate                                          chan struct{}
+	peerRequired, peerAuthorized                      bool
+	identity                                          securechannel.VerifiedIdentity
+	peer                                              securechannel.Peer
+	identitySet                                       bool
 
 	ctx             context.Context
 	cancel          context.CancelFunc
 	done            chan struct{}
-	socketStopped   chan struct{}
+	carrierStopped  chan struct{}
 	stopped         chan struct{}
 	lifetimeTimer   *time.Timer
 	lifetimeStopped chan struct{}
+	clockStopped    chan struct{}
 
-	sendGate, recvGate           chan struct{}
-	sendAdmission, recvAdmission chan struct{}
-	sendPlain, sendCipher        []byte
-	recvPlain, recvCipher        []byte
-	remaining                    []byte
-	receivedAt                   time.Time
+	sendGate, recvGate              chan struct{}
+	sendAdmission, recvAdmission    chan struct{}
+	sendPlain, sendCipher           []byte
+	recvPlain, recvCipher           []byte
+	decoder                         securechannel.FrameDecoder
+	frames                          [][]byte
+	frameDeadline, deliveryDeadline time.Duration
 }
 
 var _ syntra.Transport = (*Transport)(nil)
@@ -201,34 +262,156 @@ var _ syntra.ChannelIdentityProvider = (*Transport)(nil)
 func newTransport(carrier MessageIO, ch *securechannel.Channel, cfg *securechannel.ServerConfig, o Options) *Transport {
 	ctx, cancel := context.WithCancel(context.Background())
 	t := &Transport{io: carrier, channel: ch, server: cfg, opts: o, ctx: ctx, cancel: cancel,
-		done: make(chan struct{}), socketStopped: make(chan struct{}), stopped: make(chan struct{}), lifetimeStopped: make(chan struct{}), confirm: make(chan struct{}),
+		peerGate: make(chan struct{}, 1), peerRequired: cfg != nil,
+		done: make(chan struct{}), carrierStopped: make(chan struct{}), stopped: make(chan struct{}), lifetimeStopped: make(chan struct{}), clockStopped: make(chan struct{}), confirm: make(chan struct{}),
 		sendGate: make(chan struct{}, 1), recvGate: make(chan struct{}, 1),
 		sendAdmission: make(chan struct{}, o.MaxPending), recvAdmission: make(chan struct{}, o.MaxPending),
 		sendPlain: make([]byte, securechannel.MaxPlaintext), sendCipher: make([]byte, securechannel.MaxCiphertext),
 		recvCipher: make([]byte, securechannel.MaxCiphertext), recvPlain: make([]byte, securechannel.MaxPlaintext)}
 	// Independent of Lookup: even a bounded but slow lifecycle check must not
-	// postpone the absolute channel lifetime or leave an idle socket open.
-	t.lifetimeTimer = time.AfterFunc(o.Lifetime, func() { t.abort(); close(t.lifetimeStopped) })
+	// postpone the absolute channel lifetime or leave an idle carrier open.
+	t.lifetimeTimer = time.AfterFunc(max(0, o.Lifetime-ch.Age()), func() { t.abort(context.DeadlineExceeded); close(t.lifetimeStopped) })
+	t.lastRecordAt = ch.Age()
+	go t.monitorClock()
 	go t.supervise()
 	return t
 }
 
-func (t *Transport) abort() {
-	t.once.Do(func() {
-		t.mu.Lock()
-		t.closed = true
-		close(t.done)
-		t.cancel()
-		t.mu.Unlock()
-		_ = t.io.Close()
-		close(t.socketStopped)
-	})
+func (t *Transport) monitorClock() {
+	defer close(t.clockStopped)
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case <-t.done:
+			return
+		case <-tick.C:
+			if err := t.checkTime(); err != nil {
+				t.abort(err)
+				return
+			}
+		}
+	}
 }
 
-// Close first shuts the socket, then joins operations and the lifecycle task
+func (t *Transport) abort(cause ...error) {
+	var err error
+	if len(cause) != 0 {
+		err = cause[0]
+	}
+	t.retire(err, false)
+}
+
+func (t *Transport) retire(err error, local bool) {
+	if err != nil {
+		err = publicError(context.Background(), err)
+	}
+	t.mu.Lock()
+	t.localStop = t.localStop || local
+	// A source failure can finish after the local fence closes admission. Keep
+	// it even then; only errors induced by interrupting I/O are clean shutdown.
+	localError := !specificFailure(err) && (localStopError(err) || t.suspended && errors.Is(err, context.DeadlineExceeded))
+	if err != nil && (t.terminal == nil || !specificFailure(t.terminal) && specificFailure(err)) && (!t.localStop || !localError) {
+		t.terminal = err
+	}
+	if t.closed {
+		t.mu.Unlock()
+		return
+	}
+	t.closed = true
+	close(t.done)
+	t.cancel()
+	t.mu.Unlock()
+	go func() {
+		defer close(t.carrierStopped)
+		_ = t.io.Close()
+	}()
+}
+
+func localStopError(err error) bool {
+	if specificFailure(err) {
+		return false
+	}
+	var rpc *syntra.RpcError
+	if errors.As(err, &rpc) {
+		return rpc.Code == syntra.ErrorCodeCancelled || rpc.Code == syntra.ErrorCodeUnavailable
+	}
+	return errors.Is(err, context.Canceled) || errors.Is(err, ErrClosed) ||
+		errors.Is(err, ErrIO) || errors.Is(err, securechannel.ErrClosed)
+}
+
+// Specific failures outrank generic loss, but never replace one another. Check
+// security sentinels before cancellation: a joined error may carry both.
+func specificFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	for _, known := range []error{securechannel.ErrAuth, securechannel.ErrRecord, securechannel.ErrLimit, securechannel.ErrConfig, ErrProtocol, ErrOptions} {
+		if errors.Is(err, known) {
+			return true
+		}
+	}
+	var rpc *syntra.RpcError
+	if errors.As(err, &rpc) {
+		return rpc.Code != syntra.ErrorCodeCancelled && rpc.Code != syntra.ErrorCodeUnavailable && rpc.Code != syntra.ErrorCodeDeadlineExceeded
+	}
+	return !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) &&
+		!errors.Is(err, ErrClosed) && !errors.Is(err, ErrIO) && !errors.Is(err, securechannel.ErrClosed)
+}
+
+// LocalStopError identifies interruption errors after this owner's stop fence.
+func (t *Transport) LocalStopError(err error) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.localStop && !specificFailure(err) && (localStopError(err) || t.suspended && errors.Is(err, context.DeadlineExceeded))
+}
+
+// Stop installs the local admission fence and interrupts I/O without joining.
+func (t *Transport) Stop() {
+	t.retire(nil, true)
+}
+
+// TerminalError exposes the failure before carrier cleanup has joined. The first
+// specific failure supersedes generic loss and stays sticky. Local closure is clean.
+func (t *Transport) TerminalError() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.terminal
+}
+
+// Suspend fences I/O immediately when elapsed-clock continuity is lost.
+func (t *Transport) Suspend() {
+	t.mu.Lock()
+	t.localStop, t.suspended = true, true
+	t.mu.Unlock()
+	t.channel.Clock().Invalidate()
+	t.Stop()
+}
+
+// Close first shuts the carrier, then joins operations and the lifecycle task
 // before erasing scratch and releasing cipher states. Carriers and host Lookup
 // implementations must honor their cancellation contract.
-func (t *Transport) Close() error { t.abort(); <-t.stopped; return nil }
+func (t *Transport) Close() error { t.Stop(); <-t.stopped; return nil }
+
+// Stopped closes after carrier cleanup, operations, and lifecycle tasks join.
+func (t *Transport) Stopped() <-chan struct{} { return t.stopped }
+
+// CloseContext stops admission and I/O, then waits within the caller's budget.
+// A timeout retains the join owner; a later Close still waits for full cleanup.
+func (t *Transport) CloseContext(ctx context.Context) error {
+	t.Stop()
+	select {
+	case <-t.stopped:
+		return nil
+	default:
+	}
+	select {
+	case <-t.stopped:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
 
 func (t *Transport) supervise() {
 	defer close(t.stopped)
@@ -244,7 +427,8 @@ func (t *Transport) supervise() {
 	for {
 		select {
 		case <-t.done:
-			<-t.socketStopped
+			<-t.carrierStopped
+			<-t.clockStopped
 			t.ops.Wait()
 			t.channel.Close()
 			clear(t.sendPlain)
@@ -252,54 +436,146 @@ func (t *Transport) supervise() {
 			clear(t.recvPlain)
 			clear(t.recvCipher)
 			t.sendPlain, t.sendCipher, t.recvPlain, t.recvCipher = nil, nil, nil, nil
-			t.remaining = nil
+			t.decoder.Close()
+			for _, frame := range t.frames {
+				clear(frame)
+			}
+			t.frames = nil
 			t.server = nil
+			t.mu.Lock()
+			t.identity, t.peer, t.identitySet = securechannel.VerifiedIdentity{}, securechannel.Peer{}, false
+			t.mu.Unlock()
 			return
 		case <-confirm:
 			confirm = nil
 			active = t.server != nil
-			if active {
-				t.checkPeer()
-			}
 		case <-tick.C:
 			if active {
-				t.checkPeer()
+				if err := t.checkPeer(t.ctx, t.operationDeadline(time.Second), false); err != nil {
+					t.abort(err)
+				}
 			}
 		}
 	}
 }
 
-func (t *Transport) checkPeer() {
-	p, ok := t.channel.Peer()
-	if !ok || (!p.ExpiresAt.IsZero() && !time.Now().Before(p.ExpiresAt)) {
-		t.abort()
-		return
+// VerifiedIdentity includes the authenticated handshake hash for application
+// channel binding. Only the responder can issue it after client confirmation.
+func (t *Transport) VerifiedIdentity() (securechannel.VerifiedIdentity, bool) {
+	if !t.peerReady() {
+		return securechannel.VerifiedIdentity{}, false
 	}
-	ctx, cancel := context.WithTimeout(t.ctx, time.Second)
-	err := t.server.Check(ctx, p)
-	cancel()
-	if err != nil {
-		t.abort()
-	}
-}
-
-func (t *Transport) ChannelIdentity() (syntra.ChannelIdentity, bool) {
-	p, ok := t.channel.Peer()
-	if !ok {
-		return syntra.ChannelIdentity{}, false
+	if err := t.checkTime(); err != nil {
+		t.abort(err)
+		return securechannel.VerifiedIdentity{}, false
 	}
 	select {
 	case <-t.done:
-		return syntra.ChannelIdentity{}, false
+		return securechannel.VerifiedIdentity{}, false
 	default:
 	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed || !t.identitySet {
+		return securechannel.VerifiedIdentity{}, false
+	}
+	return t.identity, true
+}
+
+func (t *Transport) rememberIdentity() {
+	t.mu.Lock()
+	set := t.identitySet
+	t.mu.Unlock()
+	if set {
+		return
+	}
+	id, ok := t.channel.VerifiedIdentity()
+	if !ok {
+		return
+	}
+	peer, ok := t.channel.Peer()
+	if !ok {
+		return
+	}
+	t.mu.Lock()
+	t.identity, t.peer, t.identitySet = id, peer, true
+	t.mu.Unlock()
+}
+
+func (t *Transport) peerReady() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return !t.peerRequired || t.peerAuthorized
+}
+
+// Serialize callbacks across delivery, writes and idle supervision. The first
+// check belongs to Recv, before it exposes the complete initial frame.
+func (t *Transport) checkPeer(parent context.Context, until time.Duration, initial bool) (err error) {
+	if !t.peerRequired {
+		return nil
+	}
+	until = min(until, t.operationDeadline(time.Second))
+	ctx, cancel := elapsedContext(parent, t.channel.Clock(), until)
+	stop := context.AfterFunc(t.ctx, cancel)
+	defer stop()
+	defer cancel()
+	select {
+	case t.peerGate <- struct{}{}:
+		defer func() {
+			if err != nil {
+				t.abort(err)
+			}
+			<-t.peerGate
+		}()
+	case <-ctx.Done():
+		return publicError(ctx, ctx.Err())
+	}
+	if err := t.checkOperation(ctx, until); err != nil {
+		return err
+	}
+	if !initial && !t.peerReady() {
+		return securechannel.ErrAuth
+	}
+	t.mu.Lock()
+	id, ok := t.identity, t.identitySet
+	t.mu.Unlock()
+	if !ok {
+		return securechannel.ErrAuth
+	}
+	err = t.server.CheckIdentity(ctx, id)
+	if timeErr := t.checkOperation(ctx, until); timeErr != nil {
+		return timeErr
+	}
+	if err != nil {
+		return securechannel.ErrAuth
+	}
+	t.mu.Lock()
+	t.peerAuthorized = true
+	t.mu.Unlock()
+	return nil
+}
+
+func (t *Transport) ChannelIdentity() (syntra.ChannelIdentity, bool) {
+	if !t.peerReady() {
+		return syntra.ChannelIdentity{}, false
+	}
+	if err := t.checkTime(); err != nil {
+		t.abort(err)
+		return syntra.ChannelIdentity{}, false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed || !t.identitySet {
+		return syntra.ChannelIdentity{}, false
+	}
+	p := t.peer
 	c := p.Context
 	return syntra.ChannelIdentity{Mode: c.Mode.String(), Carrier: c.Carrier.String(), Scope: c.Scope, Handle: c.Handle, Epoch: c.Epoch, Principal: p.Principal}, true
 }
 
 func (t *Transport) acquire(ctx context.Context, admission, gate chan struct{}) (func(), error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, publicError(ctx, err)
 	}
 	select {
 	case <-t.done:
@@ -327,7 +603,7 @@ func (t *Transport) acquire(ctx context.Context, admission, gate chan struct{}) 
 		if err := ctx.Err(); err != nil {
 			<-gate
 			releaseAdmission()
-			return nil, err
+			return nil, publicError(ctx, err)
 		}
 		select {
 		case <-t.done:
@@ -339,16 +615,34 @@ func (t *Transport) acquire(ctx context.Context, admission, gate chan struct{}) 
 		return func() { <-gate; releaseAdmission() }, nil
 	case <-ctx.Done():
 		releaseAdmission()
-		return nil, ctx.Err()
+		return nil, publicError(ctx, ctx.Err())
 	case <-t.done:
 		releaseAdmission()
 		return nil, ErrClosed
 	}
 }
 
-func publicError(ctx context.Context, _ error) error {
+func publicError(ctx context.Context, err error) error {
+	for _, known := range []error{securechannel.ErrAuth, securechannel.ErrRecord, securechannel.ErrLimit, securechannel.ErrConfig, ErrProtocol, ErrOptions, ErrClosed} {
+		if errors.Is(err, known) {
+			return known
+		}
+	}
+	var rpc *syntra.RpcError
+	if errors.As(err, &rpc) {
+		return syntra.NewRpcError(rpc.Code, "ordered: carrier failed")
+	}
 	if err := ctx.Err(); err != nil {
-		return err
+		if errors.Is(context.Cause(ctx), context.DeadlineExceeded) {
+			return context.DeadlineExceeded
+		}
+		return context.Canceled
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return context.DeadlineExceeded
+	}
+	if errors.Is(err, context.Canceled) {
+		return context.Canceled
 	}
 	return ErrIO
 }
@@ -357,18 +651,32 @@ func publicError(ctx context.Context, _ error) error {
 // Any error after encryption is terminal: that nonce can never be reused.
 func (t *Transport) Send(ctx context.Context, frame []byte) error {
 	if len(frame) == 0 || len(frame) > MaxFrame {
+		t.abort(ErrProtocol)
 		return ErrProtocol
 	}
-	ctx, cancel := context.WithTimeout(ctx, t.opts.WriteTimeout)
+	until := t.operationDeadline(t.opts.WriteTimeout)
+	ctx, cancel := elapsedContext(ctx, t.channel.Clock(), until)
 	defer cancel()
 	release, err := t.acquire(ctx, t.sendAdmission, t.sendGate)
 	if err != nil {
 		return err
 	}
 	defer release()
+	if err := t.checkOperation(ctx, until); err != nil {
+		t.abort(err)
+		return err
+	}
 	var prefix [4]byte
 	binary.BigEndian.PutUint32(prefix[:], uint32(len(frame)))
 	for offset := 0; offset < 4+len(frame); {
+		if err := t.checkPeer(ctx, until, false); err != nil {
+			t.abort(err)
+			return err
+		}
+		if err := t.checkOperation(ctx, until); err != nil {
+			t.abort(err)
+			return err
+		}
 		n := min(len(t.sendPlain), 4+len(frame)-offset)
 		p := t.sendPlain[:n]
 		copied := 0
@@ -379,19 +687,24 @@ func (t *Transport) Send(ctx context.Context, frame []byte) error {
 		record, encErr := t.channel.Encrypt(t.sendCipher[:0], p)
 		clear(p)
 		if encErr != nil {
-			t.abort()
-			return ErrProtocol
+			return t.cipherFailure(encErr)
+		}
+		if err := t.checkOperation(ctx, until); err != nil {
+			t.abort(err)
+			return err
 		}
 		if err = t.io.WriteMessage(ctx, record); err != nil {
-			t.abort()
-			return publicError(ctx, err)
+			out := publicError(ctx, err)
+			t.abort(out)
+			return out
 		}
-		if ctx.Err() != nil {
-			t.abort()
-			return ctx.Err()
+		if err = t.checkOperation(ctx, until); err != nil {
+			t.abort(err)
+			return err
 		}
 		offset += n
 	}
+	t.helloComplete(true)
 	return nil
 }
 
@@ -402,16 +715,26 @@ func (t *Transport) Ping(ctx context.Context) error {
 	if !ok {
 		return ErrOptions
 	}
-	ctx, cancel := context.WithTimeout(ctx, t.opts.WriteTimeout)
+	until := t.operationDeadline(t.opts.WriteTimeout)
+	ctx, cancel := elapsedContext(ctx, t.channel.Clock(), until)
 	defer cancel()
 	release, err := t.acquire(ctx, t.sendAdmission, t.sendGate)
 	if err != nil {
 		return err
 	}
 	defer release()
+	if err := t.checkOperation(ctx, until); err != nil {
+		t.abort(err)
+		return err
+	}
 	if err = p.Ping(ctx); err != nil {
-		t.abort()
-		return publicError(ctx, err)
+		out := publicError(ctx, err)
+		t.abort(out)
+		return out
+	}
+	if err := t.checkOperation(ctx, until); err != nil {
+		t.abort(err)
+		return err
 	}
 	return nil
 }
@@ -425,81 +748,107 @@ func (t *Transport) Recv(ctx context.Context) ([]byte, error) {
 		return nil, err
 	}
 	defer release()
-	var deadline time.Time
-	var prefix [4]byte
-	if err = t.readPlain(ctx, prefix[:], &deadline); err != nil {
-		t.abort()
-		return nil, err
+	for {
+		until := t.operationDeadline(t.opts.RecordTimeout)
+		if t.frameDeadline != 0 {
+			until = min(until, t.frameDeadline)
+		}
+		if len(t.frames) != 0 {
+			until = min(until, t.deliveryDeadline)
+		}
+		if err := t.checkOperation(ctx, until); err != nil {
+			t.abort(err)
+			return nil, err
+		}
+		if len(t.frames) != 0 {
+			if err := t.checkPeer(ctx, until, true); err != nil {
+				t.abort(err)
+				return nil, err
+			}
+			if err := t.checkOperation(ctx, until); err != nil {
+				t.abort(err)
+				return nil, err
+			}
+			frame := t.frames[0]
+			t.frames[0] = nil
+			t.frames = t.frames[1:]
+			t.helloComplete(false)
+			t.confirmed.Do(func() { close(t.confirm) })
+			return frame, nil
+		}
+		readCtx, cancel := elapsedContext(ctx, t.channel.Clock(), until)
+		ciphertext, err := t.io.ReadMessage(readCtx, t.recvCipher[:0])
+		if err == nil {
+			err = t.checkOperation(readCtx, until)
+		}
+		if err != nil {
+			out := publicError(readCtx, err)
+			cancel()
+			t.abort(out)
+			return nil, out
+		}
+		cancel()
+		plain, err := t.channel.Decrypt(t.recvPlain[:0], ciphertext)
+		if err != nil {
+			return nil, t.cipherFailure(err)
+		}
+		t.rememberIdentity()
+		frames, err := t.decoder.Push(plain)
+		clear(plain)
+		if err != nil {
+			t.abort(ErrProtocol)
+			return nil, ErrProtocol
+		}
+		t.frames = frames
+		now := t.channel.Age()
+		t.mu.Lock()
+		t.lastRecordAt = now
+		firstHello := t.responder && t.helloPending
+		t.mu.Unlock()
+		if firstHello && len(frames) != 0 && (len(frames) != 1 || t.decoder.IsPartial()) {
+			t.abort(ErrProtocol)
+			return nil, ErrProtocol
+		}
+		if !t.decoder.IsPartial() {
+			t.frameDeadline = 0
+		} else if t.frameDeadline == 0 || len(frames) != 0 {
+			t.frameDeadline = now + t.opts.FrameTimeout
+		}
+		t.deliveryDeadline = now + t.opts.WriteTimeout
+		if err := t.checkOperation(ctx, until); err != nil {
+			t.abort(err)
+			return nil, err
+		}
+		if t.peerReady() {
+			if err := t.checkPeer(ctx, until, false); err != nil {
+				t.abort(err)
+				return nil, err
+			}
+		}
 	}
-	n := binary.BigEndian.Uint32(prefix[:])
-	if n == 0 || n > MaxFrame {
-		t.abort()
-		return nil, ErrProtocol
-	}
-	frame := make([]byte, int(n)) // length has been checked before allocation
-	if err = t.readPlain(ctx, frame, &deadline); err != nil {
-		clear(frame)
-		t.abort()
-		return nil, err
-	}
-	if err = ctx.Err(); err != nil {
-		clear(frame)
-		t.abort()
-		return nil, err
-	}
-	if !time.Now().Before(deadline) {
-		clear(frame)
-		t.abort()
-		return nil, context.DeadlineExceeded
-	}
-	return frame, nil
 }
 
-func (t *Transport) readPlain(ctx context.Context, dst []byte, deadline *time.Time) error {
-	for len(dst) != 0 {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if !deadline.IsZero() && !time.Now().Before(*deadline) {
-			return context.DeadlineExceeded
-		}
-		if len(t.remaining) == 0 {
-			readCtx := ctx
-			cancel := func() {}
-			if !deadline.IsZero() {
-				readCtx, cancel = context.WithDeadline(ctx, *deadline)
-			}
-			ciphertext, err := t.io.ReadMessage(readCtx, t.recvCipher[:0])
-			if err == nil {
-				err = readCtx.Err()
-			}
-			if err != nil {
-				out := publicError(readCtx, err)
-				cancel()
-				return out
-			}
-			cancel()
-			if len(ciphertext) < 17 || len(ciphertext) > securechannel.MaxCiphertext {
-				return ErrProtocol
-			}
-			plain, err := t.channel.Decrypt(t.recvPlain[:0], ciphertext)
-			if err != nil {
-				return ErrProtocol
-			}
-			t.receivedAt = time.Now()
-			t.remaining = plain
-			t.confirmed.Do(func() { close(t.confirm) })
-		}
-		if deadline.IsZero() {
-			*deadline = t.receivedAt.Add(t.opts.FrameTimeout)
-		}
-		if !time.Now().Before(*deadline) {
-			return context.DeadlineExceeded
-		}
-		n := copy(dst, t.remaining)
-		clear(t.remaining[:n])
-		t.remaining = t.remaining[n:]
-		dst = dst[n:]
+func (t *Transport) cipherFailure(err error) error {
+	err = t.channelError(err)
+	t.abort(err)
+	if err == ErrClosed {
+		return ErrClosed
 	}
-	return nil
+	return ErrProtocol
+}
+
+// Only a closed cipher caused by local teardown is an ordinary interruption.
+// Classify the actual operation result, not current channel liveness: a genuine
+// decrypt failure can be recorded after another direction has closed the owner.
+func (t *Transport) channelError(err error) error {
+	if err != securechannel.ErrClosed {
+		return err
+	}
+	t.mu.Lock()
+	local := t.localStop
+	t.mu.Unlock()
+	if local {
+		return ErrClosed
+	}
+	return ErrProtocol
 }

@@ -21,21 +21,19 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
-// Frame is a versioned Syntra envelope, independent of transport framing
-// (SNTR-WIRE-001..008). See specifications/schema/reference.md for runtime
-// validation obligations and RFC 0001 for unresolved behavioral conflicts.
+// Frame is a versioned Syntra envelope, independent of transport framing.
 type Frame struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// version is the proposed maximum in hello and the selected version thereafter
-	// (SNTR-HS-003/010). Zero is not a negotiated version.
+	// version is the proposed maximum in hello and the selected version thereafter.
+	// Zero is not a negotiated version.
 	Version uint32 `protobuf:"varint,1,opt,name=version,proto3" json:"version,omitempty"`
 	// request_id is connection-scoped correlation, not an authenticator or an
 	// operation key. Zero is used by hello, ready, and notification; request,
-	// result, and cancel use nonzero IDs (SNTR-WIRE-003, SNTR-RPC-002/010).
+	// result, and cancel use nonzero IDs.
 	RequestId uint64 `protobuf:"varint,2,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	// body selects one operation. Generated oneofs do not enforce all protocol
 	// validation: an unset body is representable and duplicate wire alternatives
-	// may be collapsed by the decoder. See RFC 0001, B4.
+	// may be collapsed by the decoder.
 	//
 	// Types that are valid to be assigned to Body:
 	//
@@ -160,32 +158,32 @@ type isFrame_Body interface {
 }
 
 type Frame_Hello struct {
-	// hello begins host-owned authentication (SNTR-HS-003, SNTR-AUTH-001).
+	// hello begins host-owned authentication.
 	Hello *ClientHello `protobuf:"bytes,10,opt,name=hello,proto3,oneof"`
 }
 
 type Frame_Ready struct {
-	// ready confirms acceptance, not synchronized application state (SNTR-HS-004).
+	// ready confirms acceptance, not synchronized application state.
 	Ready *ServerReady `protobuf:"bytes,11,opt,name=ready,proto3,oneof"`
 }
 
 type Frame_Request struct {
-	// request invokes an application-defined method (SNTR-RPC-001).
+	// request invokes an application-defined method.
 	Request *RpcRequest `protobuf:"bytes,12,opt,name=request,proto3,oneof"`
 }
 
 type Frame_Result struct {
-	// result completes a call; notifications may precede it (SNTR-RPC-002/020).
+	// result completes a call; notifications may precede it.
 	Result *RpcResult `protobuf:"bytes,13,opt,name=result,proto3,oneof"`
 }
 
 type Frame_Cancel struct {
-	// cancel requests cancellation, never rollback (SNTR-RPC-005).
+	// cancel requests cancellation, never rollback.
 	Cancel *Cancel `protobuf:"bytes,14,opt,name=cancel,proto3,oneof"`
 }
 
 type Frame_Notification struct {
-	// notification carries opaque host-authorized data (SNTR-EVENT-001/002).
+	// notification carries opaque host-authorized data.
 	Notification *Notification `protobuf:"bytes,15,opt,name=notification,proto3,oneof"`
 }
 
@@ -217,7 +215,7 @@ const file_syntra_v1_envelope_proto_rawDesc = "" +
 	"\x06result\x18\r \x01(\v2\x14.syntra.v1.RpcResultH\x00R\x06result\x12+\n" +
 	"\x06cancel\x18\x0e \x01(\v2\x11.syntra.v1.CancelH\x00R\x06cancel\x12=\n" +
 	"\fnotification\x18\x0f \x01(\v2\x17.syntra.v1.NotificationH\x00R\fnotificationB\x06\n" +
-	"\x04bodyJ\x04\b\x10\x10\x11J\x04\b\x11\x10\x12R\x05eventR\x06resumeR\x03ackB?Z=github.com/tinklehq/syntra/bindings/go/gen/syntra/v1;syntrav1b\x06proto3"
+	"\x04bodyJ\x04\b\x10\x10\x11J\x04\b\x11\x10\x12R\x05eventR\x06resumeR\x03ackB8Z6github.com/tinkle-org/syntra-go/gen/syntra/v1;syntrav1b\x06proto3"
 
 var (
 	file_syntra_v1_envelope_proto_rawDescOnce sync.Once

@@ -2,10 +2,7 @@
 // context cancellation, notifications, concurrency, and deterministic
 // close over a loopback transport. All method fixtures are neutral
 // (/example.Echo/Echo, /example.KV/Get, /example.Slow/Wait); no
-// messenger semantics appear here. Tests run on the pure-Go core in
-// default builds (no -tags). The syntranative adapter is exercised by
-// native_test.go under -tags syntranative; TestCoreBackend logs the
-// linked selection.
+// messenger semantics appear here.
 package syntra
 
 import (
@@ -19,42 +16,9 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// echoHandler is the neutral test dispatcher: echo returns the payload
-// bit-identical, KV Get is always missing, Slow waits out short budgets,
-// and anything else is unimplemented.
-func echoHandler(ctx context.Context, req *RpcRequest) (*RpcResult, error) {
-	switch req.GetMethod() {
-	case "/example.Echo/Echo":
-		out := make([]byte, len(req.GetPayload()))
-		copy(out, req.GetPayload())
-		return NewSuccessResult(out), nil
-	case "/example.KV/Get":
-		return nil, NewRpcError(ErrorCodeNotFound, "test: no such key")
-	case "/example.Slow/Wait":
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(300 * time.Millisecond):
-			return NewSuccessResult([]byte("slow-ok")), nil
-		}
-	default:
-		return nil, NewRpcError(ErrorCodeUnimplemented, "test: unknown method")
-	}
-}
-
-func testClientConfig() ClientConfig {
-	return ClientConfig{
-		MinVersion:     1,
-		MaxVersion:     1,
-		Credential:     []byte("test-credential"),
-		DefaultTimeout: 5 * time.Second,
-	}
-}
-
-// TestDefaultTimeoutRoundsUpToWholeMs pins the shared rounding policy:
-// sub-millisecond defaults round up at resolution so the pure-Go and
-// native backends enforce the identical deadline, never a shorter one.
-func TestDefaultTimeoutRoundsUpToWholeMs(t *testing.T) {
+// Defaults preserve the caller's precise absolute budget. Initial encoding
+// rounds up, but actual handoff floors the remaining milliseconds.
+func TestDefaultTimeoutPreservesPrecision(t *testing.T) {
 	if got := roundUpToMs(1500 * time.Microsecond); got != 2 {
 		t.Fatalf("roundUpToMs(1.5ms) = %d, want 2", got)
 	}
@@ -67,8 +31,8 @@ func TestDefaultTimeoutRoundsUpToWholeMs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveClientConfig: %v", err)
 	}
-	if cfg.timeout != 2*time.Millisecond {
-		t.Fatalf("client timeout = %v, want 2ms", cfg.timeout)
+	if cfg.timeout != 1500*time.Microsecond {
+		t.Fatalf("client timeout = %v, want 1.5ms", cfg.timeout)
 	}
 	host, err := resolveHostConfig(HostConfig{
 		MinVersion: 1, MaxVersion: 1, DefaultTimeout: 1500 * time.Microsecond,
@@ -77,103 +41,9 @@ func TestDefaultTimeoutRoundsUpToWholeMs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveHostConfig: %v", err)
 	}
-	if host.timeout != 2*time.Millisecond {
-		t.Fatalf("host timeout = %v, want 2ms", host.timeout)
+	if host.timeout != 1500*time.Microsecond {
+		t.Fatalf("host timeout = %v, want 1.5ms", host.timeout)
 	}
-}
-
-func testHostConfig() HostConfig {
-	return HostConfig{
-		MinVersion: 1,
-		MaxVersion: 1,
-		Policy:     StaticPolicy("test-principal", true),
-		Handler:    echoHandler,
-		Authorize:  AllowAllAuthorize,
-	}
-}
-
-// pair runs one client against one host over loopback. Callers MUST call
-// Cleanup. The client is returned after its handshake completes.
-type pair struct {
-	client   *Client
-	host     *Host
-	runErr   chan error
-	serveErr chan error
-	cancel   context.CancelFunc
-	a, b     Transport
-	t        *testing.T
-	cleanup  sync.Once
-}
-
-func newPair(t *testing.T, ccfg ClientConfig, hcfg HostConfig) *pair {
-	t.Helper()
-	host, err := OpenHost(hcfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	client, err := OpenClient(ccfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	a, b := LoopbackPair()
-	ctx, cancel := context.WithCancel(context.Background())
-	p := &pair{client: client, host: host, runErr: make(chan error, 1), serveErr: make(chan error, 1), cancel: cancel, a: a, b: b, t: t}
-	t.Cleanup(p.Cleanup)
-	go func() { p.serveErr <- host.Serve(ctx, a) }()
-	go func() { p.runErr <- client.Run(ctx, b) }()
-	warmupCtx, warmupStop := context.WithTimeout(ctx, 3*time.Second)
-	defer warmupStop()
-	for {
-		out, err := client.Call(warmupCtx, "/example.Echo/Echo", []byte("warmup"), 1000)
-		if err == nil && string(out) == "warmup" {
-			return p
-		}
-		var rerr *RpcError
-		if errors.As(err, &rerr) && IsFailedPrecondition(rerr.Code) {
-			t.Fatalf("handshake failed: %v", err)
-		}
-		if warmupCtx.Err() != nil {
-			t.Fatalf("handshake never completed: %v", err)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-}
-
-// Cleanup stops the session deterministically.
-func (p *pair) Cleanup() {
-	p.cleanup.Do(func() {
-		p.cancel()
-		_ = p.client.Close()
-		_ = p.host.Close()
-		_ = p.a.Close()
-		_ = p.b.Close()
-		for _, done := range []<-chan error{p.runErr, p.serveErr} {
-			select {
-			case <-done:
-			case <-time.After(3 * time.Second):
-				p.t.Error("session pump did not stop during cleanup")
-			}
-		}
-	})
-}
-
-func callCode(t *testing.T, err error) ErrorCode {
-	t.Helper()
-	if err == nil {
-		t.Fatal("expected error, got nil")
-	}
-	var rerr *RpcError
-	if !errors.As(err, &rerr) {
-		t.Fatalf("not an RpcError: %v", err)
-	}
-	return rerr.Code
-}
-
-func TestCoreBackend(t *testing.T) {
-	if err := CheckABI(); err != nil {
-		t.Fatal(err)
-	}
-	t.Logf("native core linked: %v", NativeAvailable())
 }
 
 func TestHandshakeLifecycle(t *testing.T) {
@@ -288,6 +158,9 @@ func TestDuplicateIDCoreLevel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := core.helloFrame(); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := core.activate(ready); err != nil {
 		t.Fatal(err)
 	}
@@ -366,6 +239,9 @@ func TestMissingOutcomeRejected(t *testing.T) {
 	core := c.core
 	ready, err := MarshalFrame(NewReadyFrame(1, &ServerReady{ConnectionId: "x"}))
 	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := core.helloFrame(); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := core.activate(ready); err != nil {

@@ -1,260 +1,145 @@
-// Package websocket implements SC1 draft-1 over binary WS/WSS messages.
 package websocket
 
 import (
 	"context"
-	"crypto/tls"
-	"io"
-	"net/http"
-	"net/url"
-	"strings"
-	"time"
+	"net"
 
-	ws "github.com/coder/websocket"
+	syntra "github.com/tinkle-org/syntra-go"
+	"github.com/tinkle-org/syntra-go/connection"
 	"github.com/tinkle-org/syntra-go/securechannel"
 	"github.com/tinkle-org/syntra-go/transport/ordered"
+	"github.com/tinkle-org/syntra-go/transport/stream"
+	"github.com/tinkle-org/syntra-go/transport/tlsstream"
 )
 
-// Subprotocol identifies this implementation's SC1 draft, not an upstream
-// assigned protocol identifier.
-const Subprotocol = "syntra.sc1.draft1"
-
-type Options struct {
-	Limits         ordered.Options
-	HTTPClient     *http.Client
-	OriginPatterns []string
+// NewClient upgrades an owned loopback WS connection. It checks both the URL
+// host and the actual peer address. Pass budget unchanged to the ordered driver.
+func NewClient(ctx context.Context, conn net.Conn, rawURL string, budget *ordered.EstablishmentBudget) (ordered.MessageIO, error) {
+	a, err := endpoint(rawURL, false)
+	if err != nil || !loopbackPeer(conn) {
+		if conn != nil {
+			_ = conn.Close()
+		}
+		return nil, securechannel.ErrConfig
+	}
+	return upgrade(ctx, conn, a, true, budget)
 }
 
-// Dial accepts only explicit ws:// or wss:// URLs. Redirects are refused.
-// Inspectable HTTP transports are cloned, require certificate verification,
-// and use TLS >= 1.3; custom TLS dial hooks are unsupported and custom
-// RoundTrippers own their TLS security policy.
-// Establishment and the eventual connection share one Lifetime budget measured
-// from entry; HandshakeTimeout and HTTPClient.Timeout also bound establishment.
-func Dial(ctx context.Context, address string, cfg securechannel.ClientConfig, opts Options) (*ordered.Transport, error) {
-	started := time.Now()
-	u, err := url.Parse(address)
-	if err != nil || u.Host == "" || u.User != nil || u.Fragment != "" || (u.Scheme != "ws" && u.Scheme != "wss") {
+// NewServer upgrades an owned loopback WS connection at the exact endpoint.
+func NewServer(ctx context.Context, conn net.Conn, budget *ordered.EstablishmentBudget) (ordered.MessageIO, error) {
+	if !loopbackPeer(conn) {
+		if conn != nil {
+			_ = conn.Close()
+		}
 		return nil, securechannel.ErrConfig
 	}
-	carrier := securechannel.WS
-	if u.Scheme == "wss" {
-		carrier = securechannel.WSS
+	return upgrade(ctx, conn, tlsstream.Authority{}, false, budget)
+}
+
+// NewClientTLS consumes the single-use proof before writing HTTP. The original
+// TLS budget, authority, and client role must match exactly.
+func NewClientTLS(ctx context.Context, verified *tlsstream.Verified, rawURL string, budget *ordered.EstablishmentBudget) (ordered.MessageIO, error) {
+	a, err := endpoint(rawURL, true)
+	if err != nil {
+		_ = verified.Close()
+		return nil, err
 	}
-	if cfg.Context.Carrier != carrier {
-		return nil, securechannel.ErrConfig
-	}
-	o, err := opts.Limits.Normalize()
+	conn, err := verified.Consume(a, tlsstream.Client, budget)
 	if err != nil {
 		return nil, err
 	}
-	client, err := secureHTTPClient(opts.HTTPClient)
+	return upgrade(ctx, conn, a, true, budget)
+}
+
+// NewServerTLS checks a provisioned local authority, not a forwarded claim.
+func NewServerTLS(ctx context.Context, verified *tlsstream.Verified, authority tlsstream.Authority, budget *ordered.EstablishmentBudget) (ordered.MessageIO, error) {
+	conn, err := verified.Consume(authority, tlsstream.Server, budget)
 	if err != nil {
 		return nil, err
 	}
-	budget := &messageBudget{}
-	bound := min(o.HandshakeTimeout, o.Lifetime)
-	if client.Timeout > 0 {
-		bound = min(bound, client.Timeout)
-	}
-	// Use the adapter's context for this timeout instead of letting the library
-	// create/cancel a private context while returning a successful connection.
-	client.Timeout = 0
-	ctx, cancel := context.WithDeadline(ctx, started.Add(bound))
-	defer cancel()
-	abort := &upgradeAbort{ctx: ctx}
-	client.Transport = observedRoundTripper{base: client.Transport, budget: budget, abort: abort}
-	c, _, err := ws.Dial(ctx, address, &ws.DialOptions{HTTPClient: client, Subprotocols: []string{Subprotocol}, CompressionMode: ws.CompressionDisabled})
-	abort.disarm()
-	if err != nil {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		return nil, ordered.ErrIO
-	}
-	if c.Subprotocol() != Subprotocol {
-		c.CloseNow()
-		return nil, ordered.ErrProtocol
-	}
-	c.SetReadLimit(securechannel.MaxCiphertext)
-	o.Lifetime -= time.Since(started)
-	if o.Lifetime <= 0 {
-		c.CloseNow()
-		return nil, context.DeadlineExceeded
-	}
-	return ordered.Client(ctx, &messageIO{conn: c, assembly: o.RecordTimeout, budget: budget}, cfg, o)
+	return upgrade(ctx, conn, authority, false, budget)
 }
 
-func secureHTTPClient(original *http.Client) (*http.Client, error) {
-	var client http.Client
-	if original != nil {
-		client = *original
-	}
-	rt := client.Transport
-	if rt == nil {
-		rt = http.DefaultTransport
-	}
-	if standard, ok := rt.(*http.Transport); ok {
-		//lint:ignore SA1019 DialTLS is deprecated but must still be rejected because it bypasses TLSClientConfig.
-		if standard.DialTLSContext != nil || standard.DialTLS != nil {
-			return nil, securechannel.ErrConfig
+func Connect(ctx context.Context, conn net.Conn, rawURL string, security securechannel.ClientConfig, cfg syntra.ClientConfig, opts ordered.Options) (*connection.Client, error) {
+	if security.Context.Carrier != securechannel.WS {
+		if conn != nil {
+			_ = conn.Close()
 		}
-		tr := standard.Clone()
-		if tr.TLSClientConfig == nil {
-			tr.TLSClientConfig = &tls.Config{}
-		} else {
-			tr.TLSClientConfig = tr.TLSClientConfig.Clone()
-		}
-		if tr.TLSClientConfig.InsecureSkipVerify {
-			return nil, securechannel.ErrConfig
-		}
-		if tr.TLSClientConfig.MinVersion < tls.VersionTLS13 {
-			tr.TLSClientConfig.MinVersion = tls.VersionTLS13
-		}
-		if tr.TLSClientConfig.MaxVersion != 0 && tr.TLSClientConfig.MaxVersion < tls.VersionTLS13 {
-			return nil, securechannel.ErrConfig
-		}
-		client.Transport = tr
-	} else {
-		client.Transport = rt
-	}
-	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	return &client, nil
-}
-
-// Accept checks SC1 carrier and subprotocol before upgrading. r.TLS is the
-// authoritative WS/WSS binding and WSS requires TLS >= 1.3. TLS termination
-// requires an explicitly secure deployment rather than trusting forwarded headers.
-// Establishment counts against Lifetime from entry, and is also bounded by
-// HandshakeTimeout and ctx. Successful transports retain only the remaining life.
-func Accept(ctx context.Context, w http.ResponseWriter, r *http.Request, cfg securechannel.ServerConfig, opts Options) (*ordered.Transport, error) {
-	started := time.Now()
-	carrier := securechannel.WS
-	if r.TLS != nil {
-		if r.TLS.Version < tls.VersionTLS13 {
-			http.Error(w, "TLS 1.3 required", http.StatusBadRequest)
-			return nil, securechannel.ErrConfig
-		}
-		carrier = securechannel.WSS
-	}
-	o, err := opts.Limits.Normalize()
-	if err != nil {
-		http.Error(w, "invalid configuration", http.StatusInternalServerError)
-		return nil, err
-	}
-	if cfg.Carrier != carrier || cfg.Validate() != nil {
-		http.Error(w, "invalid configuration", http.StatusBadRequest)
 		return nil, securechannel.ErrConfig
 	}
-	found := false
-	for _, header := range r.Header.Values("Sec-WebSocket-Protocol") {
-		for _, token := range strings.Split(header, ",") {
-			if strings.TrimSpace(token) == Subprotocol {
-				found = true
-			}
-		}
-	}
-	if !found {
-		http.Error(w, "SC1 subprotocol required", http.StatusBadRequest)
-		return nil, ordered.ErrProtocol
-	}
-	// coder/websocket matches subprotocols case-insensitively. Only offer its
-	// selector the exact token already verified above, including when a peer
-	// sent differently-cased alternatives before that token.
-	request := new(http.Request)
-	*request = *r
-	request.Header = r.Header.Clone()
-	request.Header.Set("Sec-WebSocket-Protocol", Subprotocol)
-	ctx, cancel := context.WithDeadline(ctx, started.Add(min(o.HandshakeTimeout, o.Lifetime)))
-	defer cancel()
-	if ctx.Err() != nil {
-		http.Error(w, "handshake expired", http.StatusRequestTimeout)
-		return nil, ctx.Err()
-	}
-	budget := &messageBudget{}
-	writer := &observedWriter{ResponseWriter: w, budget: budget}
-	d, _ := ctx.Deadline()
-	_ = http.NewResponseController(w).SetWriteDeadline(d)
-	interrupted := make(chan struct{})
-	stop := context.AfterFunc(ctx, func() { _ = http.NewResponseController(w).SetWriteDeadline(time.Now()); close(interrupted) })
-	defer func() {
-		if !stop() {
-			<-interrupted
-		}
-		if writer.conn != nil {
-			_ = writer.conn.SetDeadline(time.Time{})
-		} else {
-			_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
-		}
-	}()
-	c, err := ws.Accept(writer, request, &ws.AcceptOptions{Subprotocols: []string{Subprotocol}, OriginPatterns: opts.OriginPatterns, CompressionMode: ws.CompressionDisabled})
+	o, err := stream.Options(opts)
 	if err != nil {
-		return nil, ordered.ErrIO
+		if conn != nil {
+			_ = conn.Close()
+		}
+		return nil, err
 	}
-	if c.Subprotocol() != Subprotocol {
-		c.CloseNow()
-		return nil, ordered.ErrProtocol
-	}
-	c.SetReadLimit(securechannel.MaxCiphertext)
-	o.Lifetime -= time.Since(started)
-	if o.Lifetime <= 0 {
-		c.CloseNow()
-		return nil, context.DeadlineExceeded
-	}
-	return ordered.Server(ctx, &messageIO{conn: c, assembly: o.RecordTimeout, budget: budget}, cfg, o)
-}
-
-type messageIO struct {
-	conn     *ws.Conn
-	assembly time.Duration
-	budget   *messageBudget
-}
-
-func (m *messageIO) Close() error { _ = m.conn.CloseNow(); return nil }
-
-func (m *messageIO) ReadMessage(ctx context.Context, dst []byte) ([]byte, error) {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	m.budget.begin(cancel, m.assembly)
-	defer m.budget.end()
-	typ, reader, err := m.conn.Reader(ctx)
+	carrier, err := NewClient(ctx, conn, rawURL, o.Budget)
 	if err != nil {
-		return nil, ordered.ErrIO
+		return nil, err
 	}
-	if typ != ws.MessageBinary {
-		return nil, ordered.ErrProtocol
+	return connection.Connect(ctx, carrier, security, cfg, o)
+}
+
+func Accept(ctx context.Context, conn net.Conn, security securechannel.ServerConfig, host *syntra.Host, opts ordered.Options) error {
+	if security.Carrier != securechannel.WS {
+		if conn != nil {
+			_ = conn.Close()
+		}
+		return securechannel.ErrConfig
 	}
-	// The wire observer has already started the absolute clock, including
-	// partial headers. This also covers custom RoundTrippers with read-ahead.
-	m.budget.start()
-	dst = dst[:cap(dst)]
-	n, err := io.ReadFull(reader, dst)
-	if err == io.EOF || err == io.ErrUnexpectedEOF {
-		return dst[:n], nil
-	}
+	o, err := stream.Options(opts)
 	if err != nil {
-		return nil, ordered.ErrIO
+		if conn != nil {
+			_ = conn.Close()
+		}
+		return err
 	}
-	var extra [1]byte
-	n, err = io.ReadFull(reader, extra[:])
-	if n != 0 || err != io.EOF {
-		return nil, ordered.ErrProtocol
+	carrier, err := NewServer(ctx, conn, o.Budget)
+	if err != nil {
+		return err
 	}
-	return dst, nil
+	return connection.Accept(ctx, carrier, security, host, o)
 }
 
-func (m *messageIO) WriteMessage(ctx context.Context, msg []byte) error {
-	if err := m.conn.Write(ctx, ws.MessageBinary, msg); err != nil {
-		return ordered.ErrIO
+// ConnectTLS continues the proof's original attempt through upgrade and Ready.
+// An omitted Options.Budget selects the proof's budget, never a new origin.
+func ConnectTLS(ctx context.Context, verified *tlsstream.Verified, rawURL string, security securechannel.ClientConfig, cfg syntra.ClientConfig, opts ordered.Options) (*connection.Client, error) {
+	if security.Context.Carrier != securechannel.WSS {
+		_ = verified.Close()
+		return nil, securechannel.ErrConfig
 	}
-	return nil
+	if opts.Budget == nil {
+		opts.Budget = verified.Budget()
+	}
+	o, err := opts.Normalize()
+	if err != nil {
+		_ = verified.Close()
+		return nil, err
+	}
+	carrier, err := NewClientTLS(ctx, verified, rawURL, o.Budget)
+	if err != nil {
+		return nil, err
+	}
+	return connection.Connect(ctx, carrier, security, cfg, o)
 }
 
-// Ping uses WebSocket control frames, never SC1 application data. A concurrent
-// Recv must be active so the library can process the matching pong.
-func (m *messageIO) Ping(ctx context.Context) error {
-	if err := m.conn.Ping(ctx); err != nil {
-		return ordered.ErrIO
+func AcceptTLS(ctx context.Context, verified *tlsstream.Verified, authority tlsstream.Authority, security securechannel.ServerConfig, host *syntra.Host, opts ordered.Options) error {
+	if security.Carrier != securechannel.WSS {
+		_ = verified.Close()
+		return securechannel.ErrConfig
 	}
-	return nil
+	if opts.Budget == nil {
+		opts.Budget = verified.Budget()
+	}
+	o, err := opts.Normalize()
+	if err != nil {
+		_ = verified.Close()
+		return err
+	}
+	carrier, err := NewServerTLS(ctx, verified, authority, o.Budget)
+	if err != nil {
+		return err
+	}
+	return connection.Accept(ctx, carrier, security, host, o)
 }

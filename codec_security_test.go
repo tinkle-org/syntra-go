@@ -198,9 +198,9 @@ func TestCodecSecurityCredentialBound(t *testing.T) {
 			_, decodeErr := UnmarshalFrame(raw)
 			out, encodeErr := MarshalFrame(frame)
 			if size > MaxCredentialBytes {
-				codecSecurityInvalid(t, scanErr)
-				codecSecurityInvalid(t, decodeErr)
-				codecSecurityInvalid(t, encodeErr)
+				alignmentCode(t, scanErr, ErrorCodeResourceExhausted)
+				alignmentCode(t, decodeErr, ErrorCodeResourceExhausted)
+				alignmentCode(t, encodeErr, ErrorCodeResourceExhausted)
 				if out != nil {
 					t.Fatal("oversized credential returned wire bytes")
 				}
@@ -221,19 +221,19 @@ func TestCodecSecurityCredentialBound(t *testing.T) {
 			}
 			raw := append([]byte{8, 1}, codecSecurityBytes(10, hello)...)
 			err := scanFrameTags(raw)
-			codecSecurityInvalid(t, err)
+			alignmentCode(t, err, ErrorCodeResourceExhausted)
 			if strings.Contains(err.Error(), "codec-private-marker") {
 				t.Fatal("credential contents appeared in error")
 			}
 			_, err = UnmarshalFrame(raw)
-			codecSecurityInvalid(t, err)
+			alignmentCode(t, err, ErrorCodeResourceExhausted)
 		})
 	}
 	t.Run("retained-credential-injection", func(t *testing.T) {
 		hello := &ClientHello{MinVersion: 1, MaxVersion: 1, Credential: []byte{0xff}}
 		hello.ProtoReflect().SetUnknown(codecSecurityBytes(3, make([]byte, MaxCredentialBytes+1)))
 		out, err := MarshalFrame(NewHelloFrame(hello, 1))
-		codecSecurityInvalid(t, err)
+		alignmentCode(t, err, ErrorCodeResourceExhausted)
 		if out != nil {
 			t.Fatal("injected oversized credential returned wire bytes")
 		}
@@ -307,17 +307,17 @@ func TestCodecSecurityMalformedUnknownWire(t *testing.T) {
 
 func TestCodecSecurityCombinedRecursionLimit(t *testing.T) {
 	for _, tc := range codecSecurityMessages() {
-		for _, totalDepth := range []int{31, 32, 33, 256} {
+		for _, totalDepth := range []int{32, 33, 34, 256} {
 			t.Run(fmt.Sprintf("%s/depth%d", tc.name, totalDepth), func(t *testing.T) {
 				tc.message.ProtoReflect().SetUnknown(codecSecurityGroups(totalDepth-tc.depth, codecSecurityVarint(200, 1)))
 				raw := codecSecurityMarshal(t, tc.frame)
 				scanErr := scanFrameTags(raw)
 				_, decodeErr := UnmarshalFrame(raw)
 				out, encodeErr := MarshalFrame(tc.frame)
-				if totalDepth > 32 {
-					codecSecurityInvalid(t, scanErr)
-					codecSecurityInvalid(t, decodeErr)
-					codecSecurityInvalid(t, encodeErr)
+				if totalDepth > 33 {
+					alignmentCode(t, scanErr, ErrorCodeResourceExhausted)
+					alignmentCode(t, decodeErr, ErrorCodeResourceExhausted)
+					alignmentCode(t, encodeErr, ErrorCodeResourceExhausted)
 					if out != nil {
 						t.Fatal("excessive recursion returned wire bytes")
 					}

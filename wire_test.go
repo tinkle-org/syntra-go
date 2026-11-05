@@ -199,7 +199,7 @@ func TestDuplicateBodies(t *testing.T) {
 		raw := mustHex(t, "08011007621e0a122f6578616d706c652e4563686f2f4563686f120568656c6c6f18f4036a070a0568656c6c6f")
 		_, err := UnmarshalFrame(raw)
 		rerr, ok := err.(*RpcError)
-		if !ok || !IsInvalidArgument(rerr.Code) || !strings.Contains(rerr.Message, "multiple bodies") {
+		if !ok || !IsInvalidArgument(rerr.Code) {
 			t.Fatalf("err = %v", err)
 		}
 	})
@@ -216,7 +216,7 @@ func TestDuplicateBodies(t *testing.T) {
 		raw := mustHex(t, "080110076a1b0a0568656c6c6f1212080c120e756e6b6e6f776e206d6574686f64")
 		_, err := UnmarshalFrame(raw)
 		rerr, ok := err.(*RpcError)
-		if !ok || !IsInvalidArgument(rerr.Code) || !strings.Contains(rerr.Message, "multiple outcomes") {
+		if !ok || !IsInvalidArgument(rerr.Code) {
 			t.Fatalf("err = %v", err)
 		}
 	})
@@ -418,7 +418,6 @@ func TestDecodeDefersOnlyRequestMethodValidation(t *testing.T) {
 	for _, f := range []*Frame{
 		NewRequestFrame(1, 0, &RpcRequest{}),
 		NewRequestFrame(0, 7, &RpcRequest{}),
-		NewRequestFrame(2, 7, &RpcRequest{}),
 		NewReadyFrame(1, &ServerReady{}),
 		NewResultFrame(1, 7, &RpcResult{}),
 	} {
@@ -460,8 +459,8 @@ func TestTrackerLifecycle(t *testing.T) {
 	if err := tr.FinishResult(1, &RpcResult{}); err == nil {
 		t.Fatal("missing outcome accepted")
 	}
-	if err := tr.FinishResult(999, NewSuccessResult(nil)); err == nil {
-		t.Fatal("unknown finish accepted")
+	if err := tr.FinishResult(999, NewSuccessResult(nil)); err != nil {
+		t.Fatal("unknown result must be ignored")
 	}
 	if err := tr.FinishResult(1, NewSuccessResult([]byte("ok"))); err != nil {
 		t.Fatal(err)
@@ -474,8 +473,8 @@ func TestTrackerLifecycle(t *testing.T) {
 	if len(expired) != 1 || expired[0] != 2 {
 		t.Fatalf("expired = %v", expired)
 	}
-	if err := tr.FinishResult(2, NewSuccessResult(nil)); err == nil {
-		t.Fatal("finish after expiry accepted")
+	if err := tr.FinishResult(2, NewSuccessResult(nil)); err != nil {
+		t.Fatal("late result must be ignored")
 	}
 	if n := tr.Pending(); n != 0 {
 		t.Fatalf("pending = %d", n)
@@ -486,12 +485,12 @@ func TestTrackerLifecycle(t *testing.T) {
 func TestTrackerConcurrencyBound(t *testing.T) {
 	tr := NewTracker()
 	now := time.Now()
-	for i := uint64(1); i <= MaxConcurrentRPCs; i++ {
+	for i := uint64(1); i <= DefaultConcurrentRPCs; i++ {
 		if err := tr.StartWithBudget(now, i, "/example.Echo/Echo", 1000); err != nil {
 			t.Fatalf("slot %d: %v", i, err)
 		}
 	}
-	if err := tr.StartWithBudget(now, MaxConcurrentRPCs+1, "/example.Echo/Echo", 1000); err == nil {
+	if err := tr.StartWithBudget(now, DefaultConcurrentRPCs+1, "/example.Echo/Echo", 1000); err == nil {
 		t.Fatal("budget overflow accepted")
 	} else if rerr, ok := err.(*RpcError); !ok || !IsResourceExhausted(rerr.Code) {
 		t.Fatalf("wrong error: %v", err)

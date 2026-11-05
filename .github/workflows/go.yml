@@ -16,6 +16,8 @@ jobs:
   pure-go:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    env:
+      CGO_ENABLED: '0'
     permissions:
       contents: read
     steps:
@@ -37,16 +39,179 @@ jobs:
         env:
           CGO_ENABLED: '0'
         run: go build -mod=readonly ./...
-      - name: Test (CGO disabled)
+      - name: SDK unit and loopback integration tests (CGO disabled)
         env:
           CGO_ENABLED: '0'
         run: go test -mod=readonly -count=1 ./...
       - name: Vet
         run: go vet -mod=readonly ./...
-      - name: Race detector (pure-Go backend)
+      - name: Race detector
         env:
           CGO_ENABLED: '1'
         run: go test -mod=readonly -race -count=1 ./...
+
+  network-integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      CGO_ENABLED: '1'
+      GOTOOLCHAIN: local
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: '1.26.10'
+          cache: true
+      - name: Race-tested managed networking and real loopback carriers
+        shell: bash
+        run: |
+          set -euo pipefail
+          go list -mod=readonly -f '{{.ImportPath}}' ./network ./routes ./proxy ./transport/... > "$RUNNER_TEMP/network-packages.txt"
+          go test -mod=readonly -race -count=1 -json -timeout=10m ./network ./routes ./proxy ./transport/... | tee "$RUNNER_TEMP/network-tests.jsonl"
+      - name: Require package and relevant test execution
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib
+
+          temp = pathlib.Path(os.environ["RUNNER_TEMP"])
+          packages = set((temp / "network-packages.txt").read_text().splitlines())
+          module = "github.com/tinkle-org/syntra-go"
+          required = {
+              "network": [
+                  "TestManagedTCPPushCallsAndGenerationFences",
+                  "TestManagedWSAndWSSListeners",
+                  "TestManagedHTTPAndHTTPSIdlePushLossPauseResume",
+                  "TestNotificationWaitCannotMoveIntoSuccessorGeneration",
+                  "TestRecoveryPreparedBeforeRunAndFreshNegotiationEachGeneration",
+                  "TestManagedHTTPMutationNeverReplayed",
+                  "TestManagedHTTPIncompleteShutdownRetainsCallbackAndNativeOwner",
+                  "TestManagedHealthyCloseAccounting",
+                  "TestManagedPendingCloseCountsOnlyJoinedOverdueRetirement",
+                  "TestManagedJoinedCleanupFailureReportedOnceWithoutReplacement",
+                  "TestManagedCallerTimeoutDoesNotFailCleanCompletion",
+                  "TestAcceptRetryBoundaryAndControls",
+                  "TestAcceptSocketSetupRetriesBeforeAuthentication",
+                  "TestAcceptLiveRPCProgressesDuringRetry",
+                  "TestAcceptErrorTerminalCountedOnce",
+              ],
+              "routes": ["TestTCPRouteReachesProtectedReadinessAndPush", "TestHTTPRouteIntegrations"],
+              "proxy": ["TestHTTPConnectRemoteNameAndNoOverread", "TestSOCKSRawCredentialsRemoteDNSAndRules"],
+              "transport/tcp": ["TestLoopbackSessionsPushWithoutCall"],
+              "transport/websocket": ["TestLoopbackSessionsAndTLSProvidersPushWithoutCall"],
+              "transport/http": [
+                  "TestHTTPAndHTTPSFullConnections", "TestHTTPSLongPollPushWithoutRPC",
+                  "TestSourceRateRejectionPreservesOtherSourcesGlobalTokens",
+                  "TestFullSourceRegistryPreservesStatusAndGlobalTokens",
+                  "TestGlobalRateRejectionStillChargesAdmittedSource",
+                  "TestFullSourceRegistryReturnsNative503BeforeBody",
+              ],
+              "transport/tlsstream": ["TestStandardTLSAuthenticationFailuresAreTerminal"],
+              "transport/stream": ["TestGateChecksSynchronousCompletion"],
+              "transport/ordered": [
+                  "TestPublicDriverBothModesAndMaximumFrame",
+                  "TestBufferedRecordDecryptAfterLocalStopIsClosed",
+                  "TestLocalStopKeepsDetectedDecryptFailureTerminal",
+                  "TestClosedCipherWithoutLocalStopIsProtocolFailure",
+                  "TestTerminalSecurityFailureUpgradesLossAndStaysFirst",
+              ],
+          }
+          if not packages or not {f"{module}/{p}" for p in required} <= packages:
+              raise SystemExit("network package selection is empty or incomplete")
+          events = [json.loads(line) for line in (temp / "network-tests.jsonl").read_text().splitlines()]
+          if any(e.get("Action") == "fail" for e in events):
+              raise SystemExit("network test failure")
+          ran = {(e.get("Package"), e.get("Test")) for e in events if e.get("Action") == "run" and e.get("Test")}
+          passed = {(e.get("Package"), e.get("Test")) for e in events if e.get("Action") == "pass" and e.get("Test")}
+          package_passes = {e.get("Package") for e in events if e.get("Action") == "pass" and not e.get("Test")}
+          for package in packages:
+              executed = {test for pkg, test in ran & passed if pkg == package}
+              if package not in package_passes or not executed:
+                  raise SystemExit(f"no successful test execution: {package}")
+              print(f"{package}: {len(executed)} tests/subtests executed and passed")
+          for suffix, tests in required.items():
+              package = f"{module}/{suffix}"
+              for test in tests:
+                  if (package, test) not in ran & passed:
+                      raise SystemExit(f"required test did not execute and pass: {package} {test}")
+                  children = [e for e in events if e.get("Package") == package and e.get("Test", "").startswith(test + "/")]
+                  if any(e.get("Action") == "skip" for e in children):
+                      raise SystemExit(f"required coverage skipped: {package} {test}")
+          # Current WS/WSS subtest names encode their carrier bytes as escaped characters.
+          for carrier in (r"\x02", r"\x03"):
+              key = (f"{module}/network", f"TestManagedWSAndWSSListeners/{carrier}")
+              if key not in ran & passed:
+                  raise SystemExit(f"WebSocket loopback coverage missing: {key}")
+          # Both candidate carriers and every direct/proxy route must run, not just their parent tests.
+          for carrier in ("HTTP", "HTTPS"):
+              key = (f"{module}/network", f"TestManagedHTTPAndHTTPSIdlePushLossPauseResume/{carrier}")
+              if key not in ran & passed:
+                  raise SystemExit(f"candidate loopback coverage missing: {key}")
+          for mode in ("bootstrap", "returning"):
+              for route in ("http", "https", "http-connect", "http-socks", "https-connect", "https-socks", "http-forward"):
+                  key = (f"{module}/routes", f"TestHTTPRouteIntegrations/{mode}/{route}")
+                  if key not in ran & passed:
+                      raise SystemExit(f"route loopback coverage missing: {key}")
+          PY
+
+  dependency-isolation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      CGO_ENABLED: '0'
+      GOTOOLCHAIN: local
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: '1.26.10'
+          cache: true
+      - name: Root and securechannel production dependency isolation
+        run: |
+          python3 - <<'PY'
+          import subprocess
+
+          module = "github.com/tinkle-org/syntra-go"
+          forbidden = ["net", "crypto/tls"] + [f"{module}/{p}" for p in ("network", "routes", "proxy", "connection", "transport")]
+          for package in (".", "./securechannel"):
+              output = subprocess.check_output(["go", "list", "-mod=readonly", "-deps", "-f", "{{.ImportPath}}", package], text=True)
+              deps = set(output.splitlines())
+              if not deps:
+                  raise SystemExit(f"empty dependency graph: {package}")
+              unexpected = sorted(dep for dep in deps if any(dep == prefix or dep.startswith(prefix + "/") for prefix in forbidden))
+              if unexpected:
+                  raise SystemExit(f"networking dependencies in {package}: {unexpected}")
+              print(f"{package}: production dependency isolation passed")
+          PY
+      - name: Default HTTP candidate rejection and explicit per-config opt-in
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -mod=readonly -count=1 -json -run '^TestHTTPCandidatePolicyIsScoped$' ./securechannel | tee "$RUNNER_TEMP/candidate-tests.jsonl"
+          python3 - <<'PY'
+          import json, os, pathlib
+
+          events = [json.loads(line) for line in (pathlib.Path(os.environ["RUNNER_TEMP"]) / "candidate-tests.jsonl").read_text().splitlines()]
+          package = "github.com/tinkle-org/syntra-go/securechannel"
+          test = "TestHTTPCandidatePolicyIsScoped"
+          required = {test} | {f"{test}/{carrier}/{mode}" for carrier in ("http", "https") for mode in ("bootstrap", "returning")}
+          for action in ("run", "pass"):
+              seen = {e.get("Test") for e in events if e.get("Package") == package and e.get("Action") == action}
+              if not required <= seen:
+                  raise SystemExit(f"candidate policy {action} coverage missing: {sorted(required - seen)}")
+          if any(e.get("Action") in ("fail", "skip") for e in events):
+              raise SystemExit("candidate policy failed or skipped")
+          if not any(e.get("Package") == package and e.get("Action") == "pass" and not e.get("Test") for e in events):
+              raise SystemExit("candidate policy package did not pass")
+          print("default candidate rejection and scoped opt-in executed for both carriers and modes")
+          PY
 
   generated-go:
     runs-on: ubuntu-24.04
@@ -64,51 +229,40 @@ jobs:
         with:
           version: '1.59.0'
           github_token: ${{ github.token }}
+      - name: Protobuf formatting
+        run: buf format --diff --exit-code
+      - name: Protobuf lint
+        run: buf lint --error-format=github-actions
+      - name: Protobuf build
+        run: buf build --error-format=github-actions
+      - name: Canonical Go package options
+        run: python3 scripts/check-go-package.py
+      - name: Schema and generation script tests
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python3 -m unittest discover -s scripts -p 'test_*.py' -v
       - name: Pinned Go generation drift check
         run: python3 scripts/check-generated.py
-
-  native-go:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    permissions:
-      contents: read
-    env:
-      RUSTUP_TOOLCHAIN: '1.88.0'
-      CGO_ENABLED: '1'
-      CARGO_TARGET_DIR: ${{ github.workspace }}/.tmp/syntra-rs/target
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          persist-credentials: false
-      - name: Checkout matching Rust extraction
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          repository: tinkle-org/syntra-rs
-          ref: fca1063515d3966be71e9844346e7cbc53769c76
-          path: .tmp/syntra-rs
-          persist-credentials: false
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
-        with:
-          go-version: '1.26.10'
-          cache: true
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
-        with:
-          toolchain: '1.88.0'
-      - name: Build production FFI (not the test fixture)
-        run: cargo build --locked --manifest-path .tmp/syntra-rs/Cargo.toml -p syntra-ffi --no-default-features --features production
-      - name: Test and race-check Go against the Rust library
+      - name: Protobuf compatibility against PR base
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        shell: bash
         run: |
-          LIBDIR="$CARGO_TARGET_DIR/debug"
-          export CGO_LDFLAGS="-L$LIBDIR"
-          export LD_LIBRARY_PATH="$LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-          go test -mod=readonly -tags syntranative -count=1 ./...
-          go test -mod=readonly -tags syntranative -race -count=1 ./...
-          go install honnef.co/go/tools/cmd/staticcheck@2025.1.1
-          staticcheck -tags syntranative ./...
+          set -euo pipefail
+          if [[ ! "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            printf '%s\n' 'Invalid PR base commit SHA' >&2
+            exit 1
+          fi
+          git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          test "$(git rev-parse --verify FETCH_HEAD)" = "$BASE_SHA"
+          buf breaking --against ".git#ref=$BASE_SHA" --error-format=github-actions
 
   compat:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    env:
+      CGO_ENABLED: '0'
     permissions:
       contents: read
     strategy:
@@ -141,7 +295,7 @@ jobs:
         run: go test -mod=readonly -count=1 ./...
         env:
           GOTOOLCHAIN: local
-      - name: Race (CGO-enabled ubuntu only)
+      - name: Race detector (compiler instrumentation requires CGO)
         run: go test -mod=readonly -race -count=1 ./...
         env:
           CGO_ENABLED: '1'
@@ -158,6 +312,8 @@ jobs:
   security:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    env:
+      CGO_ENABLED: '0'
     permissions:
       contents: read
     steps:
@@ -172,7 +328,7 @@ jobs:
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
           govulncheck ./...
-      - name: staticcheck (pure-Go backend)
+      - name: staticcheck
         run: |
           go install honnef.co/go/tools/cmd/staticcheck@2025.1.1
           staticcheck ./...
@@ -180,6 +336,8 @@ jobs:
   fuzz-smoke:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    env:
+      CGO_ENABLED: '0'
     permissions:
       contents: read
     steps:
@@ -196,6 +354,8 @@ jobs:
         run: |
           go test -mod=readonly -fuzz=FuzzUnmarshalFrame -fuzztime=30s .
           go test -mod=readonly -fuzz=FuzzDuplicateContent -fuzztime=30s .
+          go test -mod=readonly -run '^$' -fuzz=FuzzHTTPHeaders -fuzztime=30s ./transport/http
+          go test -mod=readonly -run '^$' -fuzz=FuzzRecordFrames -fuzztime=30s ./transport/websocket
 
   actionlint:
     runs-on: ubuntu-24.04
@@ -216,7 +376,7 @@ jobs:
         run: actionlint .github/workflows/*.yml
 
   ci-success:
-    needs: [pure-go, generated-go, native-go, compat, security, fuzz-smoke, actionlint]
+    needs: [pure-go, network-integration, dependency-isolation, generated-go, compat, security, fuzz-smoke, actionlint]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5

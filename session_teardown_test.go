@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// Model the native counter lifetime: onFrame can record loss until it
+// Model counter lifetime: onFrame can record loss until it
 // returns, and destroying the core makes those totals inaccessible.
 type teardownLossCore struct {
 	clientCore

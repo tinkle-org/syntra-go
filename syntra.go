@@ -1,24 +1,6 @@
-// Package syntra is the Go binding for the Syntra v1 protocol.
-//
-// Distribution note: `go get github.com/tinkle-org/syntra-go`
-// installs the Go sources in this module only (generated Protobuf types
-// plus the pure-Go validation, codec, handshake, and session logic).
-// Sessions use the supported pure-Go core by default; no native library
-// is required and this module never downloads binaries. The syntranative
-// adapter is supported via the production Rust core: build
-// crates/syntra-ffi with --features production, link it with
-// CGO_LDFLAGS="-L<dir> -lsyntra_ffi", and select the adapter with
-// -tags syntranative (native.go matches
-// crates/syntra-ffi/include/syntra_production.h). See README.md for the
-// exact build, link, and test commands.
-//
-// The root package implements the transport-independent protocol core.
-// securechannel and transport provide Noise and carrier bindings; connection
-// orchestrates bounded establishment and serving. Identity policy, credential
-// storage and application payload schemas belong to the host application.
-// No messenger semantics (subscriptions, presence, JSON
-// gateways, service registries) are defined here; neutral fixtures such as
-// /example.Echo/Echo exist only in tests.
+// Package syntra implements the transport-independent Syntra protocol core,
+// codec, handshake, and sessions in Go. Identity policy, credential storage,
+// application payload schemas, and transport connectivity belong to the host.
 package syntra
 
 import (
@@ -26,12 +8,11 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
-	"math"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
-	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 
 	syntrav1 "github.com/tinkle-org/syntra-go/gen/syntra/v1"
@@ -122,6 +103,18 @@ const (
 	// Credentials are opaque; the bound prevents a peer from forcing a
 	// large allocation in the verifier.
 	MaxCredentialBytes = 8192
+	// MaxConnectionIDBytes bounds an opaque diagnostic connection identifier.
+	MaxConnectionIDBytes = 128
+	// MaxDiagnosticBytes bounds public error text, measured in UTF-8 bytes.
+	MaxDiagnosticBytes = 4096
+	// DefaultConcurrentRPCs is the default outstanding-call capacity.
+	DefaultConcurrentRPCs = 32
+	// MaxOutstandingRPCs is the supported per-connection capacity ceiling.
+	MaxOutstandingRPCs = 1024
+	// DefaultQueueCapacity is the default notification and writer capacity.
+	DefaultQueueCapacity = 256
+	// MaxQueueCapacity is the supported queue capacity ceiling.
+	MaxQueueCapacity = 1024
 	// MaxConcurrentRPCs is the minimum concurrent-RPC budget every Syntra
 	// host supports (SNTR-RPC-008). Hosts reject excess with
 	// ResourceExhausted while the connection stays usable.
@@ -130,7 +123,7 @@ const (
 	// host side. Hosts fan out to many principals and may need headroom
 	// above the client minimum; values above this fail fast as OutOfRange
 	// so one connection cannot reserve an unbounded worker pool.
-	MaxHostConcurrentRPCs = 256
+	MaxHostConcurrentRPCs = MaxOutstandingRPCs
 	// ConnectionIDBytes is the 128-bit entropy bound into every
 	// ServerReady.connection_id (SNTR-SESS-002). The ID is a diagnostic
 	// handle, never an authenticator or resume token.
@@ -146,17 +139,14 @@ const (
 // DefaultRPCTimeout is the bounded host default applied when
 // RpcRequest.TimeoutMs is zero. Callers SHOULD document any deployment
 // value that differs from this library default.
-var DefaultRPCTimeout = 3 * time.Second
+var DefaultRPCTimeout = 30 * time.Second
 
-// MaxRPCTimeoutMs caps a caller-requested timeout budget. Larger values
-// fail fast as OutOfRange so a peer cannot pin a session slot for minutes.
-const MaxRPCTimeoutMs uint32 = 30_000
+// MaxRPCTimeoutMs is the default maximum call budget. Sessions clamp larger
+// requests to their configured maximum.
+const MaxRPCTimeoutMs uint32 = 120_000
 
-// roundUpToMs converts a validated positive timeout to whole milliseconds,
-// rounding up. The native ABI expresses budgets as uint32 milliseconds, so
-// config resolution normalizes once: both backends then enforce the
-// identical effective deadline instead of the native side silently
-// truncating sub-millisecond durations.
+// roundUpToMs converts a positive timeout to whole milliseconds, rounding up.
+// Wire handoff uses a separate floored remaining budget.
 func roundUpToMs(d time.Duration) uint32 {
 	ms := uint32((d + time.Millisecond - 1) / time.Millisecond)
 	if ms == 0 {
@@ -314,8 +304,16 @@ func NewSuccessResult(payload []byte) *RpcResult {
 // never be emitted as a failure (SNTR-ERR-001), so it is mapped to
 // Internal here rather than escaping as a success-shaped result.
 func NewWireErrorResult(code ErrorCode, msg string) *RpcResult {
-	if code == ErrorCodeUnspecified {
+	if !IsValidFailure(code) {
 		code = ErrorCodeInternal
+	}
+	msg = strings.ToValidUTF8(msg, "\uFFFD")
+	if len(msg) > MaxDiagnosticBytes {
+		end := MaxDiagnosticBytes
+		for !utf8.RuneStart(msg[end]) {
+			end--
+		}
+		msg = msg[:end]
 	}
 	return &RpcResult{Outcome: &syntrav1.RpcResult_Error{Error: &syntrav1.RpcError{Code: code, Message: msg}}}
 }
@@ -651,7 +649,7 @@ func ValidateHello(h *ClientHello) error {
 	if h.GetMinVersion() > h.GetMaxVersion() {
 		return NewRpcError(ErrorCodeInvalidArgument, fmt.Sprintf("syntra: hello min_version %d exceeds max_version %d", h.GetMinVersion(), h.GetMaxVersion()))
 	}
-	return nil
+	return ValidateCredentialSize(h.GetCredential())
 }
 
 // ValidateReady checks the nested ServerReady. ConnectionId must be
@@ -660,8 +658,8 @@ func ValidateReady(r *ServerReady) error {
 	if r == nil {
 		return NewRpcError(ErrorCodeInvalidArgument, "syntra: nil ready")
 	}
-	if r.GetConnectionId() == "" {
-		return NewRpcError(ErrorCodeInvalidArgument, "syntra: ready connection_id must be non-empty")
+	if r.GetConnectionId() == "" || len(r.GetConnectionId()) > MaxConnectionIDBytes {
+		return NewRpcError(ErrorCodeInvalidArgument, "syntra: invalid connection_id length")
 	}
 	return nil
 }
@@ -688,6 +686,9 @@ func ValidateResult(r *RpcResult) error {
 		if outcome.Error.GetCode() == ErrorCodeUnspecified {
 			return NewRpcError(ErrorCodeInvalidArgument, "syntra: result error code is not a valid failure")
 		}
+		if len(outcome.Error.GetMessage()) > MaxDiagnosticBytes {
+			return NewRpcError(ErrorCodeInvalidArgument, "syntra: error message exceeds diagnostic bound")
+		}
 		return nil
 	default:
 		return NewRpcError(ErrorCodeInvalidArgument, "syntra: result must select exactly one outcome (payload or error)")
@@ -710,8 +711,14 @@ func validateFrame(f *Frame, validateRequestMethod bool) error {
 	if f == nil {
 		return NewRpcError(ErrorCodeInvalidArgument, "syntra: nil frame")
 	}
+	if err := ValidateFrameSize(proto.Size(f)); err != nil {
+		return err
+	}
 	if err := ValidateBodyCardinality(f); err != nil {
 		return err
+	}
+	if f.GetVersion() == 0 {
+		return NewRpcError(ErrorCodeInvalidArgument, "syntra: version must be nonzero")
 	}
 	if err := ValidateRequestID(f); err != nil {
 		return err
@@ -728,9 +735,6 @@ func validateFrame(f *Frame, validateRequestMethod bool) error {
 			return NewRpcError(ErrorCodeInvalidArgument, "syntra: hello version must equal max_version")
 		}
 		return nil
-	}
-	if err := ValidateVersion(f.GetVersion()); err != nil {
-		return err
 	}
 	switch BodyKindOf(f) {
 	case BodyKindReady:
@@ -801,30 +805,37 @@ func (s ConnectionState) String() string {
 	}
 }
 
-// ValidateFrameForState enforces no app frames before ACTIVE: request,
-// result, cancel, and notification are rejected in CONNECTED,
-// NEGOTIATING, AUTHENTICATING, CLOSING, and CLOSED. Hello and ready are
-// handshake frames and pass through to ValidateFrame; CLOSED rejects
-// everything including handshake frames.
+// ValidateFrameForState validates envelope shape, then phase legality, then
+// body semantics. CLOSING accepts existing results, cancels, and notifications.
 func ValidateFrameForState(f *Frame, st ConnectionState) error {
 	if f == nil {
 		return NewRpcError(ErrorCodeInvalidArgument, "syntra: nil frame")
 	}
-	if st == StateClosed {
-		return NewRpcError(ErrorCodeFailedPrecondition, "syntra: connection is closed")
-	}
-	if err := ValidateFrame(f); err != nil {
+	if err := ValidateFrameSize(proto.Size(f)); err != nil {
 		return err
 	}
-	if st == StateActive {
-		return nil
+	if f.GetVersion() == 0 {
+		return NewRpcError(ErrorCodeInvalidArgument, "syntra: version must be nonzero")
 	}
-	switch BodyKindOf(f) {
-	case BodyKindRequest, BodyKindResult, BodyKindCancel, BodyKindNotification:
-		return NewRpcError(ErrorCodeFailedPrecondition, fmt.Sprintf("syntra: %s frame not allowed before ACTIVE (state %s)", string(BodyKindOf(f)), st.String()))
-	default:
-		return nil
+	if err := ValidateRequestID(f); err != nil {
+		return err
 	}
+	kind := BodyKindOf(f)
+	allowed := false
+	switch st {
+	case StateConnected:
+		allowed = kind == BodyKindHello
+	case StateNegotiating, StateAuthenticating:
+		allowed = kind == BodyKindHello || kind == BodyKindReady
+	case StateActive:
+		allowed = kind != BodyKindHello && kind != BodyKindReady
+	case StateClosing:
+		allowed = kind == BodyKindResult || kind == BodyKindCancel || kind == BodyKindNotification
+	}
+	if !allowed {
+		return NewRpcError(ErrorCodeFailedPrecondition, fmt.Sprintf("syntra: %s frame not allowed in state %s", kind, st))
+	}
+	return ValidateFrame(f)
 }
 
 // NegotiateVersion selects the highest version in the intersection of the
@@ -852,11 +863,8 @@ func NegotiateVersion(min, max uint32) (uint32, error) {
 }
 
 // NegotiateVersionRanges selects the highest version in the overlap of an
-// explicit client range and an explicit server range. It is the testable
-// core behind NegotiateVersion: callers that carry a configured server
-// range use this instead of the binding singleton. All four bounds must
-// be nonzero with min <= max per side; disjoint ranges fail as
-// FailedPrecondition to distinguish an incompatible peer from malformed input.
+// explicit client range and an explicit server range. All four bounds must
+// be nonzero with min <= max per side; disjoint ranges fail as Unimplemented.
 func NegotiateVersionRanges(clientMin, clientMax, serverMin, serverMax uint32) (uint32, error) {
 	if clientMin == 0 || clientMax == 0 {
 		return 0, NewRpcError(ErrorCodeInvalidArgument, "syntra: hello versions must be nonzero")
@@ -879,7 +887,7 @@ func NegotiateVersionRanges(clientMin, clientMax, serverMin, serverMax uint32) (
 		ceiling = serverMax
 	}
 	if ceiling < floor {
-		return 0, NewRpcError(ErrorCodeFailedPrecondition, fmt.Sprintf("syntra: no version overlap (client [%d,%d], server [%d,%d])", clientMin, clientMax, serverMin, serverMax))
+		return 0, NewRpcError(ErrorCodeUnimplemented, "syntra: no overlapping protocol version")
 	}
 	return ceiling, nil
 }
@@ -1118,7 +1126,7 @@ func NextState(current ConnectionState, kind BodyKind) (ConnectionState, error) 
 // to host policy, not a parse error.
 func ValidateCredentialSize(credential []byte) error {
 	if len(credential) > MaxCredentialBytes {
-		return NewRpcError(ErrorCodeInvalidArgument, fmt.Sprintf("syntra: credential size %d exceeds bound %d", len(credential), MaxCredentialBytes))
+		return NewRpcError(ErrorCodeResourceExhausted, "syntra: credential exceeds bound")
 	}
 	return nil
 }
@@ -1203,11 +1211,12 @@ type callEntry struct {
 type Tracker struct {
 	mu      sync.Mutex
 	pending map[uint64]*callEntry
+	limit   int
 }
 
 // NewTracker constructs an empty RPC correlation tracker.
 func NewTracker() *Tracker {
-	return &Tracker{pending: make(map[uint64]*callEntry)}
+	return &Tracker{pending: make(map[uint64]*callEntry), limit: DefaultConcurrentRPCs}
 }
 
 // Start registers requestID for method. It fails closed on zero IDs,
@@ -1220,7 +1229,7 @@ func (t *Tracker) Start(requestID uint64, method string) error {
 
 // StartWithBudget registers requestID for method with a timeout budget of
 // timeoutMs (zero selects DefaultRPCTimeout). Budgets above
-// MaxRPCTimeoutMs fail fast as OutOfRange. now anchors the deadline;
+// MaxRPCTimeoutMs are clamped. now anchors the deadline;
 // callers pass time.Now in production and a fixed clock in tests.
 func (t *Tracker) StartWithBudget(now time.Time, requestID uint64, method string, timeoutMs uint32) error {
 	if t == nil {
@@ -1233,7 +1242,7 @@ func (t *Tracker) StartWithBudget(now time.Time, requestID uint64, method string
 		return err
 	}
 	if timeoutMs > MaxRPCTimeoutMs {
-		return NewRpcError(ErrorCodeOutOfRange, fmt.Sprintf("syntra: timeout_ms %d exceeds max %d", timeoutMs, MaxRPCTimeoutMs))
+		timeoutMs = MaxRPCTimeoutMs
 	}
 	budget := DefaultRPCTimeout
 	if timeoutMs > 0 {
@@ -1244,15 +1253,15 @@ func (t *Tracker) StartWithBudget(now time.Time, requestID uint64, method string
 	if _, exists := t.pending[requestID]; exists {
 		return NewRpcError(ErrorCodeInvalidArgument, fmt.Sprintf("syntra: duplicate request_id %d", requestID))
 	}
-	if len(t.pending) >= MaxConcurrentRPCs {
+	if len(t.pending) >= t.limit {
 		return NewRpcError(ErrorCodeResourceExhausted, "syntra: too many concurrent RPCs")
 	}
 	t.pending[requestID] = &callEntry{method: method, deadline: now.Add(budget)}
 	return nil
 }
 
-// Finish releases requestID after its terminal result. It fails closed on
-// unknown IDs so result storms cannot corrupt the table. A nil result is
+// Finish releases requestID after its terminal result. Unknown IDs are ignored.
+// A nil result is
 // InvalidArgument; callers that decode a result should pass the decoded
 // value through ValidateResult first so a both/neither outcome is
 // rejected before the table is touched.
@@ -1262,8 +1271,7 @@ func (t *Tracker) Finish(requestID uint64) error {
 
 // FinishResult completes requestID with exactly one terminal result: a
 // both/neither outcome or an error result with an Unspecified code is
-// InvalidArgument and the id stays outstanding; an unknown id is
-// InvalidArgument so duplicate finishes cannot corrupt the table.
+// InvalidArgument and the id stays outstanding; unknown IDs are ignored.
 func (t *Tracker) FinishResult(requestID uint64, result *RpcResult) error {
 	if t == nil {
 		return NewRpcError(ErrorCodeInternal, "syntra: nil tracker")
@@ -1277,7 +1285,7 @@ func (t *Tracker) FinishResult(requestID uint64, result *RpcResult) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if _, exists := t.pending[requestID]; !exists {
-		return NewRpcError(ErrorCodeInvalidArgument, fmt.Sprintf("syntra: unknown request_id %d", requestID))
+		return nil
 	}
 	delete(t.pending, requestID)
 	return nil
@@ -1319,7 +1327,7 @@ func (t *Tracker) IsCancelled(requestID uint64) bool {
 // Expired returns the ids whose deadlines are at or before now and
 // removes them from the outstanding set. The caller fails each with a
 // DeadlineExceeded result; removal here guarantees exactly-one terminal
-// semantics (a late Finish for an expired id reports unknown).
+// semantics (a late Finish for an expired id is ignored).
 func (t *Tracker) Expired(now time.Time) []uint64 {
 	if t == nil {
 		return nil
@@ -1387,7 +1395,7 @@ func MarshalFrame(f *Frame) ([]byte, error) {
 // inputs, trailing bytes, reserved top-level numbers 16/17, and duplicate
 // bodies before running structural validation. Duplicate version/request_id
 // occurrences are type-checked but follow protobuf merge semantics
-// (last wins), matching the Rust core. Cancel inner bytes and nested
+// (last wins). Cancel inner bytes and nested
 // unassigned numbers are tolerated as unknown fields per SNTR-SER-003.
 // Request methods are validated by the host so malformed methods receive
 // per-RPC errors. proto.Unmarshal owns decoding; the pre-scan owns protocol
@@ -1405,15 +1413,8 @@ func UnmarshalFrame(data []byte) (*Frame, error) {
 		return nil, err
 	}
 	var f Frame
-	if err := (proto.UnmarshalOptions{RecursionLimit: 32}).Unmarshal(data, &f); err != nil {
+	if err := (proto.UnmarshalOptions{RecursionLimit: 33}).Unmarshal(data, &f); err != nil {
 		return nil, NewRpcError(ErrorCodeInvalidArgument, fmt.Sprintf("syntra: malformed frame: %v", err))
-	}
-	// Match the Rust core's unknown-only classification (SNTR-WIRE-004).
-	// There is no allocated future-body tag range: with a known body,
-	// unknown fields must remain tolerated (SNTR-SER-003). Distinguishing
-	// mixed unknown bodies from metadata needs the discriminator in RFC B5.
-	if BodyKindOf(&f) == BodyKindNone && len(f.ProtoReflect().GetUnknown()) > 0 {
-		return nil, NewRpcError(ErrorCodeUnimplemented, "syntra: unknown frame variant")
 	}
 	// proto.Unmarshal consumed every tag the pre-scan walked, so a
 	// successful unmarshal here consumed exactly one Frame.
@@ -1427,256 +1428,4 @@ func UnmarshalFrame(data []byte) (*Frame, error) {
 		}
 	}
 	return &f, nil
-}
-
-// scanFrameTags walks top-level tags to enforce strictness before
-// proto.Unmarshal: reserved 16/17 rejected, duplicate bodies rejected,
-// unknown fields skipped, version/request_id type-checked. Duplicate
-// version/request_id occurrences follow protobuf merge semantics
-// (last value wins in proto.Unmarshal); they are type-checked here but
-// not rejected, matching the Rust core and SNTR-SER-002
-// non-canonical tolerance. Duplicate bodies remain rejected per
-// SNTR-WIRE-002 (see RFC 0001 B4).
-func scanFrameTags(data []byte) error {
-	bodySeen := false
-	raw := data
-	for len(raw) > 0 {
-		num, typ, n := protowire.ConsumeTag(raw)
-		if n < 0 || !num.IsValid() {
-			return NewRpcError(ErrorCodeInvalidArgument, "syntra: malformed frame tag")
-		}
-		raw = raw[n:]
-		if num == ReservedFrameFieldNumber16 || num == ReservedFrameFieldNumber17 {
-			return NewRpcError(ErrorCodeInvalidArgument, "syntra: reserved frame field number")
-		}
-		switch {
-		case num == 1:
-			if typ != protowire.VarintType {
-				return NewRpcError(ErrorCodeInvalidArgument, "syntra: malformed version")
-			}
-			v, m := protowire.ConsumeVarint(raw)
-			if m < 0 {
-				return NewRpcError(ErrorCodeInvalidArgument, "syntra: malformed version")
-			}
-			if v > math.MaxUint32 {
-				return NewRpcError(ErrorCodeInvalidArgument, "syntra: malformed version")
-			}
-			raw = raw[m:]
-		case num == 2:
-			if typ != protowire.VarintType {
-				return NewRpcError(ErrorCodeInvalidArgument, "syntra: malformed request_id")
-			}
-			_, m := protowire.ConsumeVarint(raw)
-			if m < 0 {
-				return NewRpcError(ErrorCodeInvalidArgument, "syntra: malformed request_id")
-			}
-			raw = raw[m:]
-		case num >= 10 && num <= 15:
-			if typ != protowire.BytesType {
-				return NewRpcError(ErrorCodeInvalidArgument, "syntra: malformed body bytes")
-			}
-			v, m := protowire.ConsumeBytes(raw)
-			if m < 0 {
-				return NewRpcError(ErrorCodeInvalidArgument, "syntra: malformed body bytes")
-			}
-			raw = raw[m:]
-			if bodySeen {
-				return NewRpcError(ErrorCodeInvalidArgument, "syntra: frame has multiple bodies set")
-			}
-			bodySeen = true
-			// The root Frame counts as depth 1, as in UnmarshalOptions.
-			if err := scanNested(num, v, 2); err != nil {
-				return err
-			}
-		default:
-			// Unknown top-level fields are forward-compatible metadata:
-			// skip per wire type (SNTR-SER-003). Reserved numbers never
-			// reach here; they are rejected above.
-			var err error
-			raw, err = skipUnknown(raw, num, typ, 1)
-			if err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-// skipUnknown consumes one unknown field value per wire type so
-// forward-compatible metadata is tolerated and skipped (SNTR-SER-003).
-// Groups require matching end tags and share the 32-level message budget.
-// Length-delimited unknown values are opaque, not nested messages.
-func skipUnknown(raw []byte, num protowire.Number, typ protowire.Type, depth int) ([]byte, error) {
-	switch typ {
-	case protowire.VarintType:
-		_, m := protowire.ConsumeVarint(raw)
-		if m < 0 {
-			return nil, NewRpcError(ErrorCodeInvalidArgument, "syntra: malformed unknown varint field")
-		}
-		return raw[m:], nil
-	case protowire.Fixed64Type:
-		_, m := protowire.ConsumeFixed64(raw)
-		if m < 0 {
-			return nil, NewRpcError(ErrorCodeInvalidArgument, "syntra: malformed unknown fixed64 field")
-		}
-		return raw[m:], nil
-	case protowire.BytesType:
-		_, m := protowire.ConsumeBytes(raw)
-		if m < 0 {
-			return nil, NewRpcError(ErrorCodeInvalidArgument, "syntra: malformed unknown bytes field")
-		}
-		return raw[m:], nil
-	case protowire.Fixed32Type:
-		_, m := protowire.ConsumeFixed32(raw)
-		if m < 0 {
-			return nil, NewRpcError(ErrorCodeInvalidArgument, "syntra: malformed unknown fixed32 field")
-		}
-		return raw[m:], nil
-	case protowire.StartGroupType:
-		if depth >= 32 {
-			return nil, NewRpcError(ErrorCodeInvalidArgument, "syntra: exceeded max recursion depth")
-		}
-		for len(raw) > 0 {
-			child, childType, n := protowire.ConsumeTag(raw)
-			if n < 0 || !child.IsValid() {
-				return nil, NewRpcError(ErrorCodeInvalidArgument, "syntra: malformed unknown group tag")
-			}
-			raw = raw[n:]
-			if childType == protowire.EndGroupType {
-				if child != num {
-					return nil, NewRpcError(ErrorCodeInvalidArgument, "syntra: mismatched unknown end group")
-				}
-				return raw, nil
-			}
-			var err error
-			raw, err = skipUnknown(raw, child, childType, depth+1)
-			if err != nil {
-				return nil, err
-			}
-		}
-		return nil, NewRpcError(ErrorCodeInvalidArgument, "syntra: unterminated unknown group")
-	default:
-		return nil, NewRpcError(ErrorCodeInvalidArgument, "syntra: unsupported wire type")
-	}
-}
-
-// scanNested walks every message reachable from Frame: its six bodies and
-// RpcResult.error (body 0). Only declared message fields recurse; strings,
-// payloads, credentials, and length-delimited unknown values stay opaque.
-func scanNested(body protowire.Number, data []byte, depth int) error {
-	if depth > 32 {
-		return NewRpcError(ErrorCodeInvalidArgument, "syntra: exceeded max recursion depth")
-	}
-	switch body {
-	case 10:
-		return scanHello(data, depth)
-	case 13:
-		return scanResult(data, depth)
-	default:
-		for len(data) > 0 {
-			num, typ, n := protowire.ConsumeTag(data)
-			if n < 0 || !num.IsValid() {
-				return NewRpcError(ErrorCodeInvalidArgument, "syntra: malformed nested message tag")
-			}
-			var err error
-			data, err = skipUnknown(data[n:], num, typ, depth)
-			if err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-}
-
-// scanHello checks ClientHello fields 1, 2, 3 for shape and bounds every
-// credential occurrence before protobuf can allocate it, including duplicates.
-func scanHello(data []byte, depth int) error {
-	raw := data
-	for len(raw) > 0 {
-		num, typ, n := protowire.ConsumeTag(raw)
-		if n < 0 || !num.IsValid() {
-			return NewRpcError(ErrorCodeInvalidArgument, "syntra: malformed hello")
-		}
-		raw = raw[n:]
-		switch {
-		case num == 1 || num == 2:
-			if typ != protowire.VarintType {
-				return NewRpcError(ErrorCodeInvalidArgument, "syntra: malformed hello version")
-			}
-			v, m := protowire.ConsumeVarint(raw)
-			if m < 0 {
-				return NewRpcError(ErrorCodeInvalidArgument, "syntra: malformed hello version")
-			}
-			if v > math.MaxUint32 {
-				return NewRpcError(ErrorCodeInvalidArgument, "syntra: malformed hello version")
-			}
-			raw = raw[m:]
-		case num == 3:
-			if typ != protowire.BytesType {
-				return NewRpcError(ErrorCodeInvalidArgument, "syntra: malformed hello credential")
-			}
-			credential, m := protowire.ConsumeBytes(raw)
-			if m < 0 {
-				return NewRpcError(ErrorCodeInvalidArgument, "syntra: malformed hello credential")
-			}
-			if err := ValidateCredentialSize(credential); err != nil {
-				return err
-			}
-			raw = raw[m:]
-		default:
-			// Unknown hello fields are forward-compatible metadata:
-			// skip per wire type (SNTR-SER-003).
-			var err error
-			raw, err = skipUnknown(raw, num, typ, depth)
-			if err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-// scanResult checks RpcResult oneof fields 1 and 2 for cardinality: at
-// most one outcome may appear on the wire. A second outcome alternative
-// is a duplicate body and is rejected here because the generated decoder
-// would silently collapse it into the last one.
-func scanResult(data []byte, depth int) error {
-	raw := data
-	seen := 0
-	for len(raw) > 0 {
-		num, typ, n := protowire.ConsumeTag(raw)
-		if n < 0 || !num.IsValid() {
-			return NewRpcError(ErrorCodeInvalidArgument, "syntra: malformed result")
-		}
-		raw = raw[n:]
-		switch num {
-		case 1, 2:
-			if typ != protowire.BytesType {
-				return NewRpcError(ErrorCodeInvalidArgument, "syntra: malformed result outcome")
-			}
-			value, m := protowire.ConsumeBytes(raw)
-			if m < 0 {
-				return NewRpcError(ErrorCodeInvalidArgument, "syntra: malformed result outcome")
-			}
-			raw = raw[m:]
-			seen++
-			if seen > 1 {
-				return NewRpcError(ErrorCodeInvalidArgument, "syntra: result has multiple outcomes")
-			}
-			if num == 2 {
-				if err := scanNested(0, value, depth+1); err != nil {
-					return err
-				}
-			}
-		default:
-			// Unknown result fields are forward-compatible metadata:
-			// skip per wire type (SNTR-SER-003).
-			var err error
-			raw, err = skipUnknown(raw, num, typ, depth)
-			if err != nil {
-				return err
-			}
-		}
-	}
-	return nil
 }

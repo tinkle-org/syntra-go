@@ -1,0 +1,23 @@
+RELEASING.md
+  s_141024b4ebb76e::t_c5487b9436882a 7,12-16
+.github/workflows/go.yml
+  s_141024b4ebb76e::t_c5487b9436882a 380
+.github/workflows/release-please.yml
+  s_141024b4ebb76e::t_c5487b9436882a 90
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "f6bb72a90989fbdc8aad0d270558abce086e6079",
+  "prompts": {},
+  "sessions": {
+    "s_141024b4ebb76e": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e5648fbe3ffePaFV5y4GAxYoJV",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "oscarlaw <oscarlaw2010@gmail.com>"
+    }
+  }
+}

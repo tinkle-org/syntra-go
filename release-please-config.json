@@ -4,6 +4,7 @@
   "versioning": "prerelease",
   "prerelease-type": "rc.1",
   "prerelease": true,
+  "initial-version": "1.0.0-rc.1",
   "packages": {
     ".": {
       "package-name": "syntra-go",

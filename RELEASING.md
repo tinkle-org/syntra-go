@@ -4,18 +4,16 @@ Syntra Go is distributed as source through the root Go module
 `github.com/tinkle-org/syntra-go`. Release Please owns version changes,
 `CHANGELOG.md`, immutable `vX.Y.Z` tags, and GitHub Releases. There is no binary
 upload or separate package-registry publish step. The current module path
-supports major versions zero and one; a future v2 needs a module-path migration
-and updated release validation.
+supports major versions zero and one; a future v2 needs a module-path migration.
 
 ## CI and publication
 
 The `Go` workflow runs on pull requests and pushes to `main`. Its `ci-success`
-job includes release metadata validation alongside build, tests, race checks,
-compatibility, generation, security, fuzz smoke, and workflow linting. Keep
-`ci-success` required in branch protection. Metadata checks compare the proposed
-manifest against the base commit, reject version regressions, and require a
-changed version to match the configured release channel and first changelog
-entry. A configuration-only channel switch leaves the previous manifest intact.
+job includes build, tests, race checks, compatibility, generation, security,
+fuzz smoke, and workflow linting. Keep `ci-success` required in branch protection.
+Release Please owns version selection and generated release bookkeeping;
+maintainers review the proposed manifest, changelog, and channel before merging.
+A configuration-only channel switch leaves the previous manifest intact.
 
 Only a successful `main` push run calls the reusable `Release Please` workflow.
 Only its publication job has write permissions. An older run skips release
@@ -51,14 +49,18 @@ the existing package settings and set these top-level properties in
 {
   "versioning": "prerelease",
   "prerelease-type": "rc.1",
-  "prerelease": true
+  "prerelease": true,
+  "initial-version": "1.0.0-rc.1"
 }
 ```
 
 `rc.1` is the initial suffix, not a value to edit for each candidate. The
 prerelease strategy increments the numeric suffix of an existing prerelease.
-With the initial `0.0.0` manifest and the pending breaking changes, the expected
-first candidate is `1.0.0-rc.1`. The manifest's bootstrap value is not a release.
+Without a prior release, Release Please uses `initial-version` instead of
+bumping through the prerelease strategy. Set it explicitly to `1.0.0-rc.1`;
+RC mode alone would still propose the default initial stable `1.0.0`.
+Once the first release exists, normal prerelease bumping applies. The manifest's
+`0.0.0` bootstrap value is not itself a release.
 
 Wait for the configuration merge's `Go` run and Release Please job to finish.
 Inspect the generated PR's actual manifest and changelog, not just its title.
@@ -96,7 +98,8 @@ deciding to promote it.
 
 Promotion is a separate reviewed configuration PR after an RC has been accepted.
 Set `prerelease` to `false` and `versioning` to `default`, and remove
-`prerelease-type`. Check for per-package overrides as well as top-level values.
+`prerelease-type` and the bootstrap-only `initial-version`. Check for per-package
+overrides as well as top-level values.
 Leave `.release-please-manifest.json` at the last released RC version.
 
 To request exactly `1.0.0` rather than relying on an inferred bump, preserve this
@@ -139,14 +142,11 @@ patch version.
 For local metadata and workflow changes, run:
 
 ```sh
-python3 scripts/check-release.py
 python3 -m unittest discover -s scripts -p 'test_*.py' -v
 actionlint .github/workflows/*.yml
 git diff --check
 ```
 
-On a released checkout, also run
-`python3 scripts/check-release.py --tag v1.0.0-rc.1`, substituting its actual tag.
 These local checks do not prove hosted Actions permissions or public proxy
 availability. See the upstream [Release Please action documentation](https://github.com/googleapis/release-please-action)
 and [version override documentation](https://github.com/googleapis/release-please#how-do-i-change-the-version-number).

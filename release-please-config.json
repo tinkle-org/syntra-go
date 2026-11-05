@@ -1,6 +1,9 @@
 {
   "$schema": "https://schema.release-please.net/schema.json",
   "release-type": "go",
+  "versioning": "prerelease",
+  "prerelease-type": "rc.1",
+  "prerelease": true,
   "packages": {
     ".": {
       "package-name": "syntra-go",

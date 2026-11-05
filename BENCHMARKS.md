@@ -34,6 +34,36 @@ platform, CPU, source revision and working-tree state with any local sample.
 - `transport/ordered.BenchmarkPrefixPreallocated` measures frame-prefix encoding
   without encryption or I/O.
 
+### Session worker admission and metrics
+
+`WorkersN` is the number of caller goroutines sharing one loopback connection,
+not a guarantee of N simultaneous RPCs. Worker cases report `inflight-limit`,
+the configured maximum outstanding benchmark calls per connection (not an
+observed peak). The benchmark estimates each echo frame as payload plus 128
+bytes for the envelope, capped at `MaxFrameBytes` (1 MiB). It admits at most
+`min(workers, hostWriterMaxBytes / estimatedFrameBytes - 1)` calls. The writer's
+8 MiB byte cap includes queued and active sends, independently of
+`WriterCapacity`. Reserving one additional frame covers a caller receiving its
+result and admitting another call before the writer releases the active send's
+charge. This estimate applies to this echo-only fixture, not arbitrary host
+traffic or notifications.
+
+With the current fixtures, only `near1MiB/Workers16` is restricted: all 16
+goroutines still perform their assigned calls, with at most 7 calls outstanding.
+The empty, 64 B, 1 KiB and 64 KiB cases keep their original concurrency and do
+not use the admission channel. Serial cases are unchanged. Admission waiting is
+inside the timed worker loop; setup of the bound and channel is outside timing.
+Every call must succeed and echo exactly; errors still fail the sample and all
+workers are joined. No production resource limits are changed.
+
+Existing metrics retain their meaning: `calls` is the successfully completed
+count and must equal `b.N`; `rpc/s` is completed calls divided by total timed
+elapsed seconds; `ns/op` is elapsed time per completed call, not individual RPC
+latency; `MB/s` counts both request and echoed application payloads, not wire
+bytes. Allocations cover the timed work. The bounded large-payload workload is
+not directly comparable to the previous unrestricted Workers16 workload as a
+production performance improvement. Record `inflight-limit` with comparisons.
+
 There are no benchmark functions for managed `network`, `routes`, `proxy`, TCP,
 WS/WSS, TLS stream establishment, or the HTTP/HTTPS candidate carrier. Their real
 loopback integration tests verify behavior and lifecycle, not performance.
@@ -69,6 +99,13 @@ samples check execution and provide observations; they are not a performance
 baseline or evidence of a statistically significant improvement.
 Selecting `./...` does not create benchmarks for packages that have none; use
 only functions present in the tree when selecting individual cases.
+
+Stress the large-payload worker admission at both CI CPU settings:
+
+```sh
+go test -mod=readonly -run '^TestBenchmarkSession(InflightLimit|FrameBudget|ReadinessAndEcho)$' -count=1 .
+CGO_ENABLED=0 go test -mod=readonly -run '^$' -bench '^BenchmarkSessionLoopback/near1MiB/Workers16$' -benchmem -count=20 -benchtime=100ms -cpu=1,4 -timeout=10m .
+```
 
 ## Compare changes
 

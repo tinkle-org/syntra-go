@@ -205,10 +205,69 @@ func BenchmarkSessionLoopback(b *testing.B) {
 	}
 }
 
+// Enough for the echo method, timeout, maximum-width request ID, tags and length
+// prefixes. TestBenchmarkSessionFrameBudget checks both request and result sizes.
+const benchmarkSessionFrameOverhead = 128
+
+func benchmarkSessionInflightLimit(payloadBytes, workers int) int {
+	frameBytes := min(payloadBytes+benchmarkSessionFrameOverhead, MaxFrameBytes)
+	// A received result can wake a caller before hostWriter.run releases the
+	// active Send's byte charge. Reserve one additional frame for that overlap.
+	return min(workers, hostWriterMaxBytes/frameBytes-1)
+}
+
+func TestBenchmarkSessionInflightLimit(t *testing.T) {
+	for _, size := range benchmarkPayloadSizes {
+		for _, workers := range []int{1, 4, 7, 8, 16} {
+			t.Run(fmt.Sprintf("%s/Workers%d", size.name, workers), func(t *testing.T) {
+				want := workers
+				if size.name == "near1MiB" {
+					want = min(workers, 7)
+				}
+				if got := benchmarkSessionInflightLimit(size.size, workers); got != want {
+					t.Fatalf("inflight limit = %d, want %d", got, want)
+				}
+			})
+		}
+	}
+	// Sixteen calls plus one completion-overlap frame fit at this boundary;
+	// one more payload byte must reduce admission, not consume the reserve.
+	boundary := hostWriterMaxBytes/17 - benchmarkSessionFrameOverhead
+	for _, tc := range []struct{ payload, want int }{{boundary, 16}, {boundary + 1, 15}} {
+		if got := benchmarkSessionInflightLimit(tc.payload, 16); got != tc.want {
+			t.Fatalf("payload %d: inflight limit = %d, want %d", tc.payload, got, tc.want)
+		}
+	}
+}
+
+func TestBenchmarkSessionFrameBudget(t *testing.T) {
+	for _, size := range benchmarkPayloadSizes {
+		payload := make([]byte, size.size)
+		for _, frame := range []*Frame{
+			NewRequestFrame(1, ^uint64(0), &RpcRequest{Method: benchmarkEchoMethod, Payload: payload, TimeoutMs: 5000}),
+			NewResultFrame(1, ^uint64(0), NewSuccessResult(payload)),
+		} {
+			raw, err := MarshalFrame(frame)
+			if err != nil {
+				t.Fatalf("%s: %v", size.name, err)
+			}
+			budget := min(size.size+benchmarkSessionFrameOverhead, MaxFrameBytes)
+			if len(raw) > budget {
+				t.Fatalf("%s: frame size %d exceeds benchmark budget %d", size.name, len(raw), budget)
+			}
+		}
+	}
+}
+
 func benchmarkSessionWorkers(b *testing.B, payload []byte, workers int) {
 	ccfg, hcfg := benchmarkSessionConfigs()
 	p := newBenchmarkSessionPair(b, ccfg, hcfg)
 	b.Cleanup(func() { p.close(b) })
+	inflightLimit := benchmarkSessionInflightLimit(len(payload), workers)
+	var admission chan struct{}
+	if inflightLimit < workers {
+		admission = make(chan struct{}, inflightLimit)
+	}
 	type result struct {
 		completed int
 		err       error
@@ -220,7 +279,13 @@ func benchmarkSessionWorkers(b *testing.B, payload []byte, workers int) {
 			<-start
 			r := result{}
 			for i := worker; i < b.N; i += workers {
+				if admission != nil {
+					admission <- struct{}{}
+				}
 				out, err := p.client.Call(context.Background(), benchmarkEchoMethod, payload, 5000)
+				if admission != nil {
+					<-admission
+				}
 				if err != nil {
 					r.err = err
 					break
@@ -256,6 +321,7 @@ func benchmarkSessionWorkers(b *testing.B, payload []byte, workers int) {
 	}
 	b.ReportMetric(float64(completed), "calls")
 	b.ReportMetric(float64(completed)/b.Elapsed().Seconds(), "rpc/s")
+	b.ReportMetric(float64(inflightLimit), "inflight-limit")
 }
 
 // Core creation, hello/ready encoding and validation, authentication completion,

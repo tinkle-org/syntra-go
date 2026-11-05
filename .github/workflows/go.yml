@@ -10,7 +10,8 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Do not interrupt main's release publication when another push arrives.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   pure-go:
@@ -375,8 +376,22 @@ jobs:
       - name: Lint workflows
         run: actionlint .github/workflows/*.yml
 
+  release-metadata:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          # Compare manifest changes with the PR base or pre-push commit.
+          fetch-depth: 0
+      - name: Validate release channel and proposed manifest changes
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: python3 scripts/check-release.py --base-ref "$BASE_SHA"
+
   ci-success:
-    needs: [pure-go, network-integration, dependency-isolation, generated-go, compat, security, fuzz-smoke, actionlint]
+    needs: [pure-go, network-integration, dependency-isolation, generated-go, compat, security, fuzz-smoke, actionlint, release-metadata]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -400,3 +415,12 @@ jobs:
           PY
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
+
+  release:
+    needs: ci-success
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    uses: ./.github/workflows/release-please.yml

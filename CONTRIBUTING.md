@@ -11,6 +11,10 @@ internal envelope. The core and socket-free runtime can use application-supplied
 ordered record I/O or optional managed networking selected by imports. Managed
 networking uses Go goroutines/netpoll and explicit ownership and quotas.
 
+Maintainers should follow [RELEASING.md](RELEASING.md) for RC versions, release
+verification, and promotion to stable. Release publication runs only after the
+required Go CI jobs succeed on `main`.
+
 ## Local checks
 
 ```sh

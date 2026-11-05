@@ -58,20 +58,33 @@ func TestManagedHTTPAndHTTPSIdlePushLossPauseResume(t *testing.T) {
 		t.Run(map[bool]string{false: "HTTP", true: "HTTPS"}[secure], func(t *testing.T) {
 			n := testNetwork(t, DefaultConfig())
 			l, connector := managedHTTP(t, n, secure, nil)
-			var elapsed atomic.Int64
+			origin := time.Now()
+			var offset atomic.Int64
 			cfg := reconnectConfig()
 			cfg.NotificationCapacity = 1
 			cfg.NotificationBytes = 64
 			cfg.ClockFactory = func() *securechannel.Clock {
-				return securechannel.NewClockWithSource(securechannel.ElapsedFunc(func() (time.Duration, bool) { return time.Duration(elapsed.Load()), true }))
+				return securechannel.NewClockWithSource(securechannel.ElapsedFunc(func() (time.Duration, bool) {
+					// Keep backoff and outage budgets progressing across the jump.
+					return time.Since(origin) + time.Duration(offset.Load()), true
+				}))
 			}
-			c, err := n.Client(cfg, connector)
+			// Force a retry before each generation instead of relying on a
+			// scheduling-dependent listener startup/resume refusal.
+			var failNext atomic.Bool
+			failNext.Store(true)
+			c, err := n.Client(cfg, func(ctx context.Context, b *ordered.EstablishmentBudget) (*connection.Client, error) {
+				if failNext.Swap(false) {
+					return nil, ordered.ErrIO
+				}
+				return connector(ctx, b)
+			})
 			if err != nil {
 				t.Fatal(err)
 			}
 			first := phase(t, c, CoreReady).Generation
 			// No RPC drives the download lane, even after the setup cutoff retires.
-			elapsed.Store(int64(2 * time.Second))
+			offset.Store(int64(2 * time.Second))
 			if err := l.NotifyAll([]byte("idle push")); err != nil {
 				t.Fatal(err)
 			}
@@ -99,6 +112,7 @@ func TestManagedHTTPAndHTTPSIdlePushLossPauseResume(t *testing.T) {
 				t.Fatal("paused listener emitted a notification")
 			}
 			until(t, func() bool { s := l.Snapshot().Server; return s.Paused && s.Associations == 0 && s.Sockets == 0 })
+			failNext.Store(true)
 			n.Resume()
 			second := phase(t, c, CoreReady).Generation
 			if second <= first {
@@ -117,6 +131,7 @@ func TestManagedHTTPAndHTTPSIdlePushLossPauseResume(t *testing.T) {
 			n.NetworkAvailable(false)
 			phase(t, c, Offline)
 			until(t, func() bool { return l.Snapshot().Server.Paused })
+			failNext.Store(true)
 			n.NetworkAvailable(true)
 			if phase(t, c, CoreReady).Generation <= second {
 				t.Fatal("offline transition reused generation")

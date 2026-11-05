@@ -1,0 +1,39 @@
+.github/workflows/go.yml
+  s_fcdbb8c3dc27d1::t_abdd40d3f81ec8 13-14,418-426
+  s_141024b4ebb76e::t_44ca9bd57c45ae 379-392,394
+.github/workflows/release-please.yml
+  s_141024b4ebb76e::t_44ca9bd57c45ae 84-85,91-92
+  s_fcdbb8c3dc27d1::t_abdd40d3f81ec8 4,8,10,21,28-31,33-53,56,58-59,62,65-83,86-90,93-146
+scripts/test_check_release.py
+  s_141024b4ebb76e::t_44ca9bd57c45ae 1-165
+RELEASING.md
+  s_141024b4ebb76e::t_3c829e24c17a35 1-152
+CONTRIBUTING.md
+  s_141024b4ebb76e::t_3c829e24c17a35 14-17
+scripts/check-release.py
+  s_141024b4ebb76e::t_44ca9bd57c45ae 1-113
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "1d570d29c7b2a321974b695b257187f29be8c748",
+  "prompts": {},
+  "sessions": {
+    "s_141024b4ebb76e": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e5648fbe3ffePaFV5y4GAxYoJV",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "oscarlaw <oscarlaw2010@gmail.com>"
+    },
+    "s_fcdbb8c3dc27d1": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e5644d046ffe4LVScSXah2KeRj",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "oscarlaw <oscarlaw2010@gmail.com>"
+    }
+  }
+}

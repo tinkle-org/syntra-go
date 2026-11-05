@@ -1,0 +1,22 @@
+session_benchmark_test.go
+  s_b752e9683a9e12::t_8b09007cb18994 208-261,266-270,282-284,286-288,324
+BENCHMARKS.md
+  s_b752e9683a9e12::t_8b09007cb18994 37-66,103-108
+  s_b752e9683a9e12::t_ab1a0761fc34b9 109
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "5bedda2807942896a7430dd32dfc7938d0585bea",
+  "prompts": {},
+  "sessions": {
+    "s_b752e9683a9e12": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e55f24680ffeiVMLjPE8k6nXuy",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "oscarlaw <oscarlaw2010@gmail.com>"
+    }
+  }
+}

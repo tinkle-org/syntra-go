@@ -1,0 +1,28 @@
+RELEASING.md
+  s_141024b4ebb76e::t_9261b85fd7f147 54-55,61-65,103-104
+scripts/check-release.py
+  s_141024b4ebb76e::t_7c1dd8b4a0c376 58-60
+  s_141024b4ebb76e::t_9261b85fd7f147 53-57
+release-please-config.json
+  s_141024b4ebb76e::t_9261b85fd7f147 7
+scripts/test_check_release.py
+  s_141024b4ebb76e::t_7c1dd8b4a0c376 54-59
+  s_141024b4ebb76e::t_9261b85fd7f147 41-52
+  s_141024b4ebb76e::t_bbb91bbbe4cd79 53
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "135e4099fcc421b55c5fb46ba28d0949f57fe9f7",
+  "prompts": {},
+  "sessions": {
+    "s_141024b4ebb76e": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e5648fbe3ffePaFV5y4GAxYoJV",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "oscarlaw <oscarlaw2010@gmail.com>"
+    }
+  }
+}

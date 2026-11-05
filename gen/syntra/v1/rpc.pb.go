@@ -21,17 +21,17 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
-// RpcRequest carries opaque application-defined data (SNTR-RPC-001/003/004/007).
+// RpcRequest carries opaque application-defined data.
 // Correlation belongs to Frame.request_id; operation keys remain inside payload.
 // No universal HTTP status fields or application service methods are declared.
 type RpcRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// method is a canonical /package.Service/Method identifier (SNTR-RPC-001).
+	// method is a canonical /package.Service/Method identifier.
 	Method string `protobuf:"bytes,1,opt,name=method,proto3" json:"method,omitempty"`
-	// payload accepts arbitrary bytes, including empty/non-UTF-8 (SNTR-RPC-003).
+	// payload accepts arbitrary bytes, including empty/non-UTF-8.
 	Payload []byte `protobuf:"bytes,2,opt,name=payload,proto3" json:"payload,omitempty"`
 	// timeout_ms is a relative millisecond budget; zero selects the bounded host
-	// default. This existing scalar has implicit presence, not an absolute clock.
+	// default. This scalar has implicit presence, not an absolute clock.
 	TimeoutMs     uint32 `protobuf:"varint,3,opt,name=timeout_ms,json=timeoutMs,proto3" json:"timeout_ms,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -88,11 +88,10 @@ func (x *RpcRequest) GetTimeoutMs() uint32 {
 	return 0
 }
 
-// RpcResult is the published RPC response name (SNTR-RPC-002/006). Renaming it
-// RpcResponse would change schema identity and generated APIs; see RFC 0001.
+// RpcResult completes a correlated RPC with a payload or a typed error.
 type RpcResult struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// outcome is selected even for a successful zero-byte result (SNTR-WIRE-007).
+	// outcome is selected even for a successful zero-byte result.
 	// Missing outcome is representable by codecs but is not protocol success.
 	//
 	// Types that are valid to be assigned to Outcome:
@@ -169,7 +168,7 @@ type RpcResult_Payload struct {
 }
 
 type RpcResult_Error struct {
-	// error is a failure with a nonzero code (SNTR-ERR-001/005).
+	// error is a failure with a nonzero code.
 	Error *RpcError `protobuf:"bytes,2,opt,name=error,proto3,oneof"`
 }
 
@@ -177,7 +176,7 @@ func (*RpcResult_Payload) isRpcResult_Outcome() {}
 
 func (*RpcResult_Error) isRpcResult_Outcome() {}
 
-// Cancel targets Frame.request_id; it is advisory, not rollback (SNTR-RPC-005).
+// Cancel targets Frame.request_id; it is advisory, not rollback.
 type Cancel struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	unknownFields protoimpl.UnknownFields
@@ -229,7 +228,7 @@ const file_syntra_v1_rpc_proto_rawDesc = "" +
 	"\apayload\x18\x01 \x01(\fH\x00R\apayload\x12+\n" +
 	"\x05error\x18\x02 \x01(\v2\x13.syntra.v1.RpcErrorH\x00R\x05errorB\t\n" +
 	"\aoutcome\"\b\n" +
-	"\x06CancelB?Z=github.com/tinklehq/syntra/bindings/go/gen/syntra/v1;syntrav1b\x06proto3"
+	"\x06CancelB8Z6github.com/tinkle-org/syntra-go/gen/syntra/v1;syntrav1b\x06proto3"
 
 var (
 	file_syntra_v1_rpc_proto_rawDescOnce sync.Once

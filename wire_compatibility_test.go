@@ -13,9 +13,7 @@ func TestUnknownFrameContentClassification(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// No future-body tag interval is allocated by envelope.proto. Exercise
-	// unallocated fields below and above known bodies, including Rust's
-	// field-90 fixture and the maximum legal protobuf field number.
+	// Future body choices occupy 18..31. Other unknown numbers are metadata.
 	for _, num := range []protowire.Number{3, 9, 18, 31, 90, 100, protowire.MaxValidNumber} {
 		for _, typ := range []protowire.Type{protowire.VarintType, protowire.Fixed32Type, protowire.Fixed64Type, protowire.BytesType} {
 			t.Run(fmt.Sprintf("field%d/type%d", num, typ), func(t *testing.T) {
@@ -32,14 +30,23 @@ func TestUnknownFrameContentClassification(t *testing.T) {
 				}
 				_, err := UnmarshalFrame(append([]byte{0x08, 0x01}, unknown...))
 				var rpcErr *RpcError
-				if !errors.As(err, &rpcErr) || rpcErr.Code != ErrorCodeUnimplemented {
-					t.Fatalf("unknown-only error = %v, want UNIMPLEMENTED", err)
+				future := num >= 18 && num <= 31
+				want := ErrorCodeInvalidArgument
+				if future && typ == protowire.BytesType {
+					want = ErrorCodeUnimplemented
+				}
+				if !errors.As(err, &rpcErr) || rpcErr.Code != want {
+					t.Fatalf("unknown-only error = %v, want %v", err, want)
 				}
 				for _, raw := range [][]byte{
 					append(append([]byte(nil), known...), unknown...),
 					append(append([]byte(nil), unknown...), known...),
 				} {
 					f, err := UnmarshalFrame(raw)
+					if future {
+						alignmentCode(t, err, ErrorCodeInvalidArgument)
+						continue
+					}
 					if err != nil || f.GetRequestId() != 7 || f.GetRequest().GetMethod() != "/example.Echo/Echo" {
 						t.Fatalf("known body with unknown metadata = %v, %v", f, err)
 					}
@@ -54,7 +61,7 @@ func TestUnknownFrameContentClassification(t *testing.T) {
 
 func TestDuplicateScalarsFollowProtobufLastWins(t *testing.T) {
 	// Duplicate version/request_id follow protobuf merge semantics
-	// (last wins), matching the Rust core and SNTR-SER-002. Duplicate
+	// (last wins), following SNTR-SER-002. Duplicate
 	// bodies remain rejected (see TestDuplicateBodies).
 	for name, tc := range map[string]struct {
 		hex     string
@@ -78,7 +85,7 @@ func TestDuplicateScalarsFollowProtobufLastWins(t *testing.T) {
 
 func TestNonemptyCancelTolerated(t *testing.T) {
 	// Cancel carries no defined fields; inner unknown bytes are tolerated
-	// per SNTR-SER-003, matching the Rust core.
+	// per SNTR-SER-003.
 	for name, hex := range map[string]string{
 		"empty":          "0801100c7200",
 		"unknown-varint": "0801100c72020801",
@@ -98,7 +105,7 @@ func TestNonemptyCancelTolerated(t *testing.T) {
 func TestNestedUnassignedNumbersTolerated(t *testing.T) {
 	// Numbers 16/17 are reserved only at the top-level Frame. Inside
 	// nested messages they are unassigned unknown fields tolerated per
-	// SNTR-SER-003, matching the Rust core. Top-level 16/17 stay rejected.
+	// SNTR-SER-003. Top-level 16/17 stay rejected.
 	for name, hex := range map[string]string{
 		"nested-16": "080110076a0a0a0568656c6c6f800100",
 		"nested-17": "080110076a0a0a0568656c6c6f880100",

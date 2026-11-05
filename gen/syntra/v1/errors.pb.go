@@ -21,10 +21,10 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
-// ErrorCode is the existing registry, not transport-specific status codes
-// (SNTR-ERR-001/002). Consumers report unknown numeric values as UNKNOWN, never
-// success, retaining the original number diagnostically where possible
-// (SNTR-ERR-005). Generated enum getters alone do not implement that policy.
+// ErrorCode defines typed failures independently of transport-specific status.
+// Consumers report unknown numeric values as UNKNOWN, never success, retaining
+// the original number diagnostically where possible. Generated enum getters
+// alone do not implement that policy.
 type ErrorCode int32
 
 const (
@@ -133,14 +133,13 @@ func (ErrorCode) EnumDescriptor() ([]byte, []int) {
 	return file_syntra_v1_errors_proto_rawDescGZIP(), []int{0}
 }
 
-// RpcError is a public typed failure (SNTR-ERR-001/003/005). Additional error
-// categories have no numeric allocation pending registry approval (RFC 0001).
+// RpcError is a public typed failure.
 type RpcError struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// code is nonzero on emission; unknown received numbers map per SNTR-ERR-005.
+	// code is nonzero on emission; unknown received numbers are reported as UNKNOWN.
 	Code ErrorCode `protobuf:"varint,1,opt,name=code,proto3,enum=syntra.v1.ErrorCode" json:"code,omitempty"`
 	// message is public text, never credentials or private diagnostics. Clients
-	// branch on code, not message text (SNTR-ERR-003/010, SNTR-ASEC-024).
+	// branch on code, not message text.
 	Message       string `protobuf:"bytes,2,opt,name=message,proto3" json:"message,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -216,7 +215,7 @@ const file_syntra_v1_errors_proto_rawDesc = "" +
 	"\x13ERROR_CODE_INTERNAL\x10\r\x12\x1a\n" +
 	"\x16ERROR_CODE_UNAVAILABLE\x10\x0e\x12\x18\n" +
 	"\x14ERROR_CODE_DATA_LOSS\x10\x0f\x12\x1e\n" +
-	"\x1aERROR_CODE_UNAUTHENTICATED\x10\x10B?Z=github.com/tinklehq/syntra/bindings/go/gen/syntra/v1;syntrav1b\x06proto3"
+	"\x1aERROR_CODE_UNAUTHENTICATED\x10\x10B8Z6github.com/tinkle-org/syntra-go/gen/syntra/v1;syntrav1b\x06proto3"
 
 var (
 	file_syntra_v1_errors_proto_rawDescOnce sync.Once

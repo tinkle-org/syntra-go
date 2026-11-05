@@ -653,7 +653,8 @@ func TestSessionHostCloseBoundsNonCooperativeDrain(t *testing.T) {
 func TestSessionCancelledWorkersStayBounded(t *testing.T) {
 	started, cancelled, release, exited := make(chan struct{}), make(chan struct{}), make(chan struct{}), make(chan struct{})
 	cfg := testHostConfig()
-	cfg.MaxConcurrent = 1
+	cfg.MaxConcurrent = 16
+	cfg.ExecutionBudget, _ = NewExecutionBudget(1)
 	cfg.Handler = func(ctx context.Context, req *RpcRequest) (*RpcResult, error) {
 		if req.GetMethod() != "/example.Slow/Wait" {
 			return echoHandler(ctx, req)
@@ -699,10 +700,11 @@ func TestSessionCancelledWorkersStayBounded(t *testing.T) {
 	}
 }
 
-func TestSessionLateCompletionCannotAnswerReusedID(t *testing.T) {
+func TestSessionLateCompletionCannotAnswerNewCall(t *testing.T) {
 	oldStarted, newStarted, oldRelease, newRelease, oldExited := make(chan struct{}), make(chan struct{}), make(chan struct{}), make(chan struct{}), make(chan struct{})
 	cfg := testHostConfig()
-	cfg.MaxConcurrent = 2
+	cfg.MaxConcurrent = 16
+	cfg.ExecutionBudget, _ = NewExecutionBudget(2)
 	cfg.Handler = func(ctx context.Context, req *RpcRequest) (*RpcResult, error) {
 		switch req.GetMethod() {
 		case "/example.Slow/Old":
@@ -733,14 +735,14 @@ func TestSessionLateCompletionCannotAnswerReusedID(t *testing.T) {
 	awaitSignal(t, oldStarted, "old worker start")
 	p.send(t, NewCancelFrame(1, 7))
 	assertTerminalCode(t, p.recv(t), 7, ErrorCodeCancelled)
-	p.request(t, 7, "/example.Slow/New")
-	awaitSignal(t, newStarted, "reused ID worker start")
+	p.request(t, 8, "/example.Slow/New")
+	awaitSignal(t, newStarted, "new worker start")
 	onceOld.Do(func() { close(oldRelease) })
 	awaitSignal(t, oldExited, "old worker exit")
 	onceNew.Do(func() { close(newRelease) })
 	f := p.recv(t)
-	if f.GetRequestId() != 7 || string(f.GetResult().GetPayload()) != "new" {
-		t.Fatalf("old completion stole reused ID: %v", f)
+	if f.GetRequestId() != 8 || string(f.GetResult().GetPayload()) != "new" {
+		t.Fatalf("old completion stole new call: %v", f)
 	}
 }
 
@@ -812,7 +814,7 @@ func TestHostAuthorizeNilDenyVsExplicitAllow(t *testing.T) {
 	p := newRawSessionPeer(t, cfg, nil)
 	p.request(t, 1, "/example.Echo/Echo")
 	assertTerminalCode(t, p.recv(t), 1, ErrorCodePermissionDenied)
-	// DenyAllAuthorize matches the Rust default explicitly.
+	// DenyAllAuthorize is the explicit fail-closed default.
 	cfg.Authorize = DenyAllAuthorize
 	q := newRawSessionPeer(t, cfg, nil)
 	q.request(t, 1, "/example.Echo/Echo")

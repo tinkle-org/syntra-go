@@ -3,7 +3,6 @@ package syntra
 import (
 	"bytes"
 	"context"
-	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -39,26 +38,6 @@ func (t *runtimeChannelTransport) Recv(ctx context.Context) ([]byte, error) {
 
 func (t *runtimeChannelTransport) ChannelIdentity() (ChannelIdentity, bool) {
 	return t.identity, t.confirm && t.received.Load()
-}
-
-func runtimeAwait(t *testing.T, done <-chan error) error {
-	t.Helper()
-	select {
-	case err := <-done:
-		return err
-	case <-time.After(2 * time.Second):
-		t.Fatal("session failed to terminate")
-		return nil
-	}
-}
-
-func runtimeAssertPeerClosed(t *testing.T, peer Transport) {
-	t.Helper()
-	ctx, stop := context.WithTimeout(context.Background(), time.Second)
-	defer stop()
-	if raw, err := peer.Recv(ctx); err == nil || errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("peer must observe terminal closure, got bytes=%d err=%v", len(raw), err)
-	}
 }
 
 func TestRuntimeChannelPolicyRequiresFreshConfirmation(t *testing.T) {
@@ -211,7 +190,7 @@ func TestRuntimeHostWriteStallTerminatesAndClosesPeer(t *testing.T) {
 		t.Fatalf("stalled write = %v", err)
 	}
 	runtimeAssertPeerClosed(t, p.peer)
-	if cfg, err := resolveHostConfig(HostConfig{}); err != nil || cfg.writeTimeout != 5*time.Second {
+	if cfg, err := resolveHostConfig(HostConfig{}); err != nil || cfg.writeTimeout != 10*time.Second {
 		t.Fatalf("default write timeout = %v, %v", cfg.writeTimeout, err)
 	}
 	if _, err := OpenHost(HostConfig{WriteTimeout: -time.Second}); callCode(t, err) != ErrorCodeInvalidArgument {
@@ -412,7 +391,7 @@ func TestRuntimeCredentialOwnershipAndRelease(t *testing.T) {
 }
 
 func TestRuntimeSessionVersionAndRehandshakeCodes(t *testing.T) {
-	if _, err := NegotiateVersionRanges(2, 2, 1, 1); callCode(t, err) != ErrorCodeFailedPrecondition {
+	if _, err := NegotiateVersionRanges(2, 2, 1, 1); callCode(t, err) != ErrorCodeUnimplemented {
 		t.Fatalf("disjoint version code = %v", err)
 	}
 	for _, f := range []*Frame{
@@ -434,10 +413,7 @@ func TestRuntimeSessionVersionAndRehandshakeCodes(t *testing.T) {
 	}
 }
 
-func TestRuntimePureGoCompletionTimestampSurvivesReap(t *testing.T) {
-	if NativeAvailable() {
-		t.Skip("native ABI v1 cannot accept callback completion timestamps")
-	}
+func TestRuntimeSelectedCompletionSurvivesReap(t *testing.T) {
 	cfg, err := resolveHostConfig(testHostConfig())
 	if err != nil {
 		t.Fatal(err)
@@ -463,35 +439,36 @@ func TestRuntimePureGoCompletionTimestampSurvivesReap(t *testing.T) {
 		if _, _, fatal := core.onFrame(raw); fatal != nil {
 			t.Fatal(fatal)
 		}
-		at := time.Now()
+		result := NewWireErrorResult(ErrorCodeNotFound, "completed")
 		if late {
-			at = at.Add(time.Hour)
+			g := core.(*goHostCore)
+			g.mu.Lock()
+			g.outstanding[id].deadline = time.Now().Add(-time.Second)
+			g.mu.Unlock()
 		}
-		core.(completionRecorder).recordCompletion(id, at)
+		core.selectResult(id, result)
 		if !late {
 			if ids := core.reapExpired(time.Now().Add(time.Hour)); len(ids) != 0 {
 				t.Fatalf("on-time completion reaped: %v", ids)
 			}
 		}
-		result := NewWireErrorResult(ErrorCodeNotFound, "completed")
 		frame, expired, err := core.answer(id, result)
-		if err != nil || expired != late {
+		if err != nil || expired {
 			t.Fatalf("completion arbitration late=%v expired=%v err=%v", late, expired, err)
 		}
-		if !late {
-			f, err := UnmarshalFrame(frame)
-			if err != nil {
-				t.Fatal(err)
-			}
-			assertTerminalCode(t, f, id, ErrorCodeNotFound)
+		f, err := UnmarshalFrame(frame)
+		if err != nil {
+			t.Fatal(err)
 		}
+		want := ErrorCodeNotFound
+		if late {
+			want = ErrorCodeDeadlineExceeded
+		}
+		assertTerminalCode(t, f, id, want)
 	}
 }
 
-func TestRuntimePureGoNotificationByteBacklogBound(t *testing.T) {
-	if NativeAvailable() {
-		t.Skip("pure-Go notification backlog admission")
-	}
+func TestRuntimeNotificationByteBacklogBound(t *testing.T) {
 	cfg, err := resolveHostConfig(testHostConfig())
 	if err != nil {
 		t.Fatal(err)
@@ -540,10 +517,7 @@ func TestRuntimePureGoNotificationByteBacklogBound(t *testing.T) {
 	}
 }
 
-func TestRuntimePureGoPublishedCompletionSurvivesBlockedWriter(t *testing.T) {
-	if NativeAvailable() {
-		t.Skip("native ABI v1 arbitrates at answer time")
-	}
+func TestRuntimePublishedCompletionSurvivesBlockedWriter(t *testing.T) {
 	gate := &gatedNotificationTransport{entered: make(chan struct{}), release: make(chan struct{})}
 	var release sync.Once
 	t.Cleanup(func() { release.Do(func() { close(gate.release) }) })

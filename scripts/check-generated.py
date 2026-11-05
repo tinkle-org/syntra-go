@@ -13,10 +13,14 @@ BUF_VERSION = "1.59.0"
 
 
 def generated_files(directory):
-    return {path.relative_to(directory): path for path in directory.rglob("*.pb.go")}
+    return {
+        path.relative_to(directory): path
+        for path in directory.rglob("*")
+        if path.is_file()
+    }
 
 
-def main():
+def main(root=ROOT):
     try:
         version = subprocess.run(
             ["buf", "--version"], check=True, capture_output=True, text=True
@@ -31,12 +35,12 @@ def main():
                     "buf", "generate", "--template", "buf.gen.yaml",
                     "--output", temporary,
                 ],
-                cwd=ROOT,
+                cwd=root,
                 check=True,
             )
-            committed = generated_files(ROOT / "gen")
+            committed = generated_files(root / "gen")
             generated = generated_files(Path(temporary) / "gen")
-            if not generated:
+            if not any(path.name.endswith(".pb.go") for path in generated):
                 print("Generation produced no .pb.go files", file=sys.stderr)
                 return 1
 
@@ -48,11 +52,16 @@ def main():
                 elif path not in generated:
                     print(f"Unexpected committed generated file: gen/{path}", file=sys.stderr)
                     drift = True
-                elif committed[path].read_bytes() != generated[path].read_bytes():
+                else:
+                    committed_bytes = committed[path].read_bytes()
+                    generated_bytes = generated[path].read_bytes()
+                    if committed_bytes == generated_bytes:
+                        continue
                     drift = True
+                    print(f"Generated file differs: gen/{path}", file=sys.stderr)
                     sys.stderr.writelines(difflib.unified_diff(
-                        committed[path].read_text().splitlines(keepends=True),
-                        generated[path].read_text().splitlines(keepends=True),
+                        committed_bytes.decode("utf-8", errors="replace").splitlines(keepends=True),
+                        generated_bytes.decode("utf-8", errors="replace").splitlines(keepends=True),
                         fromfile=f"committed/gen/{path}",
                         tofile=f"generated/gen/{path}",
                     ))

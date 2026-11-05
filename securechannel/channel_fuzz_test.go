@@ -7,7 +7,7 @@ import (
 
 func FuzzParseContext(f *testing.F) {
 	f.Add([]byte{})
-	f.Add([]byte("syntra.sc1.draft1"))
+	f.Add([]byte("syntra.1.0"))
 	for _, mode := range []Mode{Bootstrap, Returning} {
 		fixture := newChannelFixture(f, mode)
 		encoded := canonicalTestContext(fixture.client.Context)

@@ -32,7 +32,7 @@ func TestMemoryStoreAtomicFailure(t *testing.T) {
 }
 
 // TestMemoryStoreDeepCopy covers aliasing: StoreAtomic and Load deep-copy
-// committed bytes so caller mutation can never alias durable state.
+// committed bytes so caller mutation can never alias retained state.
 func TestMemoryStoreDeepCopy(t *testing.T) {
 	s := NewMemoryStore()
 	committed := []byte("c-100")
@@ -79,7 +79,7 @@ func TestReconcilerTickDoesNotCopyOwnedCursors(t *testing.T) {
 			}
 		})
 	}
-	empty, large := allocations(nil), allocations(make([]byte, 64*1024))
+	empty, large := allocations(nil), allocations(make([]byte, 4096))
 	if large > empty {
 		t.Fatalf("Tick copied owned cursor buffers: empty=%.0f allocations, large=%.0f", empty, large)
 	}
@@ -415,7 +415,9 @@ func TestReconcilerTickCursorRemovalNoStarvation(t *testing.T) {
 // public queue: cumulative counts/bytes advance exactly once per drop and
 // loss-change wakeups observe the same totals without double-counting.
 func TestLossTotalsCumulativeNoDoubleCount(t *testing.T) {
-	p := newPair(t, testClientConfig(), testHostConfig())
+	cfg := testClientConfig()
+	cfg.NotifyBuffer = 1
+	p := newPair(t, cfg, testHostConfig())
 	defer p.Cleanup()
 	d0, b0 := p.client.LossTotals()
 	for i := 0; i < 64; i++ {
@@ -470,8 +472,7 @@ func TestLossTotalsCumulativeNoDoubleCount(t *testing.T) {
 	}
 }
 
-// pureGoCoreDropped returns core-layer drops for the consistency check
-// above (zero under the native adapter when the FFI core holds them).
+// pureGoCoreDropped returns core-layer drops for the consistency check above.
 func pureGoCoreDropped(c *Client) uint64 {
 	if c == nil || c.core == nil {
 		return 0
@@ -484,7 +485,9 @@ func pureGoCoreDropped(c *Client) uint64 {
 // single drop wakes every concurrent WaitLossChange waiter, not just one
 // token consumer.
 func TestWaitLossChangeBroadcastsToAllWaiters(t *testing.T) {
-	p := newPair(t, testClientConfig(), testHostConfig())
+	cfg := testClientConfig()
+	cfg.NotifyBuffer = 1
+	p := newPair(t, cfg, testHostConfig())
 	defer p.Cleanup()
 	d0, b0 := p.client.LossTotals()
 	const waiters = 4
@@ -522,10 +525,11 @@ func TestWaitLossChangeBroadcastsToAllWaiters(t *testing.T) {
 }
 
 // TestLossTotalsMonotonicAfterClose covers Close caching: totals sampled
-// before Close must not regress after Close even though the underlying core
-// (FFI) reports zero once its handle is destroyed.
+// before Close must not regress after the underlying core is destroyed.
 func TestLossTotalsMonotonicAfterClose(t *testing.T) {
-	p := newPair(t, testClientConfig(), testHostConfig())
+	cfg := testClientConfig()
+	cfg.NotifyBuffer = 1
+	p := newPair(t, cfg, testHostConfig())
 	for i := 0; i < 64; i++ {
 		_ = p.host.NotifyAll([]byte("x"))
 	}

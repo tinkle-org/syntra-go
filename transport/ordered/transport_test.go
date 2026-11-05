@@ -194,7 +194,11 @@ func TestBufferedPrefixKeepsOriginalDeadline(t *testing.T) {
 }
 
 func TestAdmissionAndCloseJoin(t *testing.T) {
-	tr, _, _ := receiver(t, Options{MaxPending: 1})
+	tr, client, m := receiver(t, Options{MaxPending: 1})
+	putRecord(t, m, client, envelope([]byte("hello")))
+	if _, err := tr.Recv(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	done := make(chan error, 1)
 	go func() { done <- tr.Send(context.Background(), make([]byte, MaxFrame)) }()
 	deadline := time.After(time.Second)
@@ -230,6 +234,10 @@ func TestAdmissionAndCloseJoin(t *testing.T) {
 
 func TestCanceledQueuedWriterDoesNotConsumeNonce(t *testing.T) {
 	tr, client, m := receiver(t, Options{})
+	putRecord(t, m, client, envelope([]byte("hello")))
+	if _, err := tr.Recv(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	firstDone := make(chan error, 1)
 	go func() { firstDone <- tr.Send(context.Background(), []byte("first")) }()
 	limit := time.After(time.Second)

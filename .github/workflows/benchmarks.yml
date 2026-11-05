@@ -28,7 +28,7 @@ jobs:
         with:
           go-version: '1.26.10'
           cache: true
-      - name: Root-module wire, session and SC1 samples (report only)
+      - name: Wire, session and encrypted-record samples (report only)
         shell: bash
         run: |
           set -o pipefail

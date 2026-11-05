@@ -21,18 +21,17 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
-// ClientHello presents opaque credentials; no human-account model is assumed
-// (SNTR-AUTH-001/002, SNTR-ASEC-003/004). Public deployments require a verified
-// secure transport before presentation (SNTR-TSEC-001/004/009).
+// ClientHello presents opaque credentials; no human-account model is assumed.
+// Public deployments require a verified secure transport before presentation.
 type ClientHello struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// min_version is the nonzero minimum supported version (SNTR-HS-020).
+	// min_version is the nonzero minimum supported version.
 	MinVersion uint32 `protobuf:"varint,1,opt,name=min_version,json=minVersion,proto3" json:"min_version,omitempty"`
-	// max_version is the nonzero maximum, at least min_version (SNTR-HS-020).
+	// max_version is the nonzero maximum, at least min_version.
 	MaxVersion uint32 `protobuf:"varint,2,opt,name=max_version,json=maxVersion,proto3" json:"max_version,omitempty"`
 	// credential is sensitive opaque bytes, not URL metadata. Generated debug,
-	// string, JSON, or reflection output can expose it: do not log such output
-	// (SNTR-ASEC-001/003). Empty is an attempt subject to host policy.
+	// string, JSON, or reflection output can expose it: do not log such output.
+	// Empty is an attempt subject to host policy.
 	Credential    []byte `protobuf:"bytes,3,opt,name=credential,proto3" json:"credential,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -90,13 +89,13 @@ func (x *ClientHello) GetCredential() []byte {
 }
 
 // ServerReady confirms acceptance and establishes the connection's principal
-// binding (SNTR-HS-004, SNTR-AUTH-007). The selected version is Frame.version.
-// There is no separate ServerHello or resumable-session handle. Capability/limit
-// negotiation and typed handshake rejection need an approved binding (RFC 0001).
+// binding. The selected version is Frame.version. There is no separate
+// ServerHello or resumable-session handle. Capability and limit negotiation
+// use explicitly bound profile payloads rather than fields in this message.
 type ServerReady struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// connection_id is an opaque UTF-8 diagnostic identifier, never an
-	// authenticator or resume token (SNTR-SESS-002, SNTR-ASEC-010).
+	// authenticator or resume token.
 	ConnectionId  string `protobuf:"bytes,1,opt,name=connection_id,json=connectionId,proto3" json:"connection_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -153,7 +152,7 @@ const file_syntra_v1_handshake_proto_rawDesc = "" +
 	"credential\x18\x03 \x01(\fR\n" +
 	"credential\"2\n" +
 	"\vServerReady\x12#\n" +
-	"\rconnection_id\x18\x01 \x01(\tR\fconnectionIdB?Z=github.com/tinklehq/syntra/bindings/go/gen/syntra/v1;syntrav1b\x06proto3"
+	"\rconnection_id\x18\x01 \x01(\tR\fconnectionIdB8Z6github.com/tinkle-org/syntra-go/gen/syntra/v1;syntrav1b\x06proto3"
 
 var (
 	file_syntra_v1_handshake_proto_rawDescOnce sync.Once

@@ -1,16 +1,13 @@
 name: Release Please
 
 # Release automation for the Go module via release-please (conventional
-# commits). Runs only on pushes to main, never on pull_request, so untrusted
-# PRs cannot trigger releases or use the elevated permissions below.
+# commits). Called by Go only after main push CI succeeds, never for PRs.
 # On merge of a release PR, release-please pushes the root vX.Y.Z tag and
 # opens the GitHub Release; the Go proxy and pkg.go.dev index from the tag.
 # No binaries are published; Go modules ship as source through the proxy.
-# Elevated contents:write + pull-requests:write + issues:write live only
-# in this workflow.
+# Only the publication job uses write permissions; verification is read-only.
 on:
-  push:
-    branches: [main]
+  workflow_call:
 
 permissions:
   contents: read
@@ -21,18 +18,129 @@ concurrency:
 
 jobs:
   release-please:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: write
       pull-requests: write
       issues: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+      sha: ${{ steps.release.outputs.sha }}
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Validate release configuration and manifest
+        run: python3 scripts/check-release.py
+      # The action reads main via the API, not the local checkout. Do not let
+      # an old successful run operate on a newer, not-yet-tested main commit.
+      - name: Check main is still the tested commit
+        id: current
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          main_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
+          if [ "$main_sha" = "$GITHUB_SHA" ]; then
+            printf '%s\n' 'current=true' >> "$GITHUB_OUTPUT"
+          else
+            printf '%s\n' 'Main has advanced; leaving release automation to its CI run.'
+            printf '%s\n' 'current=false' >> "$GITHUB_OUTPUT"
+          fi
       # GITHUB_TOKEN is the built-in Actions token; no PAT setup required.
       # Note: pushes made with GITHUB_TOKEN do not trigger other GitHub
-      # Actions workflows, so release-PR checks run after merge instead.
+      # Actions workflows. Verify new releases here, not via release events.
       - uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4
+        id: release
+        if: steps.current.outputs.current == 'true'
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          target-branch: main
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+
+  verify-release:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      CGO_ENABLED: '0'
+      GOTOOLCHAIN: local
+      RELEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
+      RELEASE_SHA: ${{ needs.release-please.outputs.sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: refs/tags/${{ needs.release-please.outputs.tag_name }}
+          persist-credentials: false
+      - name: Verify tagged commit and release metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" > "$RUNNER_TEMP/release.json"
+          python3 scripts/check-release.py --tag "$RELEASE_TAG" --github-release "$RUNNER_TEMP/release.json"
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: '1.26.10'
+          cache: true
+      - name: Verify, build and test tagged source (CGO disabled)
+        run: |
+          go mod verify
+          go build -mod=readonly ./...
+          go test -mod=readonly -count=1 ./...
+      # Publication has already happened. Proxy propagation failures fail this
+      # job, not roll back a public tag. Retry this job without republishing.
+      - name: Verify public Go module download with bounded retries
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import tempfile
+          import time
+
+          module = "github.com/tinkle-org/syntra-go"
+          tag = os.environ["RELEASE_TAG"]
+          for attempt in range(1, 7):
+              # Neither the checkout nor a restored module cache may satisfy
+              # this consumer check. No direct-VCS fallback is allowed.
+              with tempfile.TemporaryDirectory(prefix="syntra-release-") as temporary:
+                  env = dict(os.environ, GO111MODULE="on", GOWORK="off",
+                             GOPROXY="https://proxy.golang.org", GOSUMDB="sum.golang.org",
+                             GOPRIVATE="", GONOPROXY="", GONOSUMDB="",
+                             GOMODCACHE=str(Path(temporary) / "modcache"))
+                  try:
+                      result = subprocess.run(
+                          ["go", "mod", "download", "-json", f"{module}@{tag}"],
+                          cwd=temporary, env=env, check=True, text=True,
+                          capture_output=True, timeout=60,
+                      )
+                  except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+                      print(f"Public module download attempt {attempt}/6 failed: {error}", flush=True)
+                      if attempt == 6:
+                          raise SystemExit("Public Go proxy verification failed; rerun verification after propagation")
+                  else:
+                      downloaded = json.loads(result.stdout)
+                      if downloaded.get("Path") != module or downloaded.get("Version") != tag:
+                          raise SystemExit("Downloaded module path/version does not match the release")
+                      if downloaded.get("Error") or not all(downloaded.get(key, "").startswith("h1:") for key in ("Sum", "GoModSum")):
+                          raise SystemExit("Downloaded module is missing verified checksums")
+                      origin_hash = downloaded.get("Origin", {}).get("Hash")
+                      if origin_hash and origin_hash != os.environ["RELEASE_SHA"]:
+                          raise SystemExit("Downloaded module origin does not match the tagged release commit")
+                      print(f"Verified public module {module}@{tag}")
+                      break
+              time.sleep(20)
+          PY

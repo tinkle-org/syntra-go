@@ -4,18 +4,16 @@ Syntra Go is distributed as source through the root Go module
 `github.com/tinkle-org/syntra-go`. Release Please owns version changes,
 `CHANGELOG.md`, immutable `vX.Y.Z` tags, and GitHub Releases. There is no binary
 upload or separate package-registry publish step. The current module path
-supports major versions zero and one; a future v2 needs a module-path migration
-and updated release validation.
+supports major versions zero and one; a future v2 needs a module-path migration.
 
 ## CI and publication
 
 The `Go` workflow runs on pull requests and pushes to `main`. Its `ci-success`
-job includes release metadata validation alongside build, tests, race checks,
-compatibility, generation, security, fuzz smoke, and workflow linting. Keep
-`ci-success` required in branch protection. Metadata checks compare the proposed
-manifest against the base commit, reject version regressions, and require a
-changed version to match the configured release channel and first changelog
-entry. A configuration-only channel switch leaves the previous manifest intact.
+job includes build, tests, race checks, compatibility, generation, security,
+fuzz smoke, and workflow linting. Keep `ci-success` required in branch protection.
+Release Please owns version selection and generated release bookkeeping;
+maintainers review the proposed manifest, changelog, and channel before merging.
+A configuration-only channel switch leaves the previous manifest intact.
 
 Only a successful `main` push run calls the reusable `Release Please` workflow.
 Only its publication job has write permissions. An older run skips release
@@ -144,14 +142,11 @@ patch version.
 For local metadata and workflow changes, run:
 
 ```sh
-python3 scripts/check-release.py
 python3 -m unittest discover -s scripts -p 'test_*.py' -v
 actionlint .github/workflows/*.yml
 git diff --check
 ```
 
-On a released checkout, also run
-`python3 scripts/check-release.py --tag v1.0.0-rc.1`, substituting its actual tag.
 These local checks do not prove hosted Actions permissions or public proxy
 availability. See the upstream [Release Please action documentation](https://github.com/googleapis/release-please-action)
 and [version override documentation](https://github.com/googleapis/release-please#how-do-i-change-the-version-number).

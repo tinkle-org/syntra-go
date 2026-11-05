@@ -130,6 +130,10 @@ func TestReadinessRetiresAttemptWithoutEndingSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer client.Close()
+	// Client readiness can precede the server's Ready write completion and
+	// budget release. A round trip proves both peers have retired setup before
+	// advancing either clock past its cutoff.
+	echo(t, client)
 	clientAge.Store(int64(2 * time.Second))
 	hostAge.Store(int64(2 * time.Second))
 	// Exercise the transport's synchronous time check after the original

@@ -50,6 +50,14 @@ def check(root, tag=None, base_ref=None, github_release=None):
         raise ValueError("this workflow requires published, non-draft GitHub releases")
     version = manifest["."]
     current = version_key(version)
+    initial = options.get("initial-version")
+    if initial is not None:
+        version_key(initial)
+    if version == "0.0.0" and prerelease and (not initial or "-rc." not in initial):
+        raise ValueError("first RC release requires an explicit numbered initial-version")
+    if version == "0.0.0" and initial:
+        if ("-rc." in initial) != prerelease or version_key(initial) <= current:
+            raise ValueError("initial-version must advance bootstrap and match the release channel")
     override = options.get("release-as")
     if override:
         version_key(override)

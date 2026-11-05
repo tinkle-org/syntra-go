@@ -51,14 +51,18 @@ the existing package settings and set these top-level properties in
 {
   "versioning": "prerelease",
   "prerelease-type": "rc.1",
-  "prerelease": true
+  "prerelease": true,
+  "initial-version": "1.0.0-rc.1"
 }
 ```
 
 `rc.1` is the initial suffix, not a value to edit for each candidate. The
 prerelease strategy increments the numeric suffix of an existing prerelease.
-With the initial `0.0.0` manifest and the pending breaking changes, the expected
-first candidate is `1.0.0-rc.1`. The manifest's bootstrap value is not a release.
+Without a prior release, Release Please uses `initial-version` instead of
+bumping through the prerelease strategy. Set it explicitly to `1.0.0-rc.1`;
+RC mode alone would still propose the default initial stable `1.0.0`.
+Once the first release exists, normal prerelease bumping applies. The manifest's
+`0.0.0` bootstrap value is not itself a release.
 
 Wait for the configuration merge's `Go` run and Release Please job to finish.
 Inspect the generated PR's actual manifest and changelog, not just its title.
@@ -96,7 +100,8 @@ deciding to promote it.
 
 Promotion is a separate reviewed configuration PR after an RC has been accepted.
 Set `prerelease` to `false` and `versioning` to `default`, and remove
-`prerelease-type`. Check for per-package overrides as well as top-level values.
+`prerelease-type` and the bootstrap-only `initial-version`. Check for per-package
+overrides as well as top-level values.
 Leave `.release-please-manifest.json` at the last released RC version.
 
 To request exactly `1.0.0` rather than relying on an inferred bump, preserve this

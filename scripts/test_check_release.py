@@ -38,7 +38,25 @@ class ReleaseCheckTests(unittest.TestCase):
         (self.root / "CHANGELOG.md").write_text(f"# Changelog\n\n## {version} (2026-11-05)\n")
 
     def rc(self):
-        self.config.update({"versioning": "prerelease", "prerelease-type": "rc.1", "prerelease": True})
+        self.config.update({"versioning": "prerelease", "prerelease-type": "rc.1", "prerelease": True, "initial-version": "1.0.0-rc.1"})
+
+    def test_first_rc_requires_explicit_initial_version(self):
+        self.rc()
+        del self.config["initial-version"]
+        self.assertEqual(self.run_check()[0], 1)
+        self.config["initial-version"] = "1.0.0"
+        self.assertEqual(self.run_check()[0], 1)
+        self.config["initial-version"] = "1.0.0-rc.1"
+        self.assertEqual(self.run_check()[0], 0)
+        self.config["initial-version"] = "invalid"
+        self.assertEqual(self.run_check()[0], 1)
+
+    def test_initial_version_advances_bootstrap_and_matches_channel(self):
+        self.config["initial-version"] = "1.0.0-rc.1"
+        self.assertEqual(self.run_check()[0], 1)
+        self.rc()
+        self.config["initial-version"] = "0.0.0-rc.1"
+        self.assertEqual(self.run_check()[0], 1)
 
     def run_check(self, *args):
         self.write_json("release-please-config.json", self.config)

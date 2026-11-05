@@ -1,0 +1,22 @@
+connection/budget_test.go
+  s_289edce28f4353::t_cec3aa1f69e9ef 133-136
+network/http_test.go
+  s_289edce28f4353::t_70bbea9d2b8332 61-62,67-70,87
+  s_289edce28f4353::t_cec3aa1f69e9ef 72-81,115,134
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "040adb044a0458c9aed603b379f9a2d22123653d",
+  "prompts": {},
+  "sessions": {
+    "s_289edce28f4353": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e562521eaffexIkGo41YciXVyp",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "oscarlaw <oscarlaw2010@gmail.com>"
+    }
+  }
+}

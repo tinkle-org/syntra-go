@@ -128,6 +128,29 @@ Managed clients continuously drain that queue and expose generation-bound
 `NextNotification(ctx)`, with dropped-count and dropped-byte totals. Those
 generation-local counters are not durable recovery checkpoints.
 
+## Optional terminal receipt
+
+An explicitly authorized self-withdrawing operation can call
+`CompleteTerminalReceipt(ctx, operation, expectedRevision)` inside its handler.
+It requires fixed non-sensitive bytes and a typed conditional-transition authority
+in `HostConfig.TerminalMethods`, plus `ordered.Options.EnableTerminalReceipts`.
+Both are disabled by default. Call it before mutation; the configured authority's
+`Commit` performs the conditional transition. The SDK fences ordinary traffic and
+reaches a full outbound-frame boundary first, then attempts only the exact owned
+result and closes. A nil return means complete local writing, not peer receipt or
+joined cleanup. Loss remains unknown; nothing is automatically retried or replayed.
+
+The verified stock composition is ordered/TCP, including connection ownership
+wrappers. Other stock carriers, uncoordinated custom paths, and hosts with Recovery
+reject before mutation. See [the implementation contract and fixture](TERMINAL_RECEIPT_DESIGN.md)
+for authority evidence, the 1024-byte complete-frame limit, deadline/teardown
+budgets, and last-observation race. Existing clients parse the same `RpcResult`;
+there is no new wire message or peer option. Ordinary withdrawal and
+`Host.DisconnectPrincipal` are unchanged. The
+[14-case bidirectional fixture report](TERMINAL_RECEIPT_INTEROP.md) is bounded SDK
+evidence, not production durability or application acceptance. See the
+[handoff](TERMINAL_RECEIPT_HANDOFF.md) for manual merge/release and consumer order.
+
 ## Optional update recovery
 
 Recovery uses typed RPC and notification payloads within the same encrypted

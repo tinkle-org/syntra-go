@@ -209,10 +209,16 @@ func (t *Transport) operationDeadline(timeout time.Duration) time.Duration {
 func (t *Transport) checkTime() error {
 	t.mu.Lock()
 	closed := t.closed
+	permit := t.terminalPermit
 	t.mu.Unlock()
 	if closed {
 		// Cipher retirement during owned cleanup is not a new security failure.
 		return ErrClosed
+	}
+	if permit != nil {
+		if err := permit.CheckTime(); err != nil {
+			return err
+		}
 	}
 	if t.opts.Budget != nil {
 		if err := t.opts.Budget.Check(); err != nil {

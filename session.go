@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -297,6 +298,8 @@ type hostCore interface {
 	onFrame(frame []byte) (responses [][]byte, cancelIDs []uint64, fatal *RpcError)
 	onFrameAt([]byte, time.Time) ([][]byte, []uint64, *RpcError)
 	callDeadline(uint64) (time.Time, bool)
+	terminalPending(uint64) bool
+	fenceTerminal()
 	selectResult(uint64, *RpcResult)
 	// takePending dequeues one validated request for dispatch.
 	takePending() (requestID uint64, req *RpcRequest, ok bool)
@@ -1440,6 +1443,7 @@ type resolvedHostConfig struct {
 	writerCapacity   int
 	executions       *ExecutionBudget
 	recovery         *RecoveryService
+	terminalMethods  map[string]TerminalMethodPolicy
 }
 
 // ExecutionBudget bounds callbacks still executing, independently of protocol
@@ -1501,6 +1505,9 @@ func resolveRuntimeLimits(maxTimeout, handshakeTimeout *time.Duration, writerCap
 // HostConfig configures a Host session factory. Each Serve call opens one
 // independent per-connection core from this config.
 type HostConfig struct {
+	// TerminalMethods enables only explicitly listed request-owned retirement
+	// operations. Nil is disabled. The transport must independently opt in.
+	TerminalMethods map[string]TerminalMethodPolicy
 	// MinVersion/MaxVersion bound the accepted handshake range. Zero
 	// selects the binding singleton (v1).
 	MinVersion uint32
@@ -1551,6 +1558,8 @@ type HostConfig struct {
 	ExecutionBudget *ExecutionBudget
 }
 
+// resolveHostConfig validates factory settings and owns fixed terminal policies
+// before any per-connection core or application callback can start.
 func resolveHostConfig(cfg HostConfig) (resolvedHostConfig, error) {
 	out := resolvedHostConfig{
 		minVersion:       cfg.MinVersion,
@@ -1570,6 +1579,22 @@ func resolveHostConfig(cfg HostConfig) (resolvedHostConfig, error) {
 	}
 	if out.authorize == nil {
 		out.authorize = DenyAllAuthorize
+	}
+	if len(cfg.TerminalMethods) != 0 {
+		out.terminalMethods = make(map[string]TerminalMethodPolicy, len(cfg.TerminalMethods))
+		for method, policy := range cfg.TerminalMethods {
+			if ValidateMethod(method) != nil || strings.HasPrefix(method, RecoveryMethodPrefix) || policy.Authority == nil || policy.ObservationTimeout <= 0 || policy.ObservationTimeout > time.Second || len(policy.SuccessPayload) > 1024 {
+				return resolvedHostConfig{}, terminalFailure()
+			}
+			policy.SuccessPayload = append([]byte(nil), policy.SuccessPayload...)
+			// Budget the complete correlated frame at maximum varint widths.
+			// Explicit core version ranges are not capped at the binding singleton.
+			frame, err := MarshalFrame(NewResultFrame(math.MaxUint32, math.MaxUint64, NewSuccessResult(policy.SuccessPayload)))
+			if err != nil || len(frame) > 1024 {
+				return resolvedHostConfig{}, terminalFailure()
+			}
+			out.terminalMethods[method] = policy
+		}
 	}
 	if out.writeTimeout == 0 {
 		out.writeTimeout = 10 * time.Second
@@ -1632,20 +1657,24 @@ type Host struct {
 // wake signals the serve pump that queued outbound frames (expiry
 // results, broadcasts) are ready even when no inbound frame arrived.
 type hostConn struct {
-	core         hostCore
-	cancels      map[uint64]*callCancel
-	wake         chan struct{}
-	stop         context.CancelFunc // registered before Close can observe this connection
-	completed    chan *callCancel   // bounded by maxPending, including abandoned workers
-	workers      int                // Serve-owned; released only when the callback actually returns
-	principal    string             // bound at handshake; used by Authorize before handler effects
-	version      uint32             // negotiated once during handshake
-	transport    Transport          // owned by Serve; Close interrupts I/O
-	writer       *hostWriter        // created after ready; only Serve admits frames
-	connectionID string
-	recovery     *RecoveryHostSession
-	recoveryDone <-chan struct{}
-	closing      bool // guarded by Host.mu; fences egress before cleanup
+	core                 hostCore
+	cancels              map[uint64]*callCancel
+	wake                 chan struct{}
+	stop                 context.CancelFunc // registered before Close can observe this connection
+	completed            chan *callCancel   // bounded by maxPending, including abandoned workers
+	workers              int                // Serve-owned; released only when the callback actually returns
+	principal            string             // bound at handshake; used by Authorize before handler effects
+	version              uint32             // negotiated once during handshake
+	transport            Transport          // owned by Serve; Close interrupts I/O
+	writer               *hostWriter        // created after ready; only Serve admits frames
+	connectionID         string
+	recovery             *RecoveryHostSession
+	recoveryDone         <-chan struct{}
+	closing              bool            // guarded by Host.mu; fences egress before cleanup
+	terminalFenced       atomic.Bool     // one-way admission/ordinary-egress fence
+	terminal             *TerminalPermit // guarded by Host.mu
+	authorizationRevoked bool            // sticky at observation, not deferred completion
+	terminalCloseStarted bool            // guarded by Host.mu; at most one retained close join
 }
 
 const (
@@ -1671,6 +1700,7 @@ type hostWriter struct {
 
 	mu        sync.Mutex
 	accepting bool
+	fenced    bool // suppress all unstarted ordinary output
 	count     int
 	bytes     int
 	failure   error
@@ -1706,6 +1736,9 @@ func (w *hostWriter) failLocked(err error) {
 func (w *hostWriter) enqueue(frame []byte) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.fenced {
+		return nil
+	}
 	if w.failure != nil {
 		return w.failure
 	}
@@ -1756,6 +1789,17 @@ func (w *hostWriter) run() {
 			if w.ctx.Err() != nil || w.err() != nil {
 				return
 			}
+			w.mu.Lock()
+			if w.fenced {
+				w.count--
+				w.bytes -= len(frame)
+				if w.count == 0 {
+					close(w.idle)
+				}
+				w.mu.Unlock()
+				continue
+			}
+			w.mu.Unlock()
 			ctx, stop := context.WithTimeout(w.ctx, w.timeout)
 			err := w.transport.Send(ctx, frame)
 			stop()
@@ -1830,6 +1874,25 @@ type callCancel struct {
 	// SNTR-AUTH-008/SNTR-ASEC-006. PermissionDenied denials keep the
 	// connection usable per SNTR-AUTH-009.
 	authRevoked atomic.Bool
+}
+
+// publishAuthorizationRevocation makes an observed host-policy withdrawal
+// connection-wide immediately. Receipt reservation, selection and handoff share
+// Host.mu with this publication; consuming a callback completion is not evidence
+// that the denial first became visible. Ordinary denial draining remains owned
+// by finishReadyHandler, preserving the default withdrawal path.
+func (h *Host) publishAuthorizationRevocation(hc *hostConn, cc *callCancel) {
+	h.mu.Lock()
+	hc.authorizationRevoked = true
+	cc.authRevoked.Store(true)
+	p := hc.terminal
+	if p != nil {
+		p.Fail(terminalFailure())
+	}
+	h.mu.Unlock()
+	if p != nil && p.stopIO != nil {
+		p.stopIO()
+	}
 }
 
 // OpenHost creates a responder session factory. It validates the config
@@ -2196,7 +2259,13 @@ func (h *Host) serveLoop(ctx context.Context, t Transport, hc *hostConn) (serveE
 			if err := validateActiveSessionFrame(r.raw, hc.version); err != nil {
 				return err
 			}
+			if len(h.cfg.terminalMethods) != 0 {
+				h.mu.Lock()
+			}
 			responses, cancelIDs, fatal := hc.core.onFrameAt(r.raw, r.receivedAt)
+			if len(h.cfg.terminalMethods) != 0 {
+				h.mu.Unlock()
+			}
 			if fatal != nil {
 				h.cancelHandlers(hc, nil, true)
 				return fatal
@@ -2251,6 +2320,9 @@ func validSuccess(res *RpcResult) bool {
 // callbacks still running after a terminal cancel/deadline. Only Serve
 // touches the core or admits result frames; workers publish one bounded completion.
 func (h *Host) dispatch(ctx context.Context, t Transport, hc *hostConn, id uint64, req *RpcRequest) error {
+	if hc.terminalFenced.Load() {
+		return nil
+	}
 	if hc.recovery != nil && hc.recovery.Revoked() {
 		return hc.recovery.Err()
 	}
@@ -2306,14 +2378,16 @@ drain:
 		defer h.cfg.executions.release()
 		var out *RpcResult
 		if hc.recovery != nil && hc.recovery.Revoked() {
-			cc.authRevoked.Store(true)
+			h.publishAuthorizationRevocation(hc, cc)
 			out = NewWireErrorResult(ErrorCodeUnauthenticated, "syntra: credential not accepted")
 		}
 		if out == nil && authorize != nil {
 			if aerr := authorize(hctx, principal, method); aerr != nil {
 				var rerr *RpcError
 				revoked := errors.As(aerr, &rerr) && rerr.Code == ErrorCodeUnauthenticated
-				cc.authRevoked.Store(revoked)
+				if revoked {
+					h.publishAuthorizationRevocation(hc, cc)
+				}
 				if hctx.Err() != nil {
 					out = NewWireErrorResult(mapContextErr(hctx.Err()).Code, "syntra: handler context ended")
 				} else {
@@ -2331,7 +2405,7 @@ drain:
 			}
 		}
 		if hc.recovery != nil && hc.recovery.Revoked() {
-			cc.authRevoked.Store(true)
+			h.publishAuthorizationRevocation(hc, cc)
 			out = NewWireErrorResult(ErrorCodeUnauthenticated, "syntra: credential not accepted")
 		}
 		// Authorizers may return nil after cancellation. Never start handler
@@ -2339,11 +2413,23 @@ drain:
 		if out == nil && hctx.Err() != nil {
 			out = NewWireErrorResult(mapContextErr(hctx.Err()).Code, "syntra: handler context ended")
 		}
+		if out == nil && len(h.cfg.terminalMethods) != 0 {
+			h.mu.Lock()
+			fenced := hc.terminalFenced.Load() || hc.closing || hc.authorizationRevoked
+			h.mu.Unlock()
+			if fenced {
+				out = NewWireErrorResult(ErrorCodeUnavailable, "syntra: connection retiring")
+			}
+		}
 		if out == nil {
 			if handler == nil {
 				out = NewWireErrorResult(ErrorCodeUnimplemented, "syntra: unknown method")
 			} else {
-				res, herr := handler(hctx, req)
+				handlerCtx := hctx
+				if _, enabled := h.cfg.terminalMethods[method]; enabled {
+					handlerCtx = context.WithValue(hctx, terminalRequestKey{}, &terminalRequest{host: h, conn: hc, call: cc, ctx: hctx, method: method})
+				}
+				res, herr := handler(handlerCtx, req)
 				switch {
 				case hctx.Err() != nil && !validHandlerResult(res):
 					out = NewWireErrorResult(mapContextErr(hctx.Err()).Code, "syntra: handler context ended")
@@ -2362,7 +2448,7 @@ drain:
 			}
 		}
 		if hc.recovery != nil && hc.recovery.Revoked() {
-			cc.authRevoked.Store(true)
+			h.publishAuthorizationRevocation(hc, cc)
 		}
 		h.mu.Lock()
 		if hc.cancels[id] == cc {
@@ -2429,6 +2515,9 @@ func (h *Host) finishRevocation(ctx context.Context, t Transport, hc *hostConn) 
 }
 
 func (h *Host) answer(ctx context.Context, t Transport, hc *hostConn, id uint64, out *RpcResult) error {
+	if hc.terminalFenced.Load() {
+		return nil
+	}
 	// Earlier notification admissions must precede the reply that changes their
 	// delivery phase. Admission and the writer both preserve FIFO ordering.
 	if err := h.flush(ctx, t, hc); err != nil {
@@ -2468,6 +2557,9 @@ func (h *Host) flush(ctx context.Context, t Transport, hc *hostConn) error {
 			return nil
 		}
 		if len(frame) == 0 {
+			continue
+		}
+		if hc.terminalFenced.Load() {
 			continue
 		}
 		if err := hc.writer.enqueue(frame); err != nil {
@@ -2581,6 +2673,9 @@ func (h *Host) NotifyDirected(principal string, payload []byte) error {
 	h.mu.Unlock()
 	var errs []error
 	for _, hc := range conns {
+		if hc.terminalFenced.Load() {
+			continue
+		}
 		if err := hc.core.notify(payload); err != nil {
 			errs = append(errs, err)
 			continue
@@ -2619,6 +2714,9 @@ func (h *Host) NotifyAll(payload []byte) error {
 	h.mu.Unlock()
 	var errs []error
 	for _, hc := range conns {
+		if hc.terminalFenced.Load() {
+			continue
+		}
 		if err := hc.core.notify(payload); err != nil {
 			errs = append(errs, err)
 			continue
@@ -2648,7 +2746,9 @@ func (h *Host) gracefulDrain(ctx context.Context, t Transport, hc *hostConn) {
 // connections are closed and their handlers observe ctx cancellation. A second
 // Close reports FailedPrecondition. Close signals shutdown without waiting;
 // callers join Serve for its bounded drain, then Wait for retained callbacks
-// and recovery egress to actually exit.
+// and recovery egress to actually exit. Terminal authority callbacks may call
+// Close: terminal carriers are interrupted without joining the active observer,
+// and their actual close join remains owned until Wait/Done completes.
 func (h *Host) Close() error {
 	if h == nil {
 		return NewRpcError(ErrorCodeInternal, "syntra: nil host")
@@ -2659,16 +2759,16 @@ func (h *Host) Close() error {
 		return NewRpcError(ErrorCodeFailedPrecondition, "syntra: host already closed")
 	}
 	h.closed = true
-	go func() { h.owned.Wait(); close(h.done) }()
-	var transports []Transport
+	var closes []func()
 	for hc := range h.conns {
 		hc.closing = true
 		hc.stop()
-		transports = append(transports, hc.transport)
+		closes = append(closes, h.prepareTransportCloseLocked(hc))
 	}
+	go func() { h.owned.Wait(); close(h.done) }()
 	h.mu.Unlock()
-	for _, t := range transports {
-		_ = t.Close()
+	for _, closeTransport := range closes {
+		closeTransport()
 	}
 	return nil
 }
@@ -2695,7 +2795,10 @@ func (h *Host) Wait(ctx context.Context) error {
 // DisconnectPrincipal cancels and closes every current connection bound to
 // principal, including idle connections that only receive pushes. It does not
 // prevent future authentication; the authentication policy must reject revoked
-// identities. An empty principal matches no connection.
+// identities. An empty principal matches no connection. On a terminal connection
+// this interrupts without joining a possibly reentrant authority callback; the
+// retained join is included in Host.Wait/Done after Host.Close. It is still an
+// immediate abort, never a receipt drain.
 func (h *Host) DisconnectPrincipal(principal string) error {
 	if h == nil {
 		return NewRpcError(ErrorCodeInternal, "syntra: nil host")
@@ -2705,19 +2808,44 @@ func (h *Host) DisconnectPrincipal(principal string) error {
 		h.mu.Unlock()
 		return NewRpcError(ErrorCodeFailedPrecondition, "syntra: host closed")
 	}
-	var transports []Transport
+	var closes []func()
 	if principal != "" {
 		for hc := range h.conns {
 			if hc.principal == principal {
 				hc.closing = true
 				hc.stop()
-				transports = append(transports, hc.transport)
+				closes = append(closes, h.prepareTransportCloseLocked(hc))
 			}
 		}
 	}
 	h.mu.Unlock()
-	for _, t := range transports {
-		_ = t.Close()
+	for _, closeTransport := range closes {
+		closeTransport()
 	}
 	return nil
+}
+
+// prepareTransportCloseLocked preserves ordinary synchronous transport close.
+// A terminal connection must instead interrupt first and retain one asynchronous
+// join: an authority callback can be inside t.ops or t.supervise itself. Joining
+// that owner on the callback's stack would make cancellation unable to progress.
+func (h *Host) prepareTransportCloseLocked(hc *hostConn) func() {
+	t, p := hc.transport, hc.terminal
+	if p == nil {
+		return func() { _ = t.Close() }
+	}
+	join := !hc.terminalCloseStarted
+	if join {
+		hc.terminalCloseStarted = true
+		h.owned.Add(1)
+	}
+	return func() {
+		p.Fail(terminalFailure())
+		if p.stopIO != nil {
+			p.stopIO()
+		}
+		if join {
+			go func() { defer h.owned.Done(); _ = t.Close() }()
+		}
+	}
 }

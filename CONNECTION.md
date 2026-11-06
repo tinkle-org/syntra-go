@@ -80,6 +80,24 @@ every method. A per-method denial can leave the connection usable; an
 `UNAUTHENTICATED` result signals an invalid binding and ends the session after
 a bounded denial drain. Handlers must respect their contexts.
 
+**Optional terminal receipt:** `HostConfig.TerminalMethods` and
+`ordered.Options.EnableTerminalReceipts` opt an authorized handler into
+`CompleteTerminalReceipt(ctx, operation, expectedRevision)`. It fences ordinary
+traffic, establishes a full-frame barrier before the configured authority's
+conditional commit, and permits only one fixed result with fresh exact-owned
+evidence, then closes. Call before mutation; a nil return reports complete local
+writing, not peer receipt or joined cleanup. Both defaults are off; ordinary
+withdrawal and `DisconnectPrincipal` remain immediate abort. The supported stock
+composition is ordered/TCP; raw/custom paths without coordination, other stock carriers, and
+hosts with Recovery reject before mutation. See
+[implementation and authority contract](TERMINAL_RECEIPT_DESIGN.md) for the
+1024-byte complete-frame bound, total deadline/teardown tail, typed adapter,
+explicit last-observation race, and evidence limits. Authority callback contexts
+are SDK-owned; bind application identity through the transition's scope and current
+authority rather than assuming downstream request-context values are preserved.
+The [bidirectional TCP fixture report](TERMINAL_RECEIPT_INTEROP.md) records its
+exact run separately from the [manual integration handoff](TERMINAL_RECEIPT_HANDOFF.md).
+
 ## Run a client
 
 The [README example](README.md#make-a-call) creates an establishment budget before

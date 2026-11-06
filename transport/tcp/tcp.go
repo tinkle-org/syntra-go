@@ -18,6 +18,10 @@ const Binding = "syntra.1.0"
 
 type records struct{ conn *stream.Conn }
 
+// SupportsTerminalReceipt opts this ordered, cancellation-aware stream into the
+// complete-frame barrier and exact-ciphertext terminal handoff contract.
+func (r *records) SupportsTerminalReceipt() bool { return true }
+
 // New takes ownership of conn. The same budget must be passed to the ordered
 // driver; nil is useful only when establishment is managed externally.
 func New(conn net.Conn, budget *ordered.EstablishmentBudget) ordered.MessageIO {

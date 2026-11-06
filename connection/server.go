@@ -93,6 +93,11 @@ type readyTransport struct {
 	stopPhase context.CancelFunc
 }
 
+// TerminalReceiptDriver forwards to the same ordered owner, never a new permit.
+func (t *readyTransport) TerminalReceiptDriver() syntra.TerminalReceiptDriver {
+	return t.Transport.TerminalReceiptDriver()
+}
+
 func (t *readyTransport) Recv(ctx context.Context) ([]byte, error) {
 	t.phaseOnce.Do(func() {
 		// Host's runtime handshake context carries its configured timeout.
@@ -231,6 +236,13 @@ type ownedCarrier struct {
 func (c *ownedCarrier) Close() error {
 	c.once.Do(func() { c.err = c.MessageIO.Close() })
 	return c.err
+}
+
+func (c *ownedCarrier) SupportsTerminalReceipt() bool {
+	if provider, ok := c.MessageIO.(interface{ SupportsTerminalReceipt() bool }); ok {
+		return provider.SupportsTerminalReceipt()
+	}
+	return false
 }
 
 func (s *Server) initiateClose() {

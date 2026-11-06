@@ -126,6 +126,136 @@ class OutputDirectoryTests(unittest.TestCase):
                     digest, name = entry.split("  ", 1)
                     self.assertEqual(digest, interop.sha256(archive / name))
 
+    def test_archive_failure_removes_only_owned_partial_archive(self):
+        """Copy and manifest write failures remove partial exports, preserving other data."""
+        for failure in ("copy", "manifest"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp).resolve()
+                output, archive = root / "output", root / "archive"
+                output.mkdir()
+                data = {"report.json": b"report\n", "case.json": b"case\n",
+                        "SHA256SUMS": b"source checksums\n"}
+                for name, value in data.items():
+                    (output / name).write_bytes(value)
+                manifest = {name: interop.sha256(output / name)
+                            for name in ("report.json", "case.json")}
+                unrelated = root / "unrelated"
+                unrelated.mkdir()
+                (unrelated / "report.json").write_bytes(b"keep unrelated report\n")
+                original_open = Path.open
+                original_copy = interop.shutil.copyfileobj
+                copies = 0
+
+                def copy(source, target):
+                    """Fail the second selected copy after leaving a partial file."""
+                    nonlocal copies
+                    copies += 1
+                    if failure == "copy" and copies == 2:
+                        target.write(source.read(1))
+                        raise OSError("injected copy failure")
+                    original_copy(source, target)
+
+                @contextlib.contextmanager
+                def open_file(path, *args, **kwargs):
+                    """Inject an actual archive-manifest write failure after partial output."""
+                    with original_open(path, *args, **kwargs) as target:
+                        if failure == "manifest" and path == archive / "ARCHIVE_SHA256SUMS":
+                            def write(value):
+                                """Leave partial manifest bytes before reporting the write error."""
+                                target.write(value[:1])
+                                raise OSError("injected manifest failure")
+                            yield mock.Mock(wraps=target, write=mock.Mock(side_effect=write))
+                        else:
+                            yield target
+
+                with mock.patch.object(interop.shutil, "copyfileobj", side_effect=copy), \
+                        mock.patch.object(Path, "open", open_file):
+                    with self.assertRaisesRegex(OSError, f"injected {failure} failure"):
+                        interop.archive_evidence(output, archive, manifest)
+                self.assertFalse(archive.exists())
+                self.assertEqual({"output", "unrelated"}, {p.name for p in root.iterdir()})
+                self.assertEqual(b"keep unrelated report\n", (unrelated / "report.json").read_bytes())
+                for name, value in data.items():
+                    self.assertEqual(value, (output / name).read_bytes())
+
+    def test_archive_failure_preserves_post_creation_replacement(self):
+        """A copy-time rename cannot authorize cleanup of an unrelated replacement."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            output, archive, moved = root / "output", root / "archive", root / "moved"
+            output.mkdir()
+            (output / "report.json").write_bytes(b"source report\n")
+            manifest = {"report.json": interop.sha256(output / "report.json")}
+            failure = OSError("injected copy failure after replacement")
+
+            def replace_then_fail(source, target):
+                """Replace the owned directory after opening its first target file."""
+                target.write(source.read(1))
+                archive.rename(moved)
+                archive.mkdir()
+                (archive / "report.json").write_bytes(b"unrelated replacement\n")
+                raise failure
+
+            with mock.patch.object(interop.shutil, "copyfileobj", side_effect=replace_then_fail), \
+                    mock.patch.object(interop.shutil, "rmtree", wraps=interop.shutil.rmtree) as cleanup:
+                with self.assertRaises(OSError) as raised:
+                    interop.archive_evidence(output, archive, manifest)
+            self.assertIs(failure, raised.exception)
+            cleanup.assert_not_called()
+            self.assertEqual(b"unrelated replacement\n", (archive / "report.json").read_bytes())
+            self.assertEqual(b"source report\n", (output / "report.json").read_bytes())
+            self.assertEqual(b"s", (moved / "report.json").read_bytes())
+
+    def test_archive_never_removes_preexisting_or_racing_destination(self):
+        """Exclusive creation failures preserve another owner's directory, file or link."""
+        for racing in (False, True):
+            for kind in ("directory", "file", "symlink", "dangling"):
+                with self.subTest(racing=racing, kind=kind), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp).resolve()
+                    output, archive, other = root / "output", root / "archive", root / "other"
+                    output.mkdir()
+                    (output / "report.json").write_text("source report\n")
+                    manifest = {"report.json": interop.sha256(output / "report.json")}
+
+                    def create_destination():
+                        """Create unrelated data at the requested destination before its mkdir."""
+                        if kind == "directory":
+                            archive.mkdir()
+                            (archive / "report.json").write_text("keep directory\n")
+                        elif kind == "file":
+                            archive.write_text("keep file\n")
+                        else:
+                            if kind == "symlink":
+                                other.mkdir()
+                                (other / "report.json").write_text("keep link target\n")
+                            archive.symlink_to(other, target_is_directory=True)
+
+                    validate = interop.validate_archive_destination
+
+                    def validate_then_race(path):
+                        """Model a competing creator after validation but before exclusive mkdir."""
+                        resolved = validate(path)
+                        create_destination()
+                        return resolved
+
+                    if not racing:
+                        create_destination()
+                    with mock.patch.object(interop, "validate_archive_destination",
+                                           side_effect=validate_then_race if racing else validate):
+                        with self.assertRaises((ValueError, FileExistsError)):
+                            interop.archive_evidence(output, archive, manifest)
+                    if kind == "directory":
+                        self.assertEqual("keep directory\n", (archive / "report.json").read_text())
+                    elif kind == "file":
+                        self.assertEqual("keep file\n", archive.read_text())
+                    else:
+                        self.assertTrue(archive.is_symlink())
+                        self.assertEqual(other, archive.readlink())
+                        if kind == "symlink":
+                            self.assertEqual("keep link target\n", (other / "report.json").read_text())
+                        else:
+                            self.assertFalse(other.exists())
+
 
 class ArchiveCLITests(unittest.TestCase):
     """Reject invalid archive paths before work and retain reports on export failure."""

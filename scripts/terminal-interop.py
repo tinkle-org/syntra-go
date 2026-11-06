@@ -440,22 +440,32 @@ def validate_archive_destination(archive):
 
 
 def archive_evidence(output, archive, manifest):
-    """Retain exact reviewable text artifacts and manifests, never compiled binaries."""
+    """Retain reviewable text artifacts; guard partial-archive rollback by identity."""
     archive = validate_archive_destination(archive)
     selected = {name: digest for name, digest in manifest.items()
                 if Path(name).suffix in (".json", ".log")}
     for name, digest in selected.items():
         if Path(name).is_absolute() or ".." in Path(name).parts or sha256(output / name) != digest:
             raise ValueError("archive artifact path or checksum mismatch")
+    # Claim ownership before arming cleanup: a competing creator's path is not ours.
     archive.mkdir(exist_ok=False)
-    for name in (*selected, "SHA256SUMS"):
-        destination = archive / name
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        with (output / name).open("rb") as source, destination.open("xb") as target:
-            shutil.copyfileobj(source, target)
-    with (archive / "ARCHIVE_SHA256SUMS").open("x") as target:
-        for name, digest in sorted(selected.items()):
-            target.write(f"{digest}  {name}\n")
+    owned = archive.lstat()
+    try:
+        for name in (*selected, "SHA256SUMS"):
+            destination = archive / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with (output / name).open("rb") as source, destination.open("xb") as target:
+                shutil.copyfileobj(source, target)
+        with (archive / "ARCHIVE_SHA256SUMS").open("x") as target:
+            for name, digest in sorted(selected.items()):
+                target.write(f"{digest}  {name}\n")
+    except Exception:
+        # Skip missing or replaced paths; do not search for a renamed archive.
+        # This guard and removal are not atomic against concurrent renames.
+        with contextlib.suppress(FileNotFoundError):
+            if os.path.samestat(owned, archive.lstat()):
+                shutil.rmtree(archive)
+        raise
 
 
 def write_report(output, report, mode="x"):

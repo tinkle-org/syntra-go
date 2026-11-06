@@ -9,10 +9,9 @@ import (
 
 // TestTerminalFenceCompetingReceiveDoesNotBlock covers a writer that removes
 // the last queued frame before acquiring mu, as hostWriter.run does. The fence
-// must not wait for another frame while holding the accounting mutex.
+// must not wait for another frame while holding the accounting mutex. Each round
+// owns its watchdog and joins both workers, including on the timeout path.
 func TestTerminalFenceCompetingReceiveDoesNotBlock(t *testing.T) {
-	watchdog := time.NewTimer(5 * time.Second)
-	defer watchdog.Stop()
 	for round := 0; round < 10000; round++ {
 		w := &hostWriter{frames: make(chan []byte, 1), count: 1, bytes: 1, accepting: true, idle: make(chan struct{})}
 		w.frames <- []byte{1}
@@ -37,19 +36,26 @@ func TestTerminalFenceCompetingReceiveDoesNotBlock(t *testing.T) {
 			}
 			done <- struct{}{}
 		}()
+		// Bound this round alone; completed rounds cannot consume its deadline.
+		watchdog := time.NewTimer(5 * time.Second)
 		close(start)
 		for joined := 0; joined < 2; joined++ {
 			select {
 			case <-done:
 			case <-watchdog.C:
-				// Rescue the old blocking fence so even its red-path workers join.
-				w.frames <- []byte{1}
+				watchdog.Stop()
+				// Rescue the old blocking fence without blocking if the queue is full.
+				select {
+				case w.frames <- []byte{1}:
+				default:
+				}
 				for ; joined < 2; joined++ {
 					<-done
 				}
 				t.Fatalf("fence blocked on an empty queue at round %d", round)
 			}
 		}
+		watchdog.Stop()
 		if w.count != 0 || w.bytes != 0 || w.accepting || !w.fenced {
 			t.Fatal("fence lost queue accounting or admission state")
 		}

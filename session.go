@@ -1733,6 +1733,7 @@ func (w *hostWriter) failLocked(err error) {
 	}
 }
 
+// enqueue admits an owned frame snapshot without blocking on carrier progress.
 func (w *hostWriter) enqueue(frame []byte) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -1767,6 +1768,7 @@ func (w *hostWriter) err() error {
 	return w.failure
 }
 
+// run serializes complete sends and retains each charge through send completion.
 func (w *hostWriter) run() {
 	defer close(w.done)
 	defer func() {
@@ -2514,6 +2516,7 @@ func (h *Host) finishRevocation(ctx context.Context, t Transport, hc *hostConn) 
 	return NewRpcError(ErrorCodeUnauthenticated, "syntra: credential revoked")
 }
 
+// answer preserves FIFO ordering for ordinary results without bypassing a fence.
 func (h *Host) answer(ctx context.Context, t Transport, hc *hostConn, id uint64, out *RpcResult) error {
 	if hc.terminalFenced.Load() {
 		return nil

@@ -13,6 +13,8 @@ import (
 	syntra "github.com/tinkle-org/syntra-go"
 )
 
+// TestTerminalReviewTCPStalledPostHandoffObserverRetiresSocket enforces observer
+// cutoff without releasing its execution charge or falsely reporting joined cleanup.
 func TestTerminalReviewTCPStalledPostHandoffObserverRetiresSocket(t *testing.T) {
 	writeEntered, observerEntered, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
 	var once sync.Once
@@ -60,6 +62,8 @@ func TestTerminalReviewTCPStalledPostHandoffObserverRetiresSocket(t *testing.T) 
 	}
 }
 
+// TestTerminalReviewTCPObserverCanStopHostWithoutSelfJoin verifies reentrant host
+// close/disconnect returns while the observer itself remains at a barrier.
 func TestTerminalReviewTCPObserverCanStopHostWithoutSelfJoin(t *testing.T) {
 	for _, control := range []string{"disconnect", "close"} {
 		t.Run(control, func(t *testing.T) {

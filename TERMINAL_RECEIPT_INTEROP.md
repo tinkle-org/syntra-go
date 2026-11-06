@@ -1,5 +1,33 @@
 # Cross-language TCP receipt fixture evidence
 
+## Review rerun
+
+The current review matrix is archived under
+[`docs/evidence/terminal-receipt-review-20261106-r4/`](docs/evidence/terminal-receipt-review-20261106-r4/):
+[`report.json`](docs/evidence/terminal-receipt-review-20261106-r4/report.json),
+[`SHA256SUMS`](docs/evidence/terminal-receipt-review-20261106-r4/SHA256SUMS), and
+[`ARCHIVE_SHA256SUMS`](docs/evidence/terminal-receipt-review-20261106-r4/ARCHIVE_SHA256SUMS).
+The report embeds both complete source manifests. Text logs and case results are
+retained; binaries are omitted. Verify retained bytes using the instructions in
+the [archive index](docs/evidence/README.md). These relative links become hosted
+only when the maintainer commits and publishes the files.
+
+This is a new execution against the review fixes, not a reconstruction of the
+unavailable historical run-2. It uses the current **18 harness tests**, including
+stdout-drain, cleanup-failure, refused local-write, process-group exit-race, and
+archive integrity regressions. A Go-server deny/unknown outcome additionally
+requires exactly one `local_write` event with `complete: false`; partial-loss
+cases may still report a complete local write. Rust's fresh-denial marker now
+requires an actual native authentication refusal for the exact withdrawn binding,
+outside the side-effect-free key lookup.
+
+The earlier [r3 review execution](docs/evidence/terminal-receipt-review-20261106-r3/report.json)
+is also retained. The r4 source snapshot includes the final non-sensitive-payload
+comment in the Rust policy example. Repeated executions are not additional
+distinct protocol cases.
+
+## Historical run-2
+
 Run on 2026-11-06 against the **uncommitted working trees** of both SDKs on
 `feat/scoped-terminal-receipt`. No chorus/libtinkle edits, runtime edits,
 dependency overrides, version changes, publication, commits, or pushes were
@@ -31,10 +59,19 @@ Each case starts a new server on loopback port zero and reads its announced
 address. Exactly one independent opposite-language SDK client establishes and
 calls `/example.Authority/Retire` with empty input. There is no mutation retry.
 A separate fresh Returning probe sends **no RPC**. Go uses `-mode client -probe`;
-Rust uses `probe ADDR`. The server must emit an actual key-lookup denial marker,
-then verify one stored transition, one commit, one handler invocation, one
-fresh denial, and two closed connections. A refused probe connection alone is
-insufficient evidence.
+Rust uses `probe ADDR`. The server must emit a `fresh_denied` marker for the
+withdrawn Returning binding, then verify one stored transition, one commit, one
+handler invocation, one fresh denial, and two closed connections. A refused probe
+connection alone is insufficient evidence.
+
+In the current sibling Rust source,
+`syntra-rs/crates/syntra-net/examples/terminal_receipt.rs`, `Store::lookup` is
+side-effect-free: it checks the requested handle/epoch and reads withdrawal
+state without counting or emitting evidence. `accept_probe` records denial
+outside that callback only after native accept returns channel Authentication
+failure for the exact parsed fixture context (Returning mode, TCP, server key ID,
+scope, handle, and epoch), with the transition present and one handler/commit.
+These later source checks do not retroactively strengthen run-2 evidence.
 
 For `gap`, the authority callback records the transition and waits on a
 channel/notification until an actual owned observation witnesses it while that
@@ -83,11 +120,12 @@ after the run; all proxy worker join assertions passed.
 
 `test_output_directory_policy` was added after run-2 when output-directory
 validation was made portable, raising that later suite to **nine test methods**.
-Three subsequent orchestration regressions bring the current suite to **twelve**;
+Three subsequent orchestration regressions brought that suite to **twelve**;
 they ensure the fresh no-RPC probe starts after the result is observed but before
-client/proxy cleanup can consume the server's accept window. The retained run-2
-`unit-tests.stderr.log` records `Ran 8 tests`, so its historical count and hashes
-are not changed retroactively.
+client/proxy cleanup can consume the server's accept window. The run-2
+`unit-tests.stderr.log` was recorded as `Ran 8 tests`; its historical count and
+hashes are not changed retroactively. Six review regressions bring the latest
+suite to **eighteen**, as recorded by the new archive.
 
 An earlier retained `run1` reported 8/14 PASS: six proxy cases failed the harness's
 incorrect expectation of four client records. Actual fixture traffic is three
@@ -97,15 +135,27 @@ build/run, not a relabeling of those failures or additional distinct coverage.
 
 ## Exact provenance and checksums
 
-Validated output directory:
+Original run-2 output directory (local, not a reviewer-accessible archive):
 
 `/var/folders/xv/g_j4t2793xdbd_wnr290xgyw0000gn/T/opencode/terminal-receipt-interop-20261106-run2`
 
-`report.json` contains the complete matrix, source file hashes (including
-uncommitted/untracked code), branch/revision/status, build commands/environment,
+The historical `report.json` records the complete matrix, source file hashes
+(including uncommitted/untracked code), branch/revision/status, build commands/environment,
 toolchain versions, binary hashes and per-log/per-case hashes. `SHA256SUMS`
-additionally checksums the report and both binaries. All entries were verified
-with `shasum -a 256 -c SHA256SUMS` from the output directory.
+additionally checksums the report and both binaries. The original run recorded
+verification of all entries with `shasum -a 256 -c SHA256SUMS` from that directory.
+
+At the 2026-11-06 documentation review, the directory and both original files were absent;
+the parent `opencode/` directory contained only `.DS_Store`. No original bytes
+were available to archive, inspect for sensitive content, or rehash. The values
+below remain historical recorded values, not independently reverified checksums.
+No reviewer-ready archive or hosted evidence link is claimed.
+
+The intended archive is `docs/evidence/terminal-receipt-interop-20261106-run2/`.
+It requires the original bytes, report/manifest hash verification, and inspection
+of the embedded source manifests; reconstruction or relabeling a new run is not
+a substitute. Any partial archive must identify omitted artifacts: without the
+compiled binaries, a full manifest check is unavailable.
 
 - Go: `go version go1.26.10 darwin/arm64`.
 - Rust: `rustc 1.88.0 (6b00bc388 2025-06-23)`, host

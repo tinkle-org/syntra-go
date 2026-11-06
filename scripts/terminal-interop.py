@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import shutil
 import socket
 import struct
 import subprocess
@@ -66,6 +67,9 @@ def validate_case(case, server, client, probe, proxy):
     if case["scenario"] in ("deny", "unknown"):
         state = "HardDenied" if case["scenario"] == "deny" else "Unknown"
         assert any(e.get("state") == state for e in matching(server, "authority_outcome")), "typed authority evidence"
+        if case.get("server") == "go":
+            writes = matching(server, "local_write")
+            assert len(writes) == 1 and writes[0].get("complete") is False, "refused local write"
     if case["scenario"] == "gap":
         gaps = matching(server, "gap_observed")
         returns = matching(server, "commit_return")
@@ -84,10 +88,12 @@ def validate_case(case, server, client, probe, proxy):
 class Process:
     """A child with bounded stdio, an absolute deadline and joined reader threads."""
     def __init__(self, command, directory, prefix, timeout, env=None):
+        """Start one owned child and bounded readers, tracking stdout EOF separately from exit."""
         self.command = [str(c) for c in command]
         self.events = []
         self.errors = []
         self.condition = threading.Condition()
+        self.stdout_done = False
         self.child = subprocess.Popen(self.command, cwd=directory, env=env,
                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                       start_new_session=True)
@@ -109,9 +115,20 @@ class Process:
             self.condition.notify_all()
 
     def _signal(self, sig):
-        """Signal only this child's private process group, including build workers."""
-        with contextlib.suppress(ProcessLookupError):
+        """Signal the owned group; boundedly reap Darwin's exiting-leader EPERM race."""
+        try:
             os.killpg(self.child.pid, sig)
+        except ProcessLookupError:
+            return
+        except PermissionError as denied:
+            # Darwin can return EPERM after SIGKILL but before waitpid can reap.
+            # Never suppress a live-child denial or skip surviving group members.
+            try:
+                self.child.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                raise denied
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(self.child.pid, sig)
 
     def _read(self, pipe, path, name):
         """Drain each pipe concurrently; enforce total and per-line bounds."""
@@ -134,6 +151,10 @@ class Process:
             self._signal(signal.SIGKILL)
         finally:
             pipe.close()
+            with self.condition:
+                if name == "stdout":
+                    self.stdout_done = True
+                self.condition.notify_all()
 
     def wait_event(self, name, timeout=12):
         """Wait on a condition, not port polling or a disposable TCP connection."""
@@ -141,7 +162,8 @@ class Process:
         with self.condition:
             while not matching(self.events, name):
                 remaining = deadline - time.monotonic()
-                if remaining <= 0 or self.expired or self.errors or self.child.poll() is not None:
+                if remaining <= 0 or self.expired or self.errors or (
+                        self.child.poll() is not None and self.stdout_done):
                     raise RuntimeError(f"missing {name} event")
                 self.condition.wait(min(remaining, 0.2))
             return matching(self.events, name)[0]
@@ -191,6 +213,7 @@ def recv_exact(sock, length, allow_eof=False):
 class Proxy:
     """Single-connection encrypted record relay, with retained and joined workers."""
     def __init__(self, upstream, mode):
+        """Own one loopback listener and its bounded opaque-record relay workers."""
         self.upstream = upstream
         self.mode = mode
         self.listener = socket.socket()
@@ -309,6 +332,7 @@ def run_case(case, binaries, roots, output):
     try:
         with contextlib.ExitStack() as cleanup:
             def start(language, mode, address, scenario, label):
+                """Retain each child in the cleanup stack before using any of its evidence."""
                 proc = Process(command(binaries[language], language, mode, address, scenario),
                                roots[language], folder / label, 28)
                 cleanup.callback(proc.close)
@@ -334,8 +358,8 @@ def run_case(case, binaries, roots, output):
                 proxy.close()
             server.wait()
             validate_case(case, server.events, client.events, probe.events, proxy.stats if proxy else None)
-            result["status"] = "PASS"
             result["client_result"] = matching(client.events, "result")[0]
+        result["status"] = "PASS"
     except Exception as error:
         result["failure"] = f"{type(error).__name__}: {error}"
     finally:
@@ -404,6 +428,51 @@ def prepare_output(output, roots):
     return resolved
 
 
+def validate_archive_destination(archive):
+    """Validate a fresh destination without resolving away an existing dangling link."""
+    requested = Path(os.path.abspath(archive))
+    if requested.exists() or requested.is_symlink():
+        raise ValueError("archive must not already exist")
+    resolved = requested.resolve()
+    if not resolved.parent.is_dir():
+        raise ValueError("archive parent must already exist")
+    return resolved
+
+
+def archive_evidence(output, archive, manifest):
+    """Retain exact reviewable text artifacts and manifests, never compiled binaries."""
+    archive = validate_archive_destination(archive)
+    selected = {name: digest for name, digest in manifest.items()
+                if Path(name).suffix in (".json", ".log")}
+    for name, digest in selected.items():
+        if Path(name).is_absolute() or ".." in Path(name).parts or sha256(output / name) != digest:
+            raise ValueError("archive artifact path or checksum mismatch")
+    archive.mkdir(exist_ok=False)
+    for name in (*selected, "SHA256SUMS"):
+        destination = archive / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with (output / name).open("rb") as source, destination.open("xb") as target:
+            shutil.copyfileobj(source, target)
+    with (archive / "ARCHIVE_SHA256SUMS").open("x") as target:
+        for name, digest in sorted(selected.items()):
+            target.write(f"{digest}  {name}\n")
+
+
+def write_report(output, report, mode="x"):
+    """Write the report and matching checksums; replace only this run's files on error."""
+    with (output / "report.json").open(mode) as file:
+        json.dump(report, file, indent=2)
+        file.write("\n")
+    manifest = dict(report["checksums"])
+    manifest["report.json"] = sha256(output / "report.json")
+    for value in report.get("binaries", {}).values():
+        manifest[str(Path(value["path"]).relative_to(output))] = value["sha256"]
+    with (output / "SHA256SUMS").open(mode) as file:
+        for name, digest in sorted(manifest.items()):
+            file.write(f"{digest}  {name}\n")
+    return manifest
+
+
 def main():
     """Build both working trees and preserve one fresh evidence directory per run."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -412,12 +481,15 @@ def main():
     parser.add_argument("--rust-root", type=Path, default=go_root.parent / "syntra-rs")
     parser.add_argument("--output", type=Path, required=True,
                         help="new directory with an existing parent, outside both source checkouts")
+    parser.add_argument("--archive", type=Path,
+                        help="new text-evidence archive; copied only after source-stability verification")
     args = parser.parse_args()
     if not __debug__:
         parser.error("run without -O; validation assertions must be enabled")
     roots = dict(go=args.go_root.resolve(), rust=args.rust_root.resolve())
     try:
         output = prepare_output(args.output, roots)
+        archive = validate_archive_destination(args.archive) if args.archive is not None else None
     except (OSError, ValueError) as error:
         parser.error(str(error))
     env = dict(os.environ, GOTOOLCHAIN="go1.26.10")
@@ -458,20 +530,19 @@ def main():
     report["complete"] = len(report["cases"]) == 14 and report["passed"] == 14 and report.get("source_stable", False)
     report["checksums"] = {str(p.relative_to(output)): sha256(p) for p in sorted(output.rglob("*"))
                            if p.is_file() and (p.suffix in (".log", ".json")) and "rust-target" not in p.parts}
-    with (output / "report.json").open("x") as file:
-        json.dump(report, file, indent=2)
-        file.write("\n")
-    manifest = dict(report["checksums"])
-    manifest["report.json"] = sha256(output / "report.json")
-    for value in report.get("binaries", {}).values():
-        manifest[str(Path(value["path"]).relative_to(output))] = value["sha256"]
-    with (output / "SHA256SUMS").open("x") as file:
-        for name, digest in sorted(manifest.items()):
-            file.write(f"{digest}  {name}\n")
+    manifest = write_report(output, report)
+    if archive is not None:
+        try:
+            archive_evidence(output, archive, manifest)
+        except Exception as error:
+            report["archive_error"] = f"{type(error).__name__}: {error}"
+            write_report(output, report, mode="w")
     print(f"Evidence: {output / 'report.json'}; {report['passed']}/14 PASS; complete={report['complete']}")
     if "failure" in report:
         print(report["failure"])
-    return 0 if report["complete"] else 1
+    if "archive_error" in report:
+        print(f"Archive error: {report['archive_error']}")
+    return 0 if report["complete"] and "archive_error" not in report else 1
 
 
 if __name__ == "__main__":

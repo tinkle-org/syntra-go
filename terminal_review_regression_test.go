@@ -11,13 +11,19 @@ import (
 	"time"
 )
 
+// terminalReviewMethod identifies the test-only terminal handler.
 const terminalReviewMethod = "/example.Authority/Retire"
 
+// terminalReviewClock permits race-safe jumps without waiting for wall deadlines.
 type terminalReviewClock struct{ elapsed atomic.Int64 }
 
+// Age samples the injected elapsed time.
 func (c *terminalReviewClock) Age() time.Duration { return time.Duration(c.elapsed.Load()) }
-func (c *terminalReviewClock) Check() error       { return nil }
 
+// Check leaves continuity valid so tests isolate elapsed cutoff.
+func (c *terminalReviewClock) Check() error { return nil }
+
+// terminalReviewAuthority records owned state or delegates to a barrier-controlled hook.
 type terminalReviewAuthority struct {
 	mu      sync.Mutex
 	owner   *TerminalTransition
@@ -26,6 +32,7 @@ type terminalReviewAuthority struct {
 	commit  func(context.Context, TerminalTransition) error
 }
 
+// Commit counts conditional mutation admission and optionally stalls its return.
 func (a *terminalReviewAuthority) Commit(ctx context.Context, transition TerminalTransition) error {
 	a.commits.Add(1)
 	if a.commit != nil {
@@ -37,6 +44,7 @@ func (a *terminalReviewAuthority) Commit(ctx context.Context, transition Termina
 	return ctx.Err()
 }
 
+// Observe returns owned evidence or the exact injected failure scenario.
 func (a *terminalReviewAuthority) Observe(ctx context.Context, transition TerminalTransition) (TerminalObservation, error) {
 	if a.observe != nil {
 		return a.observe(ctx, transition)
@@ -60,11 +68,18 @@ type terminalReviewDriver struct {
 	handoffs   atomic.Int32
 }
 
+// TerminalReceiptDriver preserves the test driver's exact owner.
 func (d *terminalReviewDriver) TerminalReceiptDriver() TerminalReceiptDriver { return d }
-func (d *terminalReviewDriver) TerminalClock() TerminalClock                 { return d.clock }
+
+// TerminalClock returns the barrier-controlled elapsed origin.
+func (d *terminalReviewDriver) TerminalClock() TerminalClock { return d.clock }
+
+// TerminalBinding supplies fixed confirmed evidence, independent of request IDs.
 func (d *terminalReviewDriver) TerminalBinding() (TerminalChannelBinding, bool) {
 	return TerminalChannelBinding{Identity: ChannelIdentity{Mode: "returning", Scope: "review", Epoch: 1, Handle: [8]byte{1}}, ServerKeyID: 1, HandshakeHash: [32]byte{1}}, true
 }
+
+// BeginTerminal validates Active state before running the post-begin barrier.
 func (d *terminalReviewDriver) BeginTerminal(ctx context.Context, p *TerminalPermit) error {
 	if _, err := p.Observe(ctx, false); err != nil {
 		return err
@@ -74,10 +89,14 @@ func (d *terminalReviewDriver) BeginTerminal(ctx context.Context, p *TerminalPer
 	}
 	return nil
 }
+
+// ValidateTerminal uses the real permit classifier for injected authority evidence.
 func (d *terminalReviewDriver) ValidateTerminal(ctx context.Context, p *TerminalPermit, committed bool) error {
 	_, err := p.Observe(ctx, committed)
 	return err
 }
+
+// SendTerminal counts only handoffs that survive the real permit's final gate.
 func (d *terminalReviewDriver) SendTerminal(_ context.Context, p *TerminalPermit) error {
 	if d.beforeSend != nil {
 		d.beforeSend()
@@ -88,8 +107,11 @@ func (d *terminalReviewDriver) SendTerminal(_ context.Context, p *TerminalPermit
 	d.handoffs.Add(1)
 	return nil
 }
+
+// StopTerminal intentionally leaves the request live to isolate failure publication.
 func (d *terminalReviewDriver) StopTerminal() {}
 
+// terminalReviewRequest creates a live core call and its exact authorized handler scope.
 func terminalReviewRequest(t *testing.T, h *Host, hc *hostConn, id uint64) context.Context {
 	t.Helper()
 	request := &RpcRequest{Method: terminalReviewMethod, TimeoutMs: 3000}
@@ -109,6 +131,7 @@ func terminalReviewRequest(t *testing.T, h *Host, hc *hostConn, id uint64) conte
 	return context.WithValue(ctx, terminalRequestKey{}, &terminalRequest{host: h, conn: hc, call: cc, ctx: ctx, method: terminalReviewMethod})
 }
 
+// terminalReviewConnection installs a coordinated driver and owned writer for policy tests.
 func terminalReviewConnection(t *testing.T, authorize AuthorizeFunc) (*Host, *hostConn, *terminalReviewAuthority, *terminalReviewDriver) {
 	t.Helper()
 	authority := &terminalReviewAuthority{}
@@ -143,6 +166,8 @@ func TestTerminalReviewUnusableRevisionRejectsBeforeFence(t *testing.T) {
 	}
 }
 
+// TestTerminalReviewPublishedAuthorizationDenialPreventsReservation keeps a
+// sibling's denial completion unprocessed while testing immediate revocation.
 func TestTerminalReviewPublishedAuthorizationDenialPreventsReservation(t *testing.T) {
 	h, hc, authority, driver := terminalReviewConnection(t, func(context.Context, string, string) error { return NewRpcError(ErrorCodeUnauthenticated, "withdrawn") })
 	request := &RpcRequest{Method: "/example.Authority/Sibling", TimeoutMs: 3000}
@@ -169,6 +194,8 @@ func TestTerminalReviewPublishedAuthorizationDenialPreventsReservation(t *testin
 	}
 }
 
+// TestTerminalReviewFailureAfterBeginPreventsCommitWithoutRequestCancel checks
+// sticky failure, lost ownership and elapsed cutoff independently of cancellation.
 func TestTerminalReviewFailureAfterBeginPreventsCommitWithoutRequestCancel(t *testing.T) {
 	for _, fault := range []string{"unknown", "ownership", "elapsed-deadline"} {
 		t.Run(fault, func(t *testing.T) {
@@ -195,6 +222,8 @@ func TestTerminalReviewFailureAfterBeginPreventsCommitWithoutRequestCancel(t *te
 	}
 }
 
+// TestTerminalReviewObservationChecksItsOwnElapsedDeadline rejects a read that
+// exceeds its own trusted elapsed allowance despite a longer total budget.
 func TestTerminalReviewObservationChecksItsOwnElapsedDeadline(t *testing.T) {
 	clock := &terminalReviewClock{}
 	authority := &terminalReviewAuthority{observe: func(_ context.Context, tr TerminalTransition) (TerminalObservation, error) {
@@ -207,6 +236,8 @@ func TestTerminalReviewObservationChecksItsOwnElapsedDeadline(t *testing.T) {
 	}
 }
 
+// TestTerminalReviewFailureDirectlyCancelsAdmittedCommit verifies cancellation
+// is visible synchronously at Fail's return, without request teardown or polling.
 func TestTerminalReviewFailureDirectlyCancelsAdmittedCommit(t *testing.T) {
 	h, hc, authority, driver := terminalReviewConnection(t, AllowAllAuthorize)
 	hc.stop = func() {} // cancellation cannot arrive through connection teardown
@@ -237,6 +268,8 @@ func TestTerminalReviewFailureDirectlyCancelsAdmittedCommit(t *testing.T) {
 	}
 }
 
+// TestTerminalReviewExpiredWriteContextPreventsCommit stalls Begin until its
+// write context expires and verifies no authority mutation starts afterward.
 func TestTerminalReviewExpiredWriteContextPreventsCommit(t *testing.T) {
 	h, hc, authority, driver := terminalReviewConnection(t, AllowAllAuthorize)
 	hc.stop = func() {}
@@ -256,6 +289,8 @@ func TestTerminalReviewExpiredWriteContextPreventsCommit(t *testing.T) {
 	}
 }
 
+// TestTerminalReviewPublishedDenialPreventsSelectedHandoff publishes sibling
+// revocation after result selection, independently of completion processing.
 func TestTerminalReviewPublishedDenialPreventsSelectedHandoff(t *testing.T) {
 	release := make(chan struct{})
 	var releaseOnce sync.Once

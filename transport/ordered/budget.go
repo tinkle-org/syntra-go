@@ -206,6 +206,7 @@ func (t *Transport) operationDeadline(timeout time.Duration) time.Duration {
 	return until
 }
 
+// checkTime enforces channel, establishment and any terminal permit's deadlines.
 func (t *Transport) checkTime() error {
 	t.mu.Lock()
 	closed := t.closed

@@ -11,6 +11,10 @@ The supported stock composition is the root `Host`, the ordered encrypted driver
 and TCP. Both `HostConfig.TerminalMethods` in `session.go` and
 `ordered.Options.EnableTerminalReceipts` in `transport/ordered/transport.go` must be
 enabled. Existing channel authentication and `HostConfig.Authorize` still apply.
+`CompleteTerminalReceipt` in `terminal_receipt.go` additionally requires a
+confirmed Returning-mode channel binding. Bootstrap mode rejects before
+reservation or mutation, even with successful authentication, method
+authorization, and both opt-ins.
 
 The following helper configures only the terminal policy. Supply the application's
 credential policy, method authorization, and handler separately:
@@ -199,7 +203,8 @@ terminal connection's close join is retained asynchronously. It must not await
 
 | Composition | Status |
 | --- | --- |
-| Root `Host` + ordered + TCP | Supported with both opt-ins |
+| Root `Host` + ordered + TCP, confirmed Returning mode | Supported with authentication, method authorization, and both opt-ins |
+| Bootstrap mode | Refused before reservation or mutation, regardless of authentication, authorization, or opt-ins |
 | `connection.Accept`, `connection.Server.Accept`, ownership/readiness wrappers | Preserve the same ordered/TCP capability |
 | Host with `HostConfig.Recovery` | Refused before mutation; recovery authority callbacks are not coordinated by this Go path |
 | Raw frame or loopback driver | Refused before mutation |
@@ -231,8 +236,8 @@ edit; no aggregate top-level test count is asserted here.
 distinct passing cases** across Go-server/Rust-client and Rust-server/Go-client:
 owned and commit/return-gap success over direct and fragmented TCP, denial,
 unknown authority, and partial receipt loss. Every case includes a fresh
-Returning probe with no RPC and checked authority denial. The exact run-2 source
-manifests, hashes, report location, and limits belong to that unchanged note.
+Returning probe with no RPC and checked authority denial. The recorded run-2
+hashes, report location, availability, and limits belong to that note.
 It is not evidence for later edits until rerun.
 
 `cmd/terminal-fixture/main.go` is a loopback-only volatile authority fixture, not a

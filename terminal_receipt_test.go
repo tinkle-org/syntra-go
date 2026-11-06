@@ -9,25 +9,35 @@ import (
 	"time"
 )
 
+// terminalTestClock keeps elapsed time fixed for evidence-only tests.
 type terminalTestClock struct{}
 
+// Age returns the fixture's fixed origin.
 func (terminalTestClock) Age() time.Duration { return 0 }
-func (terminalTestClock) Check() error       { return nil }
 
+// Check keeps the evidence fixture's clock valid.
+func (terminalTestClock) Check() error { return nil }
+
+// terminalTestAuthority returns controlled evidence and counts mutation attempts.
 type terminalTestAuthority struct {
 	observation TerminalObservation
 	err         error
 	commits     atomic.Int32
 }
 
+// Commit records a mutation attempt without claiming durable state.
 func (a *terminalTestAuthority) Commit(context.Context, TerminalTransition) error {
 	a.commits.Add(1)
 	return nil
 }
+
+// Observe returns the exact injected state or authority error.
 func (a *terminalTestAuthority) Observe(context.Context, TerminalTransition) (TerminalObservation, error) {
 	return a.observation, a.err
 }
 
+// TestTerminalEvidenceIsStickyAndExact rejects mismatched evidence and prevents
+// a later valid read from resurrecting an already failed reservation.
 func TestTerminalEvidenceIsStickyAndExact(t *testing.T) {
 	for _, fault := range []string{"unknown", "denied", "error", "reservation", "operation", "principal", "scope", "epoch", "method", "revision", "server-key", "handshake", "active-after-commit"} {
 		t.Run(fault, func(t *testing.T) {
@@ -80,6 +90,8 @@ func TestTerminalEvidenceIsStickyAndExact(t *testing.T) {
 	}
 }
 
+// TestTerminalQuiesceSuppressesQueuedNotActive retains the active full frame
+// while discarding queued ordinary output and rejecting later output silently.
 func TestTerminalQuiesceSuppressesQueuedNotActive(t *testing.T) {
 	probe := newWriterProbe()
 	w := newHostWriter(probe, time.Second)
@@ -121,6 +133,7 @@ func TestTerminalQuiesceSuppressesQueuedNotActive(t *testing.T) {
 	}
 }
 
+// TestTerminalContextCannotBeManufactured rejects unowned contexts and zero permits.
 func TestTerminalContextCannotBeManufactured(t *testing.T) {
 	if err := CompleteTerminalReceipt(context.Background(), "operation", 1); err == nil {
 		t.Fatal("unowned context reserved")
@@ -131,6 +144,8 @@ func TestTerminalContextCannotBeManufactured(t *testing.T) {
 	}
 }
 
+// TestTerminalUnsupportedFrameTransportRejectsBeforeCommit refuses raw frame
+// transports before the application authority can mutate.
 func TestTerminalUnsupportedFrameTransportRejectsBeforeCommit(t *testing.T) {
 	authority := &terminalTestAuthority{}
 	cfg := testHostConfig()

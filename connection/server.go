@@ -1,3 +1,4 @@
+// File server.go owns encrypted responder sessions and their bounded lifecycle.
 package connection
 
 import (
@@ -238,6 +239,7 @@ func (c *ownedCarrier) Close() error {
 	return c.err
 }
 
+// SupportsTerminalReceipt preserves only the underlying carrier's explicit opt-in.
 func (c *ownedCarrier) SupportsTerminalReceipt() bool {
 	if provider, ok := c.MessageIO.(interface{ SupportsTerminalReceipt() bool }); ok {
 		return provider.SupportsTerminalReceipt()

@@ -265,6 +265,7 @@ type Transport struct {
 var _ syntra.Transport = (*Transport)(nil)
 var _ syntra.ChannelIdentityProvider = (*Transport)(nil)
 
+// newTransport creates the sole record/nonce owner and starts bounded supervision.
 func newTransport(carrier MessageIO, ch *securechannel.Channel, cfg *securechannel.ServerConfig, o Options) *Transport {
 	ctx, cancel := context.WithCancel(context.Background())
 	t := &Transport{io: carrier, channel: ch, server: cfg, opts: o, ctx: ctx, cancel: cancel,
@@ -309,6 +310,8 @@ func (t *Transport) abort(cause ...error) {
 	t.retire(err, false)
 }
 
+// retire stops admission and carrier I/O, retiring terminal crypto before joining
+// admitted operations; scratch remains owned until those operations exit.
 func (t *Transport) retire(err error, local bool) {
 	if err != nil {
 		err = publicError(context.Background(), err)
@@ -429,6 +432,7 @@ func (t *Transport) CloseContext(ctx context.Context) error {
 	}
 }
 
+// supervise checks idle authority and joins all owners before clearing scratch.
 func (t *Transport) supervise() {
 	defer close(t.stopped)
 	defer func() {

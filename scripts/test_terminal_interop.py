@@ -1,5 +1,8 @@
 """Regression checks for the receipt harness's fail-closed evidence validator."""
 import importlib.util
+import contextlib
+import io
+import json
 from pathlib import Path
 import socket
 import struct
@@ -72,6 +75,160 @@ class OutputDirectoryTests(unittest.TestCase):
                 elif case == "existing-file":
                     self.assertEqual("preserve existing file\n", output.read_text())
 
+    def test_archive_preserves_exact_evidence_and_refuses_invalid_inputs(self):
+        """Archive reviewable bytes with checked hashes, without copying binaries or overwriting."""
+        for case in ("valid", "tampered", "traversal", "absolute", "existing", "missing-parent"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                output = root / "output"
+                output.mkdir()
+                data = {"report.json": b'{"sources":{"go":{"files":[]}}}\n',
+                        "case/case.json": b'{"status":"PASS"}\n',
+                        "unit-tests.stderr.log": b"archived test output\n",
+                        "terminal-fixture": b"excluded fake executable"}
+                for name, value in data.items():
+                    path = output / name
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(value)
+                manifest = {name: interop.sha256(output / name) for name in data}
+                original = "".join(f"{digest}  {name}\n" for name, digest in sorted(manifest.items()))
+                (output / "SHA256SUMS").write_text(original)
+                archive = root / "archive"
+                if case == "tampered":
+                    (output / "report.json").write_text("changed report\n")
+                elif case == "traversal":
+                    manifest["../report.json"] = "invalid"
+                elif case == "absolute":
+                    manifest[str(root / "report.json")] = "invalid"
+                elif case == "existing":
+                    archive.mkdir()
+                    (archive / "report.json").write_text("preserve existing archive\n")
+                elif case == "missing-parent":
+                    archive = root / "missing" / "archive"
+                if case != "valid":
+                    with self.assertRaises((ValueError, FileExistsError)):
+                        interop.archive_evidence(output, archive, manifest)
+                    if case == "existing":
+                        self.assertEqual("preserve existing archive\n", (archive / "report.json").read_text())
+                    else:
+                        self.assertFalse(archive.exists())
+                    continue
+                interop.archive_evidence(output, archive, manifest)
+                for name, value in data.items():
+                    if name == "terminal-fixture":
+                        self.assertFalse((archive / name).exists())
+                    else:
+                        self.assertEqual(value, (archive / name).read_bytes())
+                self.assertEqual(original, (archive / "SHA256SUMS").read_text())
+                retained = (archive / "ARCHIVE_SHA256SUMS").read_text().splitlines()
+                self.assertEqual(3, len(retained))
+                for entry in retained:
+                    digest, name = entry.split("  ", 1)
+                    self.assertEqual(digest, interop.sha256(archive / name))
+
+
+class ArchiveCLITests(unittest.TestCase):
+    """Reject invalid archive paths before work and retain reports on export failure."""
+
+    def test_invalid_archive_fails_before_snapshots_or_builds(self):
+        """Existing paths, dangling links and absent parents never start expensive work."""
+        for variant in ("directory", "file", "symlink", "dangling", "missing-parent", "output"):
+            with self.subTest(variant=variant), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                output, archive = root / "output", root / "archive"
+                if variant == "directory":
+                    archive.mkdir()
+                elif variant == "file":
+                    archive.write_text("preserve existing archive\n")
+                elif variant in ("symlink", "dangling"):
+                    target = root / "target"
+                    if variant == "symlink":
+                        target.mkdir()
+                    archive.symlink_to(target, target_is_directory=True)
+                elif variant == "missing-parent":
+                    archive = root / "missing" / "archive"
+                else:
+                    archive = output
+                args = ["terminal-interop.py", "--output", str(output), "--archive", str(archive)]
+                stderr = io.StringIO()
+                with mock.patch.object(sys, "argv", args), \
+                        mock.patch.object(interop, "snapshot", return_value={}) as snapshot, \
+                        mock.patch.object(interop, "build", side_effect=AssertionError("unexpected build")) as build, \
+                        contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
+                    with self.assertRaises(SystemExit) as error:
+                        interop.main()
+                self.assertEqual(2, error.exception.code)
+                snapshot.assert_not_called()
+                build.assert_not_called()
+                self.assertIn("archive", stderr.getvalue())
+                self.assertNotIn("Traceback", stderr.getvalue())
+                if variant == "dangling":
+                    self.assertTrue(archive.is_symlink())
+                    self.assertFalse(target.exists())
+                elif variant == "file":
+                    self.assertEqual("preserve existing archive\n", archive.read_text())
+
+    def run_main(self, root, archive_error=None, with_archive=True):
+        """Exercise CLI reporting with synthetic builds, never executing either SDK."""
+        output, archive = root / "output", root / "archive"
+        args = ["terminal-interop.py", "--output", str(output)]
+        if with_archive:
+            args.extend(["--archive", str(archive)])
+
+        def build(command, directory, folder, name, env=None):
+            """Create only the fake binary paths required by provenance hashing."""
+            self.assertFalse(archive.exists(), "archiving must follow source snapshots")
+            if name == "build-go":
+                binary = folder / "terminal-fixture"
+            elif name == "build-rust":
+                binary = folder / "rust-target/debug/examples/terminal_receipt"
+            else:
+                return
+            binary.parent.mkdir(parents=True, exist_ok=True)
+            binary.write_bytes(b"test-only fake binary\n")
+
+        stdout = io.StringIO()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(sys, "argv", args))
+            stack.enter_context(mock.patch.object(interop, "snapshot", return_value={
+                "revision": "fixture", "branch": "fixture", "working_tree_sha256": "fixture"}))
+            stack.enter_context(mock.patch.object(interop, "build", side_effect=build))
+            stack.enter_context(mock.patch.object(interop.subprocess, "check_output", return_value=b"fixture toolchain"))
+            stack.enter_context(mock.patch.object(interop, "run_case", side_effect=lambda case, *args: dict(case, status="PASS")))
+            if archive_error is not None:
+                stack.enter_context(mock.patch.object(interop, "archive_evidence", side_effect=archive_error))
+            stack.enter_context(contextlib.redirect_stdout(stdout))
+            code = interop.main()
+        return code, output, archive, stdout.getvalue()
+
+    def test_archive_error_is_recorded_without_losing_report_checksums(self):
+        """An export exception returns failure while preserving matrix results and evidence."""
+        for error in (PermissionError("archive denied"), ValueError("archive changed"), RuntimeError("archive failed")):
+            with self.subTest(error=type(error).__name__), tempfile.TemporaryDirectory() as tmp:
+                code, output, _, stdout = self.run_main(Path(tmp), error)
+                self.assertEqual(1, code)
+                report = json.loads((output / "report.json").read_text())
+                self.assertTrue(report["complete"], "the successful matrix must remain distinguishable")
+                self.assertEqual(f"{type(error).__name__}: {error}", report["archive_error"])
+                manifest = dict(line.split("  ", 1)[::-1]
+                                for line in (output / "SHA256SUMS").read_text().splitlines())
+                self.assertEqual(interop.sha256(output / "report.json"), manifest["report.json"])
+                self.assertIn(str(output / "report.json"), stdout)
+                self.assertIn(str(error), stdout)
+                self.assertNotIn("Traceback", stdout)
+
+    def test_successful_runs_preserve_optional_archival(self):
+        """A valid optional archive copies the final report; omitting it still succeeds."""
+        for with_archive in (False, True):
+            with self.subTest(with_archive=with_archive), tempfile.TemporaryDirectory() as tmp:
+                code, output, archive, _ = self.run_main(Path(tmp), with_archive=with_archive)
+                self.assertEqual(0, code)
+                if with_archive:
+                    self.assertEqual((output / "report.json").read_bytes(), (archive / "report.json").read_bytes())
+                    self.assertEqual((output / "SHA256SUMS").read_bytes(), (archive / "SHA256SUMS").read_bytes())
+                else:
+                    self.assertFalse(archive.exists())
+
 
 class EvidenceTests(unittest.TestCase):
     """No setup failure or untriggered fault may count as a receipt case."""
@@ -135,7 +292,8 @@ class EvidenceTests(unittest.TestCase):
 
     def test_partial_loss_requires_exact_trigger(self):
         """A missing, wrong-record, empty or complete forward is not partial loss."""
-        for record, forwarded, length in ((3, 3, 50), (2, 3, 50), (3, 0, 50), (3, 52, 50)):
+        for record, forwarded, length in ((3, 3, 50), (2, 3, 50), (3, 0, 50),
+                                           (3, 1, 50), (3, 2, 50), (3, 52, 50)):
             with self.subTest(record=record, forwarded=forwarded):
                 server, client, probe = self.events()
                 client[-1] = {"event": "result", "outcome": "unknown",
@@ -146,11 +304,31 @@ class EvidenceTests(unittest.TestCase):
                          "errors": []}
                 args = ({"scenario": "owned", "network": "partial-loss"},
                         server, client, probe, stats)
-                if record == 3 and 0 < forwarded < length + 2:
+                if record == 3 and 2 < forwarded < length + 2:
                     interop.validate_case(*args)
                 else:
                     with self.assertRaises(AssertionError):
                         interop.validate_case(*args)
+
+    def test_go_denial_requires_incomplete_local_write(self):
+        """Authority refusal cannot pass if Go reports successful receipt handoff."""
+        for scenario in ("deny", "unknown"):
+            for complete in (False, True, None, "missing"):
+                with self.subTest(scenario=scenario, complete=complete):
+                    server, client, probe = self.events()
+                    state = "HardDenied" if scenario == "deny" else "Unknown"
+                    server.insert(1, dict(event="authority_outcome", state=state))
+                    if complete != "missing":
+                        server.insert(2, dict(event="local_write", complete=complete))
+                    client[-1] = dict(event="result", outcome="unknown",
+                                      code="Unavailable", receipts=0)
+                    args = (dict(server="go", scenario=scenario, network="direct"),
+                            server, client, probe, None)
+                    if complete is False:
+                        interop.validate_case(*args)
+                    else:
+                        with self.assertRaises(AssertionError):
+                            interop.validate_case(*args)
 
     def test_gap_requires_observation_while_callback_pending(self):
         """A late or absent observation cannot stand in for a pending callback read."""
@@ -245,7 +423,13 @@ class OrchestrationTests(unittest.TestCase):
 
             proc.wait_event.side_effect = event
             proc.wait.side_effect = wait
-            proc.close.side_effect = lambda: trace.append(label + ".close")
+            def close():
+                """Model a late cleanup failure after all case evidence was validated."""
+                trace.append(label + ".close")
+                if label == "server" and failure == "cleanup":
+                    raise RuntimeError("injected cleanup failure")
+
+            proc.close.side_effect = close
             return proc
 
         case = dict(id="orchestration", server="rust", client="go",
@@ -293,6 +477,14 @@ class OrchestrationTests(unittest.TestCase):
                 for proc in processes.values():
                     proc.close.assert_called_once()
                 self.assertTrue(proxy.stats["workers_joined"])
+
+    def test_cleanup_failure_cannot_leave_pass(self):
+        """Case success is published only after every retained owner closes successfully."""
+        result, trace, processes, _ = self.exercise("direct", "cleanup")
+        self.assertEqual("FAIL", result["status"], result)
+        self.assertIn("injected cleanup failure", result["failure"])
+        for proc in processes.values():
+            proc.close.assert_called_once()
 
 
 class ProxyTests(unittest.TestCase):
@@ -368,6 +560,100 @@ class ProcessTests(unittest.TestCase):
                     proc.close()
                 self.assertIsNotNone(proc.child.poll())
                 self.assertTrue(all(not t.is_alive() for t in proc.readers))
+
+    def test_exited_child_event_waits_for_stdout_drain(self):
+        """An exited child's buffered event remains eligible until stdout reaches EOF."""
+        release = threading.Event()
+        waiting = threading.Event()
+        outcomes = []
+
+        class DelayedStdout(interop.Process):
+            """Hold stdout draining behind a barrier while the real child exits."""
+
+            def _read(self, pipe, path, name):
+                """Keep stderr live and release stdout only after the event waiter blocks."""
+                if name == "stdout":
+                    release.wait(3)
+                super()._read(pipe, path, name)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = DelayedStdout([sys.executable, "-c", 'print(\'{"event":"ready"}\')'],
+                                 tmp, Path(tmp) / "child", 5)
+            original_wait = proc.condition.wait
+
+            def condition_wait(timeout):
+                """Signal a real condition wait rather than depending on scheduling sleeps."""
+                waiting.set()
+                return original_wait(timeout)
+
+            def wait_event():
+                """Capture success or refusal so the parent can always join the waiter."""
+                try:
+                    outcomes.append(proc.wait_event("ready", timeout=2))
+                except RuntimeError as error:
+                    outcomes.append(error)
+
+            waiter = threading.Thread(target=wait_event)
+            try:
+                proc.child.wait(timeout=2)
+                with mock.patch.object(proc.condition, "wait", side_effect=condition_wait):
+                    waiter.start()
+                    self.assertTrue(waiting.wait(1), outcomes)
+                    release.set()
+                    waiter.join(3)
+                self.assertFalse(waiter.is_alive())
+                self.assertEqual([dict(event="ready")], outcomes)
+                proc.wait()
+            finally:
+                release.set()
+                if waiter.ident is not None:
+                    waiter.join(3)
+                proc.close()
+
+    def test_missing_event_still_rejects_exit_and_stdio_failure(self):
+        """Draining stdout does not turn absent markers or malformed output into evidence."""
+        for code in ("pass", "print('x' * 4097)"):
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as tmp:
+                proc = interop.Process([sys.executable, "-c", code], tmp,
+                                       Path(tmp) / "child", 3)
+                try:
+                    with self.assertRaisesRegex(RuntimeError, "missing ready event"):
+                        proc.wait_event("ready", timeout=1)
+                finally:
+                    proc.close()
+                self.assertIsNotNone(proc.child.poll())
+                self.assertTrue(all(not t.is_alive() for t in proc.readers))
+
+    def test_group_signal_reaps_only_exit_races_not_live_permission_failures(self):
+        """Retry after bounded owned-child reap without hiding live or persistent EPERM."""
+        for variant in ("missing", "reaped-missing", "reaped-group", "live", "persistent"):
+            with self.subTest(variant=variant):
+                proc = interop.Process.__new__(interop.Process)
+                proc.child = mock.Mock(pid=12345)
+                denied = PermissionError("injected group denial")
+                errors = [ProcessLookupError()] if variant == "missing" else [denied]
+                if variant == "reaped-missing":
+                    errors.append(ProcessLookupError())
+                elif variant == "persistent":
+                    errors.append(PermissionError("remaining group denied"))
+                elif variant == "reaped-group":
+                    errors.append(None)
+                if variant == "live":
+                    proc.child.wait.side_effect = interop.subprocess.TimeoutExpired("child", 2)
+                with mock.patch.object(interop.os, "killpg", side_effect=errors) as kill:
+                    if variant in ("live", "persistent"):
+                        with self.assertRaises(PermissionError) as raised:
+                            proc._signal(interop.signal.SIGTERM)
+                        if variant == "live":
+                            self.assertIs(denied, raised.exception)
+                    else:
+                        proc._signal(interop.signal.SIGTERM)
+                if variant == "missing":
+                    proc.child.wait.assert_not_called()
+                else:
+                    proc.child.wait.assert_called_once_with(timeout=2)
+                self.assertEqual(1 if variant in ("missing", "live") else 2,
+                                 kill.call_count)
 
 
 if __name__ == "__main__":

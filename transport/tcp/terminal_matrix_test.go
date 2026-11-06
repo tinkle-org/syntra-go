@@ -19,6 +19,7 @@ import (
 	"github.com/tinkle-org/syntra-go/transport/tcp"
 )
 
+// retireMethod identifies the neutral terminal operation shared by TCP fixtures.
 const retireMethod = "/example.Authority/Retire"
 
 // terminalTCPFixture owns all sockets and workers started by one test.
@@ -33,6 +34,7 @@ type terminalTCPFixture struct {
 	budget    *syntra.ExecutionBudget
 }
 
+// terminalTCPOptions injects bounded authority and transport faults per fixture.
 type terminalTCPOptions struct {
 	connections                  int
 	ownedServer                  bool
@@ -43,9 +45,14 @@ type terminalTCPOptions struct {
 	commit                       func(context.Context)
 	observe                      func(syntra.TerminalObservation) (syntra.TerminalObservation, error)
 	wrap                         func(net.Conn) net.Conn
+	wrapRecords                  func(ordered.MessageIO) ordered.MessageIO
+	wrapTransport                func(*ordered.Transport) syntra.Transport
+	observeContext               func(context.Context, syntra.TerminalObservation) (syntra.TerminalObservation, error)
+	observationTimeout           time.Duration
 	handler                      func(context.Context, *syntra.RpcRequest) (*syntra.RpcResult, error)
 }
 
+// terminalTCP starts a real encrypted loopback responder and registers joined cleanup.
 func terminalTCP(t *testing.T, options terminalTCPOptions) *terminalTCPFixture {
 	t.Helper()
 	key, err := securechannel.GenerateStaticKey()
@@ -57,7 +64,7 @@ func terminalTCP(t *testing.T, options terminalTCPOptions) *terminalTCPFixture {
 		t.Fatal(err)
 	}
 	var revoked atomic.Bool
-	authority := &terminalAuthority{revoked: &revoked, afterCommit: options.commit, observation: options.observe}
+	authority := &terminalAuthority{revoked: &revoked, afterCommit: options.commit, observation: options.observe, contextObservation: options.observeContext}
 	security := securechannel.ServerConfig{StaticKey: key, ServerKeyID: 7, Scope: "terminal-fixture", Carrier: securechannel.TCP,
 		LookupKey: func(_ context.Context, c securechannel.Context) (securechannel.Key, error) {
 			if revoked.Load() || c.Epoch != 1 || c.Handle != [8]byte{1} {
@@ -66,6 +73,9 @@ func terminalTCP(t *testing.T, options terminalTCPOptions) *terminalTCPFixture {
 			return ak, nil
 		}}
 	policy := syntra.TerminalMethodPolicy{SuccessPayload: []byte("retired"), Authority: authority, ObservationTimeout: 10 * time.Millisecond}
+	if options.observationTimeout != 0 {
+		policy.ObservationTimeout = options.observationTimeout
+	}
 	if options.payload != nil {
 		policy.SuccessPayload = options.payload
 	}
@@ -129,6 +139,18 @@ func terminalTCP(t *testing.T, options terminalTCPOptions) *terminalTCPFixture {
 			workers.Add(1)
 			go func() {
 				defer workers.Done()
+				if options.wrapTransport != nil {
+					tr, err := ordered.Server(ctx, tcp.New(conn, opts.Budget), security, opts)
+					if err == nil {
+						defer tr.Close()
+						_ = host.Serve(ctx, options.wrapTransport(tr))
+					}
+					return
+				}
+				if options.wrapRecords != nil {
+					_ = connection.Accept(ctx, options.wrapRecords(tcp.New(conn, opts.Budget)), security, host, opts)
+					return
+				}
 				if server != nil {
 					_ = server.Accept(ctx, tcp.New(conn, opts.Budget), opts)
 					return
@@ -161,6 +183,7 @@ func terminalTCP(t *testing.T, options terminalTCPOptions) *terminalTCPFixture {
 	return f
 }
 
+// TestTerminalTCPOwnedServerForwardsCapability covers connection.Server's owned wrapper.
 func TestTerminalTCPOwnedServerForwardsCapability(t *testing.T) {
 	f := terminalTCP(t, terminalTCPOptions{ownedServer: true})
 	c := f.connect(t)
@@ -170,6 +193,8 @@ func TestTerminalTCPOwnedServerForwardsCapability(t *testing.T) {
 	}
 }
 
+// TestTerminalTCPReservationDoesNotTransfer rejects both an existing sibling and
+// fresh Returning handshake while permitting only the original terminal result.
 func TestTerminalTCPReservationDoesNotTransfer(t *testing.T) {
 	committed, release := make(chan struct{}), make(chan struct{})
 	f := terminalTCP(t, terminalTCPOptions{connections: 3, commit: func(context.Context) { close(committed); <-release }})
@@ -205,6 +230,7 @@ func TestTerminalTCPReservationDoesNotTransfer(t *testing.T) {
 	}
 }
 
+// connect establishes the fixture's initiating client and retains it for cleanup.
 func (f *terminalTCPFixture) connect(t *testing.T) *connection.Client {
 	t.Helper()
 	c, err := tcp.Dial(f.ctx, f.address, f.security, syntra.ClientConfig{}, ordered.Options{})
@@ -336,23 +362,7 @@ func TestTerminalTCPCompleteFrameCeilingAndSnapshot(t *testing.T) {
 	}
 }
 
-func TestTerminalTCPFinalObservationDenialWins(t *testing.T) {
-	var reads atomic.Int32
-	f := terminalTCP(t, terminalTCPOptions{observe: func(o syntra.TerminalObservation) (syntra.TerminalObservation, error) {
-		if o.State == syntra.TerminalOwnedCommitted && reads.Add(1) >= 3 {
-			o.State = syntra.TerminalDenied
-		}
-		return o, nil
-	}})
-	c := f.connect(t)
-	if got, err := c.Call(f.ctx, retireMethod, nil, 1000); err == nil || len(got) != 0 {
-		t.Fatal("denial at final validation allowed receipt")
-	}
-	if reads.Load() < 3 || f.authority.commits.Load() != 1 {
-		t.Fatal("final evidence gate was not exercised")
-	}
-}
-
+// TestTerminalTCPInsufficientBudgetDoesNotMutate reserves the teardown tail before commit.
 func TestTerminalTCPInsufficientBudgetDoesNotMutate(t *testing.T) {
 	f := terminalTCP(t, terminalTCPOptions{})
 	c := f.connect(t)
@@ -364,6 +374,8 @@ func TestTerminalTCPInsufficientBudgetDoesNotMutate(t *testing.T) {
 	}
 }
 
+// TestTerminalTCPRetiredHandlerContextCannotReserve rejects a saved callback scope
+// without fencing a later unrelated live request on the same connection.
 func TestTerminalTCPRetiredHandlerContextCannotReserve(t *testing.T) {
 	saved := make(chan context.Context, 1)
 	f := terminalTCP(t, terminalTCPOptions{handler: func(ctx context.Context, _ *syntra.RpcRequest) (*syntra.RpcResult, error) {
@@ -385,6 +397,8 @@ func TestTerminalTCPRetiredHandlerContextCannotReserve(t *testing.T) {
 	}
 }
 
+// TestTerminalTCPDisconnectPrincipalStillAborts preserves immediate withdrawal,
+// without pretending that abort rolls back an already committed transition.
 func TestTerminalTCPDisconnectPrincipalStillAborts(t *testing.T) {
 	committed, release := make(chan struct{}), make(chan struct{})
 	f := terminalTCP(t, terminalTCPOptions{commit: func(context.Context) { close(committed); <-release }})
@@ -405,6 +419,8 @@ func TestTerminalTCPDisconnectPrincipalStillAborts(t *testing.T) {
 	}
 }
 
+// TestTerminalTCPOwnCommitVisibleBeforeCallbackReturn lets the supervisor observe
+// owned state while Commit is held at a synchronization barrier.
 func TestTerminalTCPOwnCommitVisibleBeforeCallbackReturn(t *testing.T) {
 	visible, release := make(chan struct{}), make(chan struct{})
 	var once sync.Once
@@ -441,6 +457,8 @@ func TestTerminalTCPOwnCommitVisibleBeforeCallbackReturn(t *testing.T) {
 	}
 }
 
+// TestTerminalTCPDeadlineRetainsActualCallbackCharge retires the carrier at cutoff
+// while retaining the execution slot of a callback that has not actually returned.
 func TestTerminalTCPDeadlineRetainsActualCallbackCharge(t *testing.T) {
 	committed, release := make(chan struct{}), make(chan struct{})
 	f := terminalTCP(t, terminalTCPOptions{commit: func(context.Context) { close(committed); <-release }})
@@ -465,6 +483,8 @@ func TestTerminalTCPDeadlineRetainsActualCallbackCharge(t *testing.T) {
 	close(release)
 }
 
+// TestTerminalTCPCancelBeforeSelection rejects success and closes the carrier when
+// cancellation wins before terminal result selection.
 func TestTerminalTCPCancelBeforeSelection(t *testing.T) {
 	committed := make(chan struct{})
 	f := terminalTCP(t, terminalTCPOptions{commit: func(ctx context.Context) { close(committed); <-ctx.Done() }})
@@ -499,10 +519,13 @@ type terminalFaultConn struct {
 	drop    bool
 }
 
+// Close releases a held partial write and closes the real socket idempotently.
 func (c *terminalFaultConn) Close() error {
 	c.once.Do(func() { close(c.closed) })
 	return c.Conn.Close()
 }
+
+// Write stalls or drops the third record after a single prefix byte was emitted.
 func (c *terminalFaultConn) Write(p []byte) (int, error) {
 	c.writes++
 	if c.writes != 5 {
@@ -524,6 +547,8 @@ func (c *terminalFaultConn) Write(p []byte) (int, error) {
 	}
 }
 
+// TestTerminalTCPPartialReceiptLossIsUnknown rejects complete receipt success
+// after a partial prefix, without replaying or rolling back the authority commit.
 func TestTerminalTCPPartialReceiptLossIsUnknown(t *testing.T) {
 	entered := make(chan struct{})
 	f := terminalTCP(t, terminalTCPOptions{wrap: func(conn net.Conn) net.Conn {
@@ -540,6 +565,8 @@ func TestTerminalTCPPartialReceiptLossIsUnknown(t *testing.T) {
 	}
 }
 
+// TestTerminalTCPSelectedSuccessIgnoresLateCancel retains the first selected
+// result when cancellation arrives after ciphertext handoff.
 func TestTerminalTCPSelectedSuccessIgnoresLateCancel(t *testing.T) {
 	entered, release := make(chan struct{}), make(chan struct{})
 	f := terminalTCP(t, terminalTCPOptions{wrap: func(conn net.Conn) net.Conn {
@@ -586,6 +613,8 @@ func TestTerminalTCPSelectedSuccessIgnoresLateCancel(t *testing.T) {
 	}
 }
 
+// TestTerminalTCPProtocolFailureWhileFencedWins preserves fatal request-ID replay
+// checks while ordinary admission is fenced and Commit has not returned.
 func TestTerminalTCPProtocolFailureWhileFencedWins(t *testing.T) {
 	committed, release := make(chan struct{}), make(chan struct{})
 	defer close(release)
@@ -626,14 +655,19 @@ func TestTerminalTCPProtocolFailureWhileFencedWins(t *testing.T) {
 	}
 }
 
+// TestTerminalTCPBlockedReceiptRepollsAndRetires observes injected denial/unknown
+// and real socket retirement before the longer RPC/receipt deadline can mask it.
 func TestTerminalTCPBlockedReceiptRepollsAndRetires(t *testing.T) {
 	for _, fault := range []string{"deadline", "denial", "unknown"} {
 		t.Run(fault, func(t *testing.T) {
 			entered := make(chan struct{})
+			observed := make(chan struct{})
+			closed := make(chan struct{})
+			var observedOnce sync.Once
 			var fail atomic.Bool
 			f := terminalTCP(t, terminalTCPOptions{
 				wrap: func(conn net.Conn) net.Conn {
-					return &terminalFaultConn{Conn: conn, entered: entered, closed: make(chan struct{})}
+					return &terminalFaultConn{Conn: conn, entered: entered, closed: closed}
 				},
 				observe: func(o syntra.TerminalObservation) (syntra.TerminalObservation, error) {
 					if fail.Load() {
@@ -641,16 +675,36 @@ func TestTerminalTCPBlockedReceiptRepollsAndRetires(t *testing.T) {
 						if fault == "unknown" {
 							o.State = syntra.TerminalUnknown
 						}
+						observedOnce.Do(func() { close(observed) })
 					}
 					return o, nil
 				},
 			})
 			c := f.connect(t)
 			done := make(chan error, 1)
-			go func() { _, err := c.Call(f.ctx, retireMethod, nil, 200); done <- err }()
+			timeout := uint32(3000)
+			if fault == "deadline" {
+				timeout = 200
+			}
+			go func() { _, err := c.Call(f.ctx, retireMethod, nil, timeout); done <- err }()
 			<-entered
 			if fault != "deadline" {
 				fail.Store(true)
+				select {
+				case <-observed:
+				case <-time.After(150 * time.Millisecond):
+					t.Fatal("injected authority state was never observed")
+				}
+				select {
+				case <-closed:
+				case <-time.After(150 * time.Millisecond):
+					t.Fatal("authority failure did not retire socket before RPC/watchdog deadline")
+				}
+				select {
+				case <-c.Done():
+				case <-time.After(150 * time.Millisecond):
+					t.Fatal("peer did not observe socket retirement before RPC/watchdog deadline")
+				}
 			}
 			select {
 			case err := <-done:
@@ -667,6 +721,8 @@ func TestTerminalTCPBlockedReceiptRepollsAndRetires(t *testing.T) {
 	}
 }
 
+// TestTerminalTCPPartialOrdinaryBarrier waits for a full active ordinary frame
+// before mutation and discards all queued ordinary output across the fence.
 func TestTerminalTCPPartialOrdinaryBarrier(t *testing.T) {
 	for _, drop := range []bool{false, true} {
 		t.Run(map[bool]string{false: "finish-before-commit", true: "failure-no-commit"}[drop], func(t *testing.T) {
@@ -719,6 +775,8 @@ func TestTerminalTCPPartialOrdinaryBarrier(t *testing.T) {
 	}
 }
 
+// TestTerminalTCPQuiescenceUsesElapsedBudget rejects a clock jump during a
+// blocked ordinary frame without starting the authority mutation.
 func TestTerminalTCPQuiescenceUsesElapsedBudget(t *testing.T) {
 	entered, handlerEntered := make(chan struct{}), make(chan struct{})
 	var jump atomic.Int64

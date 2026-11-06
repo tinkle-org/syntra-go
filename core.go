@@ -1,3 +1,4 @@
+// File core.go implements socket-free client and host protocol state machines.
 package syntra
 
 import (
@@ -469,6 +470,8 @@ func (g *goHostCore) onFrameAt(frame []byte, receivedAt time.Time) ([][]byte, []
 // onRequestLocked validates one request and either queues it for
 // dispatch or answers it immediately with a terminal error. Callers MUST
 // hold g.mu.
+// onRequestLocked validates monotonic requests, preserving replay rejection even
+// while terminal fencing suppresses admission. The caller holds g.mu.
 func (g *goHostCore) onRequestLocked(f *Frame, receivedAt time.Time) *RpcError {
 	id := f.GetRequestId()
 	if id <= g.highwater {
@@ -580,6 +583,7 @@ func (g *goHostCore) answer(requestID uint64, result *RpcResult) ([]byte, bool, 
 	return raw, false, nil
 }
 
+// notify snapshots ordinary notification output unless the connection is fenced.
 func (g *goHostCore) notify(payload []byte) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()

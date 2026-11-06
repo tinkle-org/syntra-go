@@ -17,11 +17,13 @@ const terminalConfigMethod = "/test.Authority/Retire"
 // terminalConfigAuthority records any accidental constructor-time authority I/O.
 type terminalConfigAuthority struct{ calls atomic.Int32 }
 
+// Commit counts forbidden constructor-time mutations.
 func (a *terminalConfigAuthority) Commit(context.Context, TerminalTransition) error {
 	a.calls.Add(1)
 	return nil
 }
 
+// Observe counts forbidden constructor-time authority reads.
 func (a *terminalConfigAuthority) Observe(context.Context, TerminalTransition) (TerminalObservation, error) {
 	a.calls.Add(1)
 	return TerminalObservation{}, nil

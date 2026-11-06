@@ -11,17 +11,23 @@ import (
 	"github.com/tinkle-org/syntra-go/connection"
 )
 
+// unsupportedTerminalAuthority detects any work past unsupported-driver preflight.
 type unsupportedTerminalAuthority struct{ commits, observes atomic.Int32 }
 
+// Commit counts mutations that unsupported record pumps must never reach.
 func (a *unsupportedTerminalAuthority) Commit(context.Context, syntra.TerminalTransition) error {
 	a.commits.Add(1)
 	return nil
 }
+
+// Observe counts reads that unsupported record pumps must never reach.
 func (a *unsupportedTerminalAuthority) Observe(_ context.Context, transition syntra.TerminalTransition) (syntra.TerminalObservation, error) {
 	a.observes.Add(1)
 	return syntra.TerminalObservation{State: syntra.TerminalActive, Transition: transition, Revision: 1}, nil
 }
 
+// TestTerminalCustomMessageIORejectsBeforeMutation checks that ordinary custom
+// MessageIO cannot silently inherit terminal authority or coordinated I/O support.
 func TestTerminalCustomMessageIORejectsBeforeMutation(t *testing.T) {
 	authority := &unsupportedTerminalAuthority{}
 	cfg := hostConfig()

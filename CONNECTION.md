@@ -82,8 +82,11 @@ a bounded denial drain. Handlers must respect their contexts.
 
 **Optional terminal receipt:** `HostConfig.TerminalMethods` and
 `ordered.Options.EnableTerminalReceipts` opt an authorized handler into
-`CompleteTerminalReceipt(ctx, operation, expectedRevision)`. It fences ordinary
-traffic, establishes a full-frame barrier before the configured authority's
+`CompleteTerminalReceipt(ctx, operation, expectedRevision)`. In
+`terminal_receipt.go`, this additionally requires a confirmed Returning-mode
+channel binding; Bootstrap rejects before reservation or mutation, even with
+successful authentication, method authorization, and both opt-ins. It fences
+ordinary traffic, establishes a full-frame barrier before the configured authority's
 conditional commit, and permits only one fixed result with fresh exact-owned
 evidence, then closes. Call before mutation; a nil return reports complete local
 writing, not peer receipt or joined cleanup. Both defaults are off; ordinary

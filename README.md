@@ -135,8 +135,11 @@ An explicitly authorized self-withdrawing operation can call
 It requires fixed non-sensitive bytes and a typed conditional-transition authority
 in `HostConfig.TerminalMethods`, plus `ordered.Options.EnableTerminalReceipts`.
 Both are disabled by default. Call it before mutation; the configured authority's
-`Commit` performs the conditional transition. The SDK fences ordinary traffic and
-reaches a full outbound-frame boundary first, then attempts only the exact owned
+`Commit` performs the conditional transition. `terminal_receipt.go` also requires
+a confirmed Returning-mode channel binding: Bootstrap rejects before reservation
+or mutation, even with successful authentication, method authorization, and both
+opt-ins. The SDK fences ordinary traffic and reaches a full outbound-frame
+boundary first, then attempts only the exact owned
 result and closes. A nil return means complete local writing, not peer receipt or
 joined cleanup. Loss remains unknown; nothing is automatically retried or replayed.
 

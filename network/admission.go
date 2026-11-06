@@ -1,3 +1,4 @@
+// File admission.go provides shared FIFO connection leases through joined cleanup.
 package network
 
 import (
@@ -27,7 +28,16 @@ func NewAdmission(maximum int) (*Admission, error) {
 }
 func (a *Admission) InUse() int     { a.mu.Lock(); defer a.mu.Unlock(); return a.used }
 func (a *Admission) Available() int { a.mu.Lock(); defer a.mu.Unlock(); return a.maximum - a.used }
+
+// acquire waits for a bounded FIFO lease until cancellation or admission closes.
 func (a *Admission) acquire(ctx context.Context) (func(), error) {
+	return a.acquireTracked(ctx, nil)
+}
+
+// acquireTracked publishes position only after reserving a slot or joining the
+// FIFO. position runs once outside mu, before waiting/return; it must be prompt.
+// Publishing earlier lets a reported waiter be overtaken during budget setup.
+func (a *Admission) acquireTracked(ctx context.Context, position func()) (func(), error) {
 	a.mu.Lock()
 	if err := ctx.Err(); err != nil {
 		a.mu.Unlock()
@@ -40,11 +50,17 @@ func (a *Admission) acquire(ctx context.Context) (func(), error) {
 	if a.used < a.maximum && len(a.waiters) == 0 {
 		a.used++
 		a.mu.Unlock()
+		if position != nil {
+			position()
+		}
 		return a.releaser(), nil
 	}
 	w := &admissionWaiter{ready: make(chan struct{})}
 	a.waiters = append(a.waiters, w)
 	a.mu.Unlock()
+	if position != nil {
+		position()
+	}
 	select {
 	case <-w.ready:
 		a.mu.Lock()

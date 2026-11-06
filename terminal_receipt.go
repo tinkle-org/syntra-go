@@ -62,7 +62,9 @@ type TerminalObservation struct {
 // callback's stack. Do not await Host.Wait/Done or the serving result inside a
 // callback: joined cleanup necessarily includes the callback's own return.
 type TerminalAuthority interface {
+	// Commit conditionally records the application transition and exact ownership.
 	Commit(context.Context, TerminalTransition) error
+	// Observe returns fresh authority state, including any superseding denial.
 	Observe(context.Context, TerminalTransition) (TerminalObservation, error)
 }
 
@@ -82,7 +84,9 @@ type TerminalMethodPolicy struct {
 // must fail sticky on discontinuity; Age and Check must be prompt and safe
 // concurrently. Unsupported drivers must not supply an untrusted wall clock.
 type TerminalClock interface {
+	// Age returns trusted elapsed time from the channel's original origin.
 	Age() time.Duration
+	// Check rejects an invalidated or discontinuous origin.
 	Check() error
 }
 
@@ -95,11 +99,17 @@ type TerminalClock interface {
 // failure without replay. StopTerminal interrupts I/O without joining itself.
 // Custom drivers must implement the whole contract or return no capability.
 type TerminalReceiptDriver interface {
+	// TerminalClock returns this driver's original trusted clock.
 	TerminalClock() TerminalClock
+	// TerminalBinding returns current confirmed evidence for this exact channel.
 	TerminalBinding() (TerminalChannelBinding, bool)
+	// BeginTerminal joins the ordinary frame and identity-check barriers.
 	BeginTerminal(context.Context, *TerminalPermit) error
+	// ValidateTerminal classifies current authority; true requires owned commit.
 	ValidateTerminal(context.Context, *TerminalPermit, bool) error
+	// SendTerminal consumes one permit and attempts only its fixed ciphertext.
 	SendTerminal(context.Context, *TerminalPermit) error
+	// StopTerminal interrupts the carrier without joining the caller's operation.
 	StopTerminal()
 }
 
@@ -114,6 +124,7 @@ type TerminalChannelBinding struct {
 // TerminalReceiptProvider forwards the capability to the actual transport owner.
 // Wrappers must preserve owner identity; nil means unsupported/default-disabled.
 type TerminalReceiptProvider interface {
+	// TerminalReceiptDriver returns the exact coordinated owner, or nil.
 	TerminalReceiptDriver() TerminalReceiptDriver
 }
 
@@ -142,6 +153,7 @@ type TerminalPermit struct {
 	stopIO        func() // immutable, prompt and nonjoining driver interrupt
 }
 
+// terminalFailure hides authority diagnostics behind one stable refusal.
 func terminalFailure() error {
 	return NewRpcError(ErrorCodeFailedPrecondition, "syntra: terminal receipt unavailable")
 }
@@ -330,6 +342,7 @@ func (p *TerminalPermit) Handoff() error {
 	return nil
 }
 
+// terminalRequestKey prevents application values from manufacturing handler scope.
 type terminalRequestKey struct{}
 
 // terminalRequest is minted only after method authorization, for the exact live
@@ -543,10 +556,12 @@ type terminalChargedAuthority struct {
 	authority TerminalAuthority
 }
 
+// Commit forwards mutation on the initiating handler's existing execution charge.
 func (a terminalChargedAuthority) Commit(ctx context.Context, transition TerminalTransition) error {
 	return a.authority.Commit(ctx, transition)
 }
 
+// Observe retains a separate execution charge until the authority actually returns.
 func (a terminalChargedAuthority) Observe(ctx context.Context, transition TerminalTransition) (TerminalObservation, error) {
 	if !a.host.cfg.executions.acquire() {
 		return TerminalObservation{}, terminalFailure()
@@ -557,6 +572,7 @@ func (a terminalChargedAuthority) Observe(ctx context.Context, transition Termin
 	return a.authority.Observe(ctx, transition)
 }
 
+// TerminalReceiptDriver forwards optional coordination without changing its owner.
 func (t *ownedTransport) TerminalReceiptDriver() TerminalReceiptDriver {
 	if provider, ok := t.Transport.(TerminalReceiptProvider); ok {
 		return provider.TerminalReceiptDriver()
@@ -564,6 +580,7 @@ func (t *ownedTransport) TerminalReceiptDriver() TerminalReceiptDriver {
 	return nil
 }
 
+// minTime preserves the earlier absolute deadline without renewing either budget.
 func minTime(a, b time.Time) time.Time {
 	if a.Before(b) {
 		return a
@@ -588,15 +605,20 @@ func (w *hostWriter) fence() <-chan struct{} {
 	w.mu.Lock()
 	w.fenced = true
 	w.accepting = false
-	for len(w.frames) > 0 {
-		frame := <-w.frames
-		w.count--
-		w.bytes -= len(frame)
-		if w.count == 0 {
-			close(w.idle)
+	for {
+		select {
+		case frame := <-w.frames:
+			w.count--
+			w.bytes -= len(frame)
+			if w.count == 0 {
+				close(w.idle)
+			}
+		default:
+			// The writer may have removed the last frame before acquiring mu.
+			// It retains that frame's charge until it can finish/discard it.
+			idle := w.idle
+			w.mu.Unlock()
+			return idle
 		}
 	}
-	idle := w.idle
-	w.mu.Unlock()
-	return idle
 }

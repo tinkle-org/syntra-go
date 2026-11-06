@@ -110,6 +110,7 @@ func (a *fixtureAuthority) Observe(ctx context.Context, transition syntra.Termin
 	return syntra.TerminalObservation{State: syntra.TerminalOwnedCommitted, Transition: *a.owner, Revision: 2}, nil
 }
 
+// lookup rejects fresh Returning handshakes once the fixture transition is recorded.
 func (a *fixtureAuthority) lookup(ctx context.Context, c securechannel.Context) (securechannel.Key, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -132,6 +133,7 @@ func emit(value any) {
 	}
 }
 
+// main validates finite loopback provisioning before starting either fixture role.
 func main() {
 	mode := flag.String("mode", "client", "server or client; static fixture provisioning only")
 	address := flag.String("addr", "127.0.0.1:7443", "explicit loopback TCP address")
@@ -173,9 +175,9 @@ func main() {
 	defer cancel()
 	switch *mode {
 	case "server":
-		err = serve(ctx, *address, *connections, *drop, *scenario, static)
+		err = serve(ctx, endpoint.String(), *connections, *drop, *scenario, static)
 	case "client":
-		err = call(ctx, *address, *payload, *scenario, *probe, static)
+		err = call(ctx, endpoint.String(), *payload, *scenario, *probe, static)
 	default:
 		err = errors.New("mode must be server or client")
 	}
@@ -311,6 +313,7 @@ type dropConn struct {
 	writes int
 }
 
+// Write fails the receipt prefix after M2 and Ready have each written two units.
 func (c *dropConn) Write(p []byte) (int, error) {
 	c.writes++
 	if c.writes != 5 {

@@ -90,6 +90,7 @@ func (t *Transport) BeginTerminal(ctx context.Context, p *syntra.TerminalPermit)
 	return nil
 }
 
+// channelIdentity maps confirmed peer evidence without inferring an RPC principal.
 func channelIdentity(p securechannel.Peer) syntra.ChannelIdentity {
 	c := p.Context
 	return syntra.ChannelIdentity{Mode: c.Mode.String(), Carrier: c.Carrier.String(), Scope: c.Scope, Handle: c.Handle, Epoch: c.Epoch, Principal: p.Principal}
@@ -133,6 +134,8 @@ func (t *Transport) SendTerminal(ctx context.Context, p *syntra.TerminalPermit) 
 		return ErrProtocol
 	}
 	until := t.operationDeadline(t.opts.WriteTimeout)
+	ctx, cancel := elapsedContext(ctx, t.channel.Clock(), until)
+	defer cancel()
 	if err := t.checkPeerMode(ctx, until, false, true, nil); err != nil {
 		return err
 	}

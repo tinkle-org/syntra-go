@@ -16,16 +16,19 @@ import (
 	"github.com/tinkle-org/syntra-go/transport/tcp"
 )
 
+// terminalAuthority models a volatile conditional transaction and fresh read hooks.
 type terminalAuthority struct {
-	mu          sync.Mutex
-	committed   *syntra.TerminalTransition
-	revoked     *atomic.Bool
-	commits     atomic.Int32
-	ownedReads  atomic.Int32
-	afterCommit func(context.Context)
-	observation func(syntra.TerminalObservation) (syntra.TerminalObservation, error)
+	mu                 sync.Mutex
+	committed          *syntra.TerminalTransition
+	revoked            *atomic.Bool
+	commits            atomic.Int32
+	ownedReads         atomic.Int32
+	afterCommit        func(context.Context)
+	observation        func(syntra.TerminalObservation) (syntra.TerminalObservation, error)
+	contextObservation func(context.Context, syntra.TerminalObservation) (syntra.TerminalObservation, error)
 }
 
+// Commit atomically records exact ownership and withdraws ordinary Returning access.
 func (a *terminalAuthority) Commit(ctx context.Context, transition syntra.TerminalTransition) error {
 	a.mu.Lock()
 	if ctx.Err() != nil || a.committed != nil || transition.ExpectedRevision != 1 {
@@ -42,6 +45,7 @@ func (a *terminalAuthority) Commit(ctx context.Context, transition syntra.Termin
 	return nil
 }
 
+// Observe snapshots authority state before applying an optional controlled fault.
 func (a *terminalAuthority) Observe(ctx context.Context, transition syntra.TerminalTransition) (syntra.TerminalObservation, error) {
 	a.mu.Lock()
 	if ctx.Err() != nil {
@@ -59,6 +63,9 @@ func (a *terminalAuthority) Observe(ctx context.Context, transition syntra.Termi
 	observation = syntra.TerminalObservation{State: syntra.TerminalOwnedCommitted, Transition: *a.committed, Revision: 2}
 	a.mu.Unlock()
 	a.ownedReads.Add(1)
+	if a.contextObservation != nil {
+		return a.contextObservation(ctx, observation)
+	}
 	if a.observation != nil {
 		return a.observation(observation)
 	}

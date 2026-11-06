@@ -1,3 +1,4 @@
+// File listener.go owns managed stream listeners, admission and session teardown.
 package network
 
 import (
@@ -251,6 +252,8 @@ func (l *Listener) notify(principal string, payload []byte) error {
 	return errors.Join(errs...)
 }
 
+// run owns socket acceptance and FIFO admission through each session's joined
+// teardown, publishing waiters only after their shared admission position exists.
 func (l *Listener) run() {
 	failed := false
 	closed := make(chan struct{})
@@ -345,16 +348,21 @@ func (l *Listener) run() {
 			return
 		}
 		attempt, cancel := budget.Context(epoch)
-		l.mu.Lock()
-		l.status.WaitingAdmission++
-		l.mu.Unlock()
-		release, err := l.network.admission.acquire(attempt)
+		waiting := false
+		release, err := l.network.admission.acquireTracked(attempt, func() {
+			l.mu.Lock()
+			l.status.WaitingAdmission++
+			waiting = true
+			l.mu.Unlock()
+		})
 		var releaseExtra func()
 		if err == nil && l.cfg.Admission != nil && l.cfg.Admission != l.network.admission {
 			releaseExtra, err = l.cfg.Admission.acquire(attempt)
 		}
 		l.mu.Lock()
-		l.status.WaitingAdmission--
+		if waiting {
+			l.status.WaitingAdmission--
+		}
 		l.mu.Unlock()
 		if err != nil || attempt.Err() != nil {
 			terminal := err != nil && attempt.Err() == nil && epoch.Err() == nil

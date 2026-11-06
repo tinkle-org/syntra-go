@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Default-disabled scoped terminal receipts through `HostConfig.TerminalMethods`
+  and `ordered.Options.EnableTerminalReceipts`; both opt-ins are required.
+  `CompleteTerminalReceipt` coordinates fencing, the full-frame barrier, a
+  conditional `TerminalAuthority.Commit`, fresh typed observations, and one fixed
+  correlated result before retirement. Success means complete local writing, not
+  peer receipt or joined cleanup; loss is unknown and never automatically replayed.
+- Root Host + ordered/TCP support, including connection ownership/readiness
+  wrappers. Recovery-enabled Go hosts, raw drivers, other stock carriers, and
+  uncoordinated custom paths refuse before mutation. Ordinary withdrawal defaults
+  and wire messages are unchanged. See [usage and limits](TERMINAL_RECEIPT_DESIGN.md)
+  and the [manual release/consumer handoff](TERMINAL_RECEIPT_HANDOFF.md).
+
 ## 1.0.0-rc.1 (2026-11-05)
 
 ## What's Changed

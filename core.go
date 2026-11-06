@@ -1,3 +1,4 @@
+// File core.go implements socket-free client and host protocol state machines.
 package syntra
 
 import (
@@ -357,16 +358,17 @@ const hostNotificationBacklogBytes = 8 * MaxFrameBytes
 
 // goHostCore is the pure-Go responder core for one connection.
 type goHostCore struct {
-	mu          sync.Mutex
-	cfg         resolvedHostConfig
-	conn        *Connection
-	negotiated  uint32
-	active      bool
-	closed      bool
-	highwater   uint64
-	pending     []pendingReq
-	outstanding map[uint64]*hostCall
-	outbound    [][]byte
+	mu             sync.Mutex
+	cfg            resolvedHostConfig
+	conn           *Connection
+	negotiated     uint32
+	active         bool
+	closed         bool
+	highwater      uint64
+	pending        []pendingReq
+	outstanding    map[uint64]*hostCall
+	outbound       [][]byte
+	terminalFenced bool // preserve validation/control, never admit new protected work
 }
 
 func (g *goHostCore) acceptHello(frame []byte) (uint32, error) {
@@ -468,6 +470,8 @@ func (g *goHostCore) onFrameAt(frame []byte, receivedAt time.Time) ([][]byte, []
 // onRequestLocked validates one request and either queues it for
 // dispatch or answers it immediately with a terminal error. Callers MUST
 // hold g.mu.
+// onRequestLocked validates monotonic requests, preserving replay rejection even
+// while terminal fencing suppresses admission. The caller holds g.mu.
 func (g *goHostCore) onRequestLocked(f *Frame, receivedAt time.Time) *RpcError {
 	id := f.GetRequestId()
 	if id <= g.highwater {
@@ -476,6 +480,14 @@ func (g *goHostCore) onRequestLocked(f *Frame, receivedAt time.Time) *RpcError {
 		return NewRpcError(ErrorCodeFailedPrecondition, "syntra: non-increasing request_id")
 	}
 	g.highwater = id
+	if g.terminalFenced {
+		// Continue protocol validation without creating pending work, output or
+		// correlation capacity. A fence must not hide fatal replay/framing errors.
+		if req := f.GetRequest(); req == nil || ValidateMethod(req.GetMethod()) != nil || ValidatePayloadSize(len(req.GetPayload())) != nil {
+			return NewRpcError(ErrorCodeInvalidArgument, "syntra: invalid request during retirement")
+		}
+		return nil
+	}
 	if len(g.outbound)+len(g.outstanding) >= g.cfg.writerCapacity+g.cfg.maxPending {
 		return NewRpcError(ErrorCodeResourceExhausted, "syntra: terminal output capacity exhausted")
 	}
@@ -571,11 +583,15 @@ func (g *goHostCore) answer(requestID uint64, result *RpcResult) ([]byte, bool, 
 	return raw, false, nil
 }
 
+// notify snapshots ordinary notification output unless the connection is fenced.
 func (g *goHostCore) notify(payload []byte) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.closed {
 		return NewRpcError(ErrorCodeFailedPrecondition, "syntra: host closed")
+	}
+	if g.terminalFenced {
+		return nil
 	}
 	if !g.active {
 		return NewRpcError(ErrorCodeFailedPrecondition, "syntra: notify before handshake completed")
@@ -672,6 +688,24 @@ func (g *goHostCore) callDeadline(id uint64) (time.Time, bool) {
 		return time.Time{}, false
 	}
 	return call.deadline, true
+}
+
+// terminalPending excludes cancellation, expiry, and already-selected outcomes.
+func (g *goHostCore) terminalPending(id uint64) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	call := g.outstanding[id]
+	return !g.closed && call != nil && call.selected == nil && !call.cancelled && time.Now().Before(call.deadline)
+}
+
+// fenceTerminal suppresses unstarted core output and request admission while
+// retaining existing first-terminal state and fatal protocol validation.
+func (g *goHostCore) fenceTerminal() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.terminalFenced = true
+	g.pending = nil
+	g.outbound = nil
 }
 
 func (g *goHostCore) close() error {

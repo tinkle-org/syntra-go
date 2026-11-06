@@ -38,14 +38,18 @@ type MessageIO interface {
 // MaxPending includes the active operation in each direction (default 32,
 // maximum 1024). Admission beyond that limit fails immediately with ErrBusy.
 type Options struct {
-	AttemptTimeout   time.Duration
-	HandshakeTimeout time.Duration
-	WriteTimeout     time.Duration
-	FrameTimeout     time.Duration
-	RecordTimeout    time.Duration
-	Lifetime         time.Duration
-	MaxPending       int
-	Budget           *EstablishmentBudget
+	// EnableTerminalReceipts opts this driver into request-owned retirement.
+	// The host must also configure method policies and the carrier must explicitly
+	// support coordinated terminal I/O. Zero/default remains disabled.
+	EnableTerminalReceipts bool
+	AttemptTimeout         time.Duration
+	HandshakeTimeout       time.Duration
+	WriteTimeout           time.Duration
+	FrameTimeout           time.Duration
+	RecordTimeout          time.Duration
+	Lifetime               time.Duration
+	MaxPending             int
+	Budget                 *EstablishmentBudget
 }
 
 func (o Options) Normalize() (Options, error) {
@@ -237,6 +241,8 @@ type Transport struct {
 	identity                                          securechannel.VerifiedIdentity
 	peer                                              securechannel.Peer
 	identitySet                                       bool
+	terminalPermit                                    *syntra.TerminalPermit
+	terminalWake                                      chan struct{}
 
 	ctx             context.Context
 	cancel          context.CancelFunc
@@ -259,10 +265,12 @@ type Transport struct {
 var _ syntra.Transport = (*Transport)(nil)
 var _ syntra.ChannelIdentityProvider = (*Transport)(nil)
 
+// newTransport creates the sole record/nonce owner and starts bounded supervision.
 func newTransport(carrier MessageIO, ch *securechannel.Channel, cfg *securechannel.ServerConfig, o Options) *Transport {
 	ctx, cancel := context.WithCancel(context.Background())
 	t := &Transport{io: carrier, channel: ch, server: cfg, opts: o, ctx: ctx, cancel: cancel,
-		peerGate: make(chan struct{}, 1), peerRequired: cfg != nil,
+		terminalWake: make(chan struct{}, 1),
+		peerGate:     make(chan struct{}, 1), peerRequired: cfg != nil,
 		done: make(chan struct{}), carrierStopped: make(chan struct{}), stopped: make(chan struct{}), lifetimeStopped: make(chan struct{}), clockStopped: make(chan struct{}), confirm: make(chan struct{}),
 		sendGate: make(chan struct{}, 1), recvGate: make(chan struct{}, 1),
 		sendAdmission: make(chan struct{}, o.MaxPending), recvAdmission: make(chan struct{}, o.MaxPending),
@@ -302,6 +310,8 @@ func (t *Transport) abort(cause ...error) {
 	t.retire(err, false)
 }
 
+// retire stops admission and carrier I/O, retiring terminal crypto before joining
+// admitted operations; scratch remains owned until those operations exit.
 func (t *Transport) retire(err error, local bool) {
 	if err != nil {
 		err = publicError(context.Background(), err)
@@ -319,9 +329,18 @@ func (t *Transport) retire(err error, local bool) {
 		return
 	}
 	t.closed = true
+	permit := t.terminalPermit
+	if permit != nil {
+		permit.Fail(err)
+	}
 	close(t.done)
 	t.cancel()
 	t.mu.Unlock()
+	// A terminal operation can outlive close. Retire cipher state now rather
+	// than waiting for its authority callback; scratch remains owned until join.
+	if permit != nil {
+		t.channel.Close()
+	}
 	go func() {
 		defer close(t.carrierStopped)
 		_ = t.io.Close()
@@ -413,6 +432,7 @@ func (t *Transport) CloseContext(ctx context.Context) error {
 	}
 }
 
+// supervise checks idle authority and joins all owners before clearing scratch.
 func (t *Transport) supervise() {
 	defer close(t.stopped)
 	defer func() {
@@ -449,6 +469,8 @@ func (t *Transport) supervise() {
 		case <-confirm:
 			confirm = nil
 			active = t.server != nil
+		case <-t.terminalWake:
+			tick.Reset(10 * time.Millisecond)
 		case <-tick.C:
 			if active {
 				if err := t.checkPeer(t.ctx, t.operationDeadline(time.Second), false); err != nil {
@@ -511,6 +533,15 @@ func (t *Transport) peerReady() bool {
 // Serialize callbacks across delivery, writes and idle supervision. The first
 // check belongs to Recv, before it exposes the complete initial frame.
 func (t *Transport) checkPeer(parent context.Context, until time.Duration, initial bool) (err error) {
+	return t.checkPeerMode(parent, until, initial, false, nil)
+}
+
+// checkPeerMode is the sole authority classifier for delivery, send and idle
+// supervision. Once fenced there is NO ordinary traffic permission, including
+// while Active. The explicit terminal observer covers the whole binding, avoiding
+// a generic lookup racing an owned commit between two reads. Ordinary connections
+// retain their unchanged fail-closed current-key lookup path.
+func (t *Transport) checkPeerMode(parent context.Context, until time.Duration, initial, requireCommit bool, handoff func() error) (err error) {
 	if !t.peerRequired {
 		return nil
 	}
@@ -537,12 +568,20 @@ func (t *Transport) checkPeer(parent context.Context, until time.Duration, initi
 		return securechannel.ErrAuth
 	}
 	t.mu.Lock()
-	id, ok := t.identity, t.identitySet
+	id, ok, permit := t.identity, t.identitySet, t.terminalPermit
 	t.mu.Unlock()
 	if !ok {
 		return securechannel.ErrAuth
 	}
-	err = t.server.CheckIdentity(ctx, id)
+	if permit != nil {
+		_, err = permit.Observe(ctx, requireCommit)
+		if err != nil {
+			return securechannel.ErrAuth
+		}
+	}
+	if permit == nil {
+		err = t.server.CheckIdentity(ctx, id)
+	}
 	if timeErr := t.checkOperation(ctx, until); timeErr != nil {
 		return timeErr
 	}
@@ -552,6 +591,12 @@ func (t *Transport) checkPeer(parent context.Context, until time.Duration, initi
 	t.mu.Lock()
 	t.peerAuthorized = true
 	t.mu.Unlock()
+	// Consume while still holding the observation gate: no earlier observer can
+	// be halfway through publishing a denial at this local linearization point.
+	// The callback is prompt, local bookkeeping only; it never performs carrier I/O.
+	if handoff != nil {
+		return handoff()
+	}
 	return nil
 }
 
@@ -662,6 +707,12 @@ func (t *Transport) Send(ctx context.Context, frame []byte) error {
 		return err
 	}
 	defer release()
+	t.mu.Lock()
+	terminal := t.terminalPermit != nil
+	t.mu.Unlock()
+	if terminal {
+		return ErrClosed
+	}
 	if err := t.checkOperation(ctx, until); err != nil {
 		t.abort(err)
 		return err
@@ -711,6 +762,12 @@ func (t *Transport) Send(ctx context.Context, frame []byte) error {
 // Ping invokes an optional carrier control ping. It shares bounded writer
 // admission with Send, and requires a concurrent Recv to process pong replies.
 func (t *Transport) Ping(ctx context.Context) error {
+	t.mu.Lock()
+	terminal := t.terminalPermit != nil
+	t.mu.Unlock()
+	if terminal {
+		return ErrClosed
+	}
 	p, ok := t.io.(interface{ Ping(context.Context) error })
 	if !ok {
 		return ErrOptions
@@ -723,6 +780,12 @@ func (t *Transport) Ping(ctx context.Context) error {
 		return err
 	}
 	defer release()
+	t.mu.Lock()
+	terminal = t.terminalPermit != nil
+	t.mu.Unlock()
+	if terminal {
+		return ErrClosed
+	}
 	if err := t.checkOperation(ctx, until); err != nil {
 		t.abort(err)
 		return err

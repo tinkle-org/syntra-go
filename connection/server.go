@@ -1,3 +1,4 @@
+// File server.go owns encrypted responder sessions and their bounded lifecycle.
 package connection
 
 import (
@@ -91,6 +92,11 @@ type readyTransport struct {
 	phaseOnce sync.Once
 	phase     chan context.Context
 	stopPhase context.CancelFunc
+}
+
+// TerminalReceiptDriver forwards to the same ordered owner, never a new permit.
+func (t *readyTransport) TerminalReceiptDriver() syntra.TerminalReceiptDriver {
+	return t.Transport.TerminalReceiptDriver()
 }
 
 func (t *readyTransport) Recv(ctx context.Context) ([]byte, error) {
@@ -231,6 +237,14 @@ type ownedCarrier struct {
 func (c *ownedCarrier) Close() error {
 	c.once.Do(func() { c.err = c.MessageIO.Close() })
 	return c.err
+}
+
+// SupportsTerminalReceipt preserves only the underlying carrier's explicit opt-in.
+func (c *ownedCarrier) SupportsTerminalReceipt() bool {
+	if provider, ok := c.MessageIO.(interface{ SupportsTerminalReceipt() bool }); ok {
+		return provider.SupportsTerminalReceipt()
+	}
+	return false
 }
 
 func (s *Server) initiateClose() {

@@ -1,3 +1,4 @@
+// File http.go composes native HTTP associations with managed network ownership.
 package network
 
 import (
@@ -243,6 +244,8 @@ func (l *HTTPListener) allowedLocked() bool {
 	return !l.stopped && !l.paused && !l.networkPaused && l.online && !l.networkOffline
 }
 
+// admit reserves one shared lease for the native association's full lifetime.
+// WaitingAdmission is published only once a FIFO position or slot is owned.
 func (l *HTTPListener) admit(ctx context.Context, budget *ordered.EstablishmentBudget) (func(), error) {
 	l.mu.Lock()
 	if !l.allowedLocked() {
@@ -250,22 +253,29 @@ func (l *HTTPListener) admit(ctx context.Context, budget *ordered.EstablishmentB
 		return nil, ErrClosed
 	}
 	revision, epoch := l.revision, l.epoch
-	l.status.WaitingAdmission++
 	l.mu.Unlock()
-	l.network.signal()
 	attempt, cancel := budget.Context(ctx)
 	stop := context.AfterFunc(epoch, cancel)
 	if epoch.Err() != nil {
 		cancel()
 	}
-	release, err := l.network.admission.acquire(attempt)
+	waiting := false
+	release, err := l.network.admission.acquireTracked(attempt, func() {
+		l.mu.Lock()
+		l.status.WaitingAdmission++
+		waiting = true
+		l.mu.Unlock()
+		l.network.signal()
+	})
 	if err == nil {
 		err = budget.Check()
 	}
 	stop()
 	cancel()
 	l.mu.Lock()
-	l.status.WaitingAdmission--
+	if waiting {
+		l.status.WaitingAdmission--
+	}
 	if err == nil && (l.revision != revision || !l.allowedLocked()) {
 		err = ErrClosed
 	}

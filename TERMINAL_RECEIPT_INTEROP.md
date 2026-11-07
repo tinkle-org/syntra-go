@@ -1,8 +1,124 @@
 # Cross-language TCP receipt fixture evidence
 
-## Review rerun
+## Request-wide deadline regression matrix
 
-The current review matrix is archived under
+The `feat/request-wide-deadlines` fixture adds six **direct TCP** cases to the
+unchanged fourteen baseline direction/scenario/network combinations (20 distinct
+cases total). Each added scenario runs Go host / Rust client and Rust host / Go
+client against the working-tree SDK APIs; Rust is the contract source of truth.
+
+| Scenario | Peer timeout | Host cap | Required outcome |
+|---|---|---|---|
+| `budget-cap` | 120 s | 1.5 s | Exact fixed `retired` receipt |
+| `budget-short` | 1 s | 1.5 s | Exact fixed `retired` receipt; cap must not extend the shorter peer allowance |
+| `budget-late` | 120 s | 600 ms | Retained commit finishes after cutoff; typed failure and zero receipts |
+
+The selector records only input-validity and cap metrics. Authorization remains
+prompt and nonblocking, including Rust's synchronous hook. A cooperative 200 ms
+handler delay spends the original allowance; measured authorization/handler/
+commit budgets must keep the selected cutoff rather than restart it. Authority
+reads must expose an actual live SDK budget, bounded by the original request and
+the configured read timeout (Go: 20 ms; Rust: 100 ms). Any positive read allowance
+up to that limit is valid; a prior freshness cutoff can shorten it further. The
+fixture measures the SDK budget itself, never a context-deadline substitute.
+Every measured callback requires `sdk_budget_present: true`; absence, malformed
+evidence, or a legacy `refresh` phase fails validation. Go also checks that the
+observation context deadline does not extend the supplied SDK cutoff.
+
+The Go SDK's earlier periodic-observation budget-propagation limitation is now
+fixed: periodic driver observations also carry `RequestBudgetFromContext` with
+the derived read cutoff. Both SDKs supply the original operation cutoff to
+commit, excluding the teardown tail. The validator derives that tail from the
+remaining allowance at reservation (one quarter, capped at 250 ms), permitting
+50 ms measurement/scheduling slack rather than a fresh per-phase allowance.
+No assertion depends on an exact network error arrival time.
+
+`budget-late` is an explicit **test-only uncooperative adapter contract violation**:
+admitted external commit work ignores cancellation, retains its execution charge,
+and finishes 250 ms after its supplied budget expires. This does not block the
+authorizer. The validator requires an expired retained-work marker, the actual
+late transition, callback return before joined connection closure, and no receipt.
+It additionally requires exactly one `commit_pending` admission marker and at
+least one live SDK-budgeted `observe` event strictly after that marker and before
+`late_commit`. Initial reservation reads, reads after the delayed mutation, and
+reads after callback return cannot satisfy this event-range proof. The range is
+opened by the actual commit callback in each fixture; neither poll count nor
+exact network-error timing is prescribed.
+The fresh no-RPC Returning probe waits for that transition before attempting
+authentication; all six cases still require one commit, one handler, one actual
+fresh denial, and two joined connection closures. This demonstrates neither
+rollback on timeout nor production storage durability.
+
+Use the reproduction commands below with a **new external output directory**.
+The harness report now requires all 20 cases and stable before/after source
+manifests. Historical fourteen-case results below remain historical; they do not
+establish outcomes for these added scenarios. No binaries or large source
+manifests need to be archived into either repository. These are bounded volatile
+application fixtures, not formal conformance or production application acceptance.
+
+### Latest strict final-run evidence and retained history
+
+Portable report location for each selected output directory (local artifacts, not
+a repository archive):
+
+`<output>/report.json`
+
+The same directory holds `SHA256SUMS`, per-case logs/results, binaries and source
+manifests. The report's `complete`, `source_stable`, counts and before/after hashes
+are authoritative; verify artifact bytes with `shasum -a 256 -c SHA256SUMS` from
+that directory. Source edits after a run require another new output directory.
+
+**Latest: `terminal-request-budget-20261107-run4`**, started
+2026-11-07 18:48:00 UTC: **20/20 PASS**, zero failures, `complete: true`,
+`source_stable: true`. All **31 Python test methods** passed, including the
+initial-reads-only negative regression added for the P2 review finding. Both
+late-case logs contain SDK-budgeted reads inside the explicit pending-commit
+range. The actual working-tree builds used Go 1.26.10 and Rust 1.88.0 `--locked`.
+Every artifact in `<output>/SHA256SUMS` was verified successfully.
+
+Run4 exact SHA-256 provenance:
+
+| Artifact | SHA-256 |
+|---|---|
+| `report.json` | `85546c02148bbcefb0b4cf70c4c181735dc8889d3efaea9924b52b53047b679b` |
+| Go working tree, before = after | `b57ae3b1df6bf5859bf558e80175ea9d6d7b2bba38eab994a277a3d085c2984c` |
+| Rust working tree, before = after | `705506544d4cf2976e0f3aa95650789fe20bc4a465dbc44de8bf3fcaf1d66f6b` |
+
+This run4 result/provenance entry and subsequent editorial SDK documentation
+updates were recorded **after** execution and are not part of its captured source
+hashes. Fixture, harness and runtime sources were not edited afterward. The stable
+hashes describe the captured run, not the subsequently updated documentation.
+
+The recorded working-tree runs remain unchanged in separately named output
+directories. Hashes identify each run's captured snapshots, not the current
+checkout; later source/doc edits cannot retroactively regenerate an old result.
+
+- `terminal-request-budget-20261107-run1`: **19/20**, stable sources, incomplete.
+  Its Go-host late case exposed missing SDK budgets on periodic driver reads.
+- `terminal-request-budget-20261107-run2`: **20/20**, stable sources, complete
+  under the then-current validator, which explicitly allowed separately labelled
+  bounded refresh contexts without the SDK value. That exception is now removed;
+  run2 is not evidence that the new strict per-callback requirement passed.
+- `terminal-request-budget-20261107-run3`: **20/20**, stable sources, complete;
+  all **30 Python test methods** passed. It required the SDK budget on every
+  measured callback but did not require a read inside an explicit pending-commit
+  event range. The later P2 validator regression closes that coverage gap;
+  run3 is not relabelled as evidence of the new range assertion.
+
+Run3 exact SHA-256 provenance:
+
+| Artifact | SHA-256 |
+|---|---|
+| `report.json` | `fb4c574243ce33e12bb5592e833a179da583022fccd370176165708bf7726604` |
+| Go working tree, before = after | `227ad6f7ae68d11c48f2d45b1a42fc5f016d828d9e3419629a2456ac9b758673` |
+| Rust working tree, before = after | `df5a5147fc3c84338521ebf0bc0c5c007db2baec8458a4802909dd0ebbe02cda` |
+
+These request-budget runs are distinct from the older fourteen-case receipt
+archives below. No old failures or results have been relabelled.
+
+## Historical 2026-11-06 review rerun
+
+The 2026-11-06 review matrix is archived under
 [`docs/evidence/terminal-receipt-review-20261106-r4/`](docs/evidence/terminal-receipt-review-20261106-r4/):
 [`report.json`](docs/evidence/terminal-receipt-review-20261106-r4/report.json),
 [`SHA256SUMS`](docs/evidence/terminal-receipt-review-20261106-r4/SHA256SUMS), and
@@ -12,8 +128,8 @@ retained; binaries are omitted. Verify retained bytes using the instructions in
 the [archive index](docs/evidence/README.md). These relative links become hosted
 only when the maintainer commits and publishes the files.
 
-This is a new execution against the review fixes, not a reconstruction of the
-unavailable historical run-2. It uses the current **18 harness tests**, including
+That was a new execution against the review fixes, not a reconstruction of the
+unavailable historical run-2. It used **18 harness tests** at that revision, including
 stdout-drain, cleanup-failure, refused local-write, process-group exit-race, and
 archive integrity regressions. A Go-server deny/unknown outcome additionally
 requires exactly one `local_write` event with `complete: false`; partial-loss
@@ -124,8 +240,8 @@ Three subsequent orchestration regressions brought that suite to **twelve**;
 they ensure the fresh no-RPC probe starts after the result is observed but before
 client/proxy cleanup can consume the server's accept window. The run-2
 `unit-tests.stderr.log` was recorded as `Ran 8 tests`; its historical count and
-hashes are not changed retroactively. Six review regressions bring the latest
-suite to **eighteen**, as recorded by the new archive.
+hashes are not changed retroactively. Six review regressions brought the
+2026-11-06 review-rerun suite to **eighteen**, as recorded by that archive.
 
 An earlier retained `run1` reported 8/14 PASS: six proxy cases failed the harness's
 incorrect expectation of four client records. Actual fixture traffic is three

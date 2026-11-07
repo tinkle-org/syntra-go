@@ -119,6 +119,66 @@ receive a context bounded by the call budget and must stop and join their own
 work when it ends. Return `NewSuccessResult` for success or a typed `RpcError`
 with safe public text for a method failure.
 
+### Optional request-wide host cap
+
+`HostConfig.RequestBudget` is an optional `RequestBudgetFunc`:
+
+```go
+func(principal, method string, payload []byte) (time.Duration, bool)
+```
+
+It runs for live application requests after envelope/method/payload bounds and
+before `Authorize`, outside protocol locks and raw I/O. It must be pure, prompt,
+bounded and concurrency-safe;
+do not perform authorization, storage or network work. Payload is untrusted opaque
+borrowed data: do not mutate or retain it. Built-in `RecoveryMethodPrefix` routes
+skip this application selector and retain their original read-only budget and
+trusted-clock enforcement. Already-expired or invalid original budgets also skip
+the selector; application policy cannot rescue them. The SDK has no
+application-specific method names, payload schema, or terminal-operation duration
+built in.
+
+Returning `false` leaves timeout selection unchanged; nil disables selection.
+Returning `true` selects a cap measured from **original complete-frame receipt**,
+including receive-queue time, selector execution and initial authorization. Zero
+expires immediately; a negative duration (including negative arithmetic overflow)
+fails closed without authorization. Larger caps never extend the peer timeout,
+default timeout, `MaxTimeout`, or an earlier serving-context deadline. Duration
+addition against the trusted elapsed origin is checked for overflow. The core's
+expiry/cancel/result decisions and callback context share the selected deadline.
+There is no timer reset at handler or terminal reservation entry. Missing
+`Authorize` still denies every method, and built-in recovery keeps its normal
+authorization and routing.
+
+`RequestBudgetFromContext(ctx) (RequestBudget, bool)` exposes read-only SDK timing
+to authorizers, handlers and terminal authority adapters. `Deadline()` returns the
+selected Go deadline; `Remaining()` and `Err()` also check trusted elapsed time
+when the driver supplies `TerminalReceiptDriver.TerminalClock`. The clock's age
+is captured at frame receipt before queueing or authorization, so time spent
+suspended is not forgiven at terminal reservation. Discontinuity, regression and
+invalid elapsed arithmetic fail closed. Drivers without that clock retain normal
+context/wall timing; this does not grant unsupported terminal receipt capability.
+Ordinary expiry cancellation is supervised at the existing 10-ms pump cadence;
+callback boundaries and terminal decisions check the budget independently.
+
+Adapters must honor their callback context as well as this SDK budget: a child
+context or an individual observation can have an earlier deadline. Timeout does
+not undo durable external work. Noncooperative callbacks retain their execution
+charges until actual return and cannot restore expired receipt eligibility.
+
+Every terminal authority callback, including periodic driver refresh observations
+whose parent has no request values, receives a derived SDK budget. Commit's
+budget excludes the teardown tail. Observe's budget is additionally clamped by
+the per-read timeout and any earlier parent context/budget. Its `Deadline()`
+matches the actual callback context deadline; both reflect the permit's wall and
+trusted elapsed cutoffs immediately, rather than relying only on later watchdog
+polling. Derivation retains the original clock origin and never extends an
+absolute elapsed cutoff. Legacy/manual permits without a captured request budget
+derive directly from their actual absolute permit cutoffs.
+
+This adds a field to exported `HostConfig`; use keyed composite literals.
+Downstream unkeyed literals can require a source update.
+
 `Host.NotifyDirected` targets all connections of a principal. `Host.NotifyAll`
 broadcasts to active connections. Successful enqueue is not a delivery
 acknowledgement. Running clients receive live updates automatically through
@@ -150,7 +210,7 @@ for authority evidence, the 1024-byte complete-frame limit, deadline/teardown
 budgets, and last-observation race. Existing clients parse the same `RpcResult`;
 there is no new wire message or peer option. Ordinary withdrawal and
 `Host.DisconnectPrincipal` are unchanged. The
-[14-case bidirectional fixture report](TERMINAL_RECEIPT_INTEROP.md) is bounded SDK
+[20-case bidirectional fixture report](TERMINAL_RECEIPT_INTEROP.md) is bounded SDK
 evidence, not production durability or application acceptance. See the
 [handoff](TERMINAL_RECEIPT_HANDOFF.md) for manual merge/release and consumer order.
 

@@ -345,6 +345,8 @@ func (g *goClientCore) close() error {
 // hostCall is one outstanding responder-side call.
 type hostCall struct {
 	deadline  time.Time
+	receipt   requestReceipt // complete-frame origin, retained across dispatch delay
+	budget    *RequestBudget // selected before authorization; immutable thereafter
 	cancelled bool
 	selected  *RpcResult
 }
@@ -423,6 +425,11 @@ func (g *goHostCore) onFrame(frame []byte) ([][]byte, []uint64, *RpcError) {
 }
 
 func (g *goHostCore) onFrameAt(frame []byte, receivedAt time.Time) ([][]byte, []uint64, *RpcError) {
+	return g.onFrameReceipt(frame, requestReceipt{at: receivedAt})
+}
+
+// onFrameReceipt retains original trusted timing while validating the envelope.
+func (g *goHostCore) onFrameReceipt(frame []byte, receipt requestReceipt) ([][]byte, []uint64, *RpcError) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.closed {
@@ -449,7 +456,7 @@ func (g *goHostCore) onFrameAt(frame []byte, receivedAt time.Time) ([][]byte, []
 	}
 	switch BodyKindOf(f) {
 	case BodyKindRequest:
-		return nil, nil, g.onRequestLocked(f, receivedAt)
+		return nil, nil, g.onRequestLocked(f, receipt)
 	case BodyKindCancel:
 		id := f.GetRequestId()
 		if call, ok := g.outstanding[id]; ok {
@@ -472,7 +479,7 @@ func (g *goHostCore) onFrameAt(frame []byte, receivedAt time.Time) ([][]byte, []
 // hold g.mu.
 // onRequestLocked validates monotonic requests, preserving replay rejection even
 // while terminal fencing suppresses admission. The caller holds g.mu.
-func (g *goHostCore) onRequestLocked(f *Frame, receivedAt time.Time) *RpcError {
+func (g *goHostCore) onRequestLocked(f *Frame, receipt requestReceipt) *RpcError {
 	id := f.GetRequestId()
 	if id <= g.highwater {
 		g.active = false
@@ -499,7 +506,7 @@ func (g *goHostCore) onRequestLocked(f *Frame, receivedAt time.Time) *RpcError {
 	if budget > g.cfg.maxTimeout {
 		budget = g.cfg.maxTimeout
 	}
-	deadline := receivedAt.Add(budget)
+	deadline := receipt.at.Add(budget)
 	fail := func(code ErrorCode, msg string) *RpcError {
 		if !time.Now().Before(deadline) {
 			code, msg = ErrorCodeDeadlineExceeded, "syntra: deadline exceeded"
@@ -525,7 +532,7 @@ func (g *goHostCore) onRequestLocked(f *Frame, receivedAt time.Time) *RpcError {
 	if len(g.outstanding) >= g.cfg.maxPending {
 		return fail(ErrorCodeResourceExhausted, "syntra: too many concurrent RPCs")
 	}
-	g.outstanding[id] = &hostCall{deadline: deadline}
+	g.outstanding[id] = &hostCall{deadline: deadline, receipt: receipt}
 	g.pending = append(g.pending, pendingReq{id: id, req: req})
 	return nil
 }
@@ -643,7 +650,7 @@ func (g *goHostCore) reapExpired(now time.Time) []uint64 {
 		if call.selected != nil {
 			continue
 		}
-		if !now.Before(call.deadline) {
+		if !now.Before(call.deadline) || call.budget != nil && call.budget.Err() != nil {
 			expired = append(expired, id)
 		}
 	}
@@ -674,7 +681,7 @@ func (g *goHostCore) selectResultLocked(call *hostCall, result *RpcResult) {
 	if call.selected != nil {
 		return
 	}
-	if !time.Now().Before(call.deadline) {
+	if !time.Now().Before(call.deadline) || call.budget != nil && call.budget.Err() != nil {
 		result = NewWireErrorResult(ErrorCodeDeadlineExceeded, "syntra: deadline exceeded")
 	}
 	call.selected = result
@@ -690,12 +697,34 @@ func (g *goHostCore) callDeadline(id uint64) (time.Time, bool) {
 	return call.deadline, true
 }
 
+// callReceipt returns timing without running application policy under core.mu.
+func (g *goHostCore) callReceipt(id uint64) (requestReceipt, time.Time, bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	call, ok := g.outstanding[id]
+	if !ok {
+		return requestReceipt{}, time.Time{}, false
+	}
+	return call.receipt, call.deadline, true
+}
+
+// setRequestBudget updates the core's expiry/selection source as well as the
+// callback context. Existing first-terminal selection is never overwritten.
+func (g *goHostCore) setRequestBudget(id uint64, budget RequestBudget) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if call := g.outstanding[id]; call != nil {
+		call.deadline = minTime(call.deadline, budget.deadline)
+		call.budget = &budget
+	}
+}
+
 // terminalPending excludes cancellation, expiry, and already-selected outcomes.
 func (g *goHostCore) terminalPending(id uint64) bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	call := g.outstanding[id]
-	return !g.closed && call != nil && call.selected == nil && !call.cancelled && time.Now().Before(call.deadline)
+	return !g.closed && call != nil && call.selected == nil && !call.cancelled && time.Now().Before(call.deadline) && (call.budget == nil || call.budget.Err() == nil)
 }
 
 // fenceTerminal suppresses unstarted core output and request admission while

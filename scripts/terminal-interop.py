@@ -10,6 +10,7 @@ import argparse
 import contextlib
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import signal
@@ -22,7 +23,7 @@ import time
 
 
 def matrix():
-    """Return the fourteen distinct cases, without counting reruns as coverage."""
+    """Keep fourteen baseline cases and add six direct request-budget cases."""
     cases = []
     for server, client in (("go", "rust"), ("rust", "go")):
         for scenario, network in ((s, n) for s in ("owned", "gap")
@@ -33,12 +34,67 @@ def matrix():
                                   ("owned", "partial-loss")):
             cases.append(dict(id=f"{server}-to-{client}-{scenario}-{network}",
                               server=server, client=client, scenario=scenario, network=network))
+        for scenario in ("budget-cap", "budget-short", "budget-late"):
+            cases.append(dict(id=f"{server}-to-{client}-{scenario}-direct",
+                              server=server, client=client, scenario=scenario, network="direct"))
     return cases
 
 
 def matching(events, name):
     """Select structured fixture events, never diagnostic substring matches."""
     return [e for e in events if e.get("event") == name]
+
+
+def validate_budgets(case, server, client):
+    """Check clock-relative measurements, not exact network-error arrival times."""
+    scenario = case["scenario"]
+    cap = 600 if scenario == "budget-late" else 1500
+    peer = 1000 if scenario == "budget-short" else 120000
+    effective = min(cap, peer)
+    assert matching(server, "budget_selected") == [dict(event="budget_selected", cap_ms=cap, input_valid=True)], "selector evidence"
+    assert matching(client, "peer_budget") == [dict(event="peer_budget", timeout_ms=peer)], "peer budget"
+    observations = matching(server, "budget")
+    phases = {phase: [e for e in observations if e.get("phase") == phase]
+              for phase in ("authorize", "handler", "commit", "observe")}
+    assert all(len(phases[p]) == 1 for p in ("authorize", "handler", "commit")), "operation budget phases"
+    assert phases["observe"] and sum(map(len, phases.values())) == len(observations), "authority read budget"
+    for event in observations:
+        assert event.get("sdk_budget_present") is True, "SDK budget required for every callback"
+        for field in ("remaining_ms", "elapsed_ms"):
+            value = event.get(field)
+            assert type(value) in (int, float) and math.isfinite(value) and value >= 0, "numeric budget evidence"
+        assert event.get("live") is True and event["remaining_ms"] > 0, "live budget"
+        assert event["remaining_ms"] + event["elapsed_ms"] <= effective + 50, "no budget extension"
+        if event["phase"] == "observe":
+            read_limit = 20 if case.get("server") == "go" else 100
+            assert event["remaining_ms"] <= read_limit, "SDK read timeout bound"
+    authorization = phases["authorize"][0]
+    origin = authorization["remaining_ms"] + authorization["elapsed_ms"]
+    assert effective - 250 <= origin <= effective + 50, "selected minimum"
+    for phase in ("handler", "commit"):
+        event = phases[phase][0]
+        # Both SDKs expose the original operation cutoff, excluding the bounded
+        # teardown tail derived at reservation, not a fresh commit allowance.
+        tail = min(phases["handler"][0]["remaining_ms"] / 4, 250) if phase == "commit" else 0
+        assert abs(event["remaining_ms"] + event["elapsed_ms"] - (origin - tail)) <= 50, "original cutoff retained"
+        assert event["elapsed_ms"] >= 150, "cooperative handler delay not exercised"
+    assert server.index(authorization) < server.index(phases["handler"][0]) < server.index(phases["commit"][0]), "budget phase order"
+    if scenario == "budget-late":
+        pending = matching(server, "commit_pending")
+        assert pending == [dict(event="commit_pending")], "pending commit admission marker"
+        late = matching(server, "late_commit")
+        assert late == [dict(event="late_commit", expired=True, retained_work=True, contract_violation=True)], "late retained commit evidence"
+        returned = matching(server, "commit_return")
+        assert len(returned) == 1, "retained callback joined"
+        start, end = server.index(pending[0]), server.index(late[0])
+        assert server.index(phases["commit"][0]) < start < end < server.index(matching(server, "transition")[0]) < server.index(returned[0]), "late commit order"
+        # Initial reservation reads do not prove periodic driver observation.
+        # The callback has entered, has not completed its delayed mutation, and
+        # must receive at least one independently budgeted read in that range.
+        assert any(e.get("event") == "budget" and e.get("phase") == "observe"
+                   for e in server[start + 1:end]), "budgeted read while commit pending"
+        closed = [e for e in matching(server, "connection_closed") if e.get("connection") == 1]
+        assert len(closed) == 1 and server.index(returned[0]) < server.index(closed[0]), "actual work joined before close"
 
 
 def validate_case(case, server, client, probe, proxy):
@@ -57,9 +113,11 @@ def validate_case(case, server, client, probe, proxy):
     results = matching(client, "result")
     assert len(results) == 1, "exactly one client result"
     result = results[0]
-    negative = case["scenario"] in ("deny", "unknown") or case["network"] == "partial-loss"
+    negative = case["scenario"] in ("deny", "unknown", "budget-late") or case["network"] == "partial-loss"
     if negative:
         allowed = ("Unavailable", "Unauthenticated") if case["scenario"] == "deny" else ("Unavailable",)
+        if case["scenario"] == "budget-late":
+            allowed = ("Unavailable", "DeadlineExceeded")
         assert result.get("outcome") == "unknown" and result.get("receipts") == 0, "zero receipts"
         assert result.get("code") in allowed and "payload" not in result, "typed error"
     else:
@@ -75,6 +133,11 @@ def validate_case(case, server, client, probe, proxy):
         returns = matching(server, "commit_return")
         assert len(gaps) == 1 and gaps[0].get("before_callback_return") is True and len(returns) == 1, "gap not observed"
         assert server.index(transitions[0]) < server.index(gaps[0]) < server.index(returns[0]), "gap event order"
+    if case["scenario"].startswith("budget-"):
+        validate_budgets(case, server, client)
+        if case.get("server") == "go":
+            writes = matching(server, "local_write")
+            assert len(writes) == 1 and writes[0].get("complete") is (case["scenario"] != "budget-late"), "budget local write"
     if case["network"] != "direct":
         assert proxy and proxy.get("workers_joined") is True and not proxy.get("errors"), "proxy workers"
         assert proxy.get("client_records") == 3 and proxy.get("server_records") == 3, "record sequence"
@@ -350,6 +413,10 @@ def run_case(case, binaries, roots, output):
             # Arm the no-RPC probe within the server's second-accept window,
             # independent of client exit or the old proxy's bounded teardown.
             client.wait_event("result")
+            if case["scenario"] == "budget-late":
+                # The intentionally uncooperative mutation may finish after the
+                # client failed. Probe only its actual recorded withdrawal.
+                server.wait_event("transition")
             probe = start(case["client"], "probe", address, "unknown", "probe")
             probe.wait()
             client.wait()
@@ -537,7 +604,8 @@ def main():
         report["failure"] = f"{type(error).__name__}: {error}"
     report["passed"] = sum(c["status"] == "PASS" for c in report["cases"])
     report["failed"] = sum(c["status"] != "PASS" for c in report["cases"])
-    report["complete"] = len(report["cases"]) == 14 and report["passed"] == 14 and report.get("source_stable", False)
+    expected = len(matrix())
+    report["complete"] = len(report["cases"]) == expected and report["passed"] == expected and report.get("source_stable", False)
     report["checksums"] = {str(p.relative_to(output)): sha256(p) for p in sorted(output.rglob("*"))
                            if p.is_file() and (p.suffix in (".log", ".json")) and "rust-target" not in p.parts}
     manifest = write_report(output, report)
@@ -547,7 +615,7 @@ def main():
         except Exception as error:
             report["archive_error"] = f"{type(error).__name__}: {error}"
             write_report(output, report, mode="w")
-    print(f"Evidence: {output / 'report.json'}; {report['passed']}/14 PASS; complete={report['complete']}")
+    print(f"Evidence: {output / 'report.json'}; {report['passed']}/{expected} PASS; complete={report['complete']}")
     if "failure" in report:
         print(report["failure"])
     if "archive_error" in report:

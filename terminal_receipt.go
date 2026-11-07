@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"math"
 	"sync"
 	"time"
 )
@@ -55,6 +56,9 @@ type TerminalObservation struct {
 // application authority, including superseding denial; caches/replicas unable to
 // establish that are unsupported. Both methods must honor cancellation and return
 // within the configured ObservationTimeout (Commit within its context budget).
+// Every callback receives RequestBudgetFromContext timing derived to its actual
+// operation/read cutoff, including periodic driver observations. Commit excludes
+// the reserved teardown tail; Observe is additionally bounded by its read limit.
 // Returning nil from Commit is never commit evidence. The SDK cannot prove an
 // adapter's durability or make its transaction atomic with carrier I/O.
 // A terminal callback may request Host.Close or Host.DisconnectPrincipal; the
@@ -137,6 +141,7 @@ type TerminalPermit struct {
 	transition    TerminalTransition
 	policy        TerminalMethodPolicy
 	clock         TerminalClock
+	budget        RequestBudget // immutable original receipt budget, when available
 	until         time.Duration
 	wallUntil     time.Time
 	frame         []byte
@@ -177,6 +182,49 @@ func (p *TerminalPermit) checkTimeLocked() {
 	}
 }
 
+// authorityContext derives callback timing from the permit's absolute cutoffs,
+// retaining the original receipt/clock origin rather than rebuilding elapsed time
+// from wall remaining. A positive timeout additionally bounds one observation;
+// zero means the operation cutoff (Commit). Driver refresh parents need not carry
+// SDK values. Legacy/manual permits derive directly from their absolute clock
+// cutoff. The supplied parent's earlier deadline and cancellation remain intact.
+func (p *TerminalPermit) authorityContext(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc, RequestBudget) {
+	b := p.budget
+	if b.deadline.IsZero() {
+		b = RequestBudget{deadline: p.wallUntil, receipt: requestReceipt{clock: p.clock}, until: p.until}
+	}
+	b.deadline = minTime(b.deadline, p.wallUntil)
+	b.until = min(b.until, p.until)
+	now := time.Now()
+	age := p.clock.Age()
+	if p.clock.Check() != nil || age < 0 || age < b.receipt.age || age >= b.until || b.invalid {
+		b.invalid = true
+		b.deadline = minTime(b.deadline, now)
+	} else {
+		remaining := b.until - age
+		if parentBudget, ok := RequestBudgetFromContext(ctx); ok {
+			// A parent can already carry a tighter elapsed bound even when
+			// suspend has not advanced its Go context timer. Conservatively
+			// shrink this permit-clock allowance; never move its origin.
+			remaining = min(remaining, parentBudget.Remaining())
+		}
+		if timeout > 0 {
+			remaining = min(remaining, timeout)
+		}
+		// remaining <= until-age makes this addition nonoverflowing and
+		// never extends the original absolute permit cutoff.
+		b.until = age + remaining
+		// The actual context timer must honor the elapsed cutoff at this
+		// sample, not wait for a later watchdog poll to notice it.
+		b.deadline = minTime(b.deadline, now.Add(remaining))
+	}
+	if d, ok := ctx.Deadline(); ok {
+		b.deadline = minTime(b.deadline, d)
+	}
+	callbackCtx, cancel := context.WithDeadline(context.WithValue(ctx, requestBudgetKey{}, b), b.deadline)
+	return callbackCtx, cancel, b
+}
+
 // Fail installs an irreversible failure and synchronously cancels an admitted
 // Commit's context before returning. It never joins carrier I/O. Late callback or
 // read success cannot clear the failure or restore delivery eligibility.
@@ -211,14 +259,29 @@ func (p *TerminalPermit) failLocked(err error) {
 // local mutex is held across authority I/O. Unknown/error/mismatch is sticky.
 // Active never permits a receipt or ordinary traffic on the fenced connection.
 // Once committed, a stale Active read cannot resurrect state.
+// Every authority callback, including driver refresh, receives an SDK budget and
+// context deadline clamped by the permit, this read's bound and the parent.
 func (p *TerminalPermit) Observe(ctx context.Context, requireCommit bool) (TerminalAuthorityState, error) {
 	if err := p.CheckTime(); err != nil {
 		return TerminalUnknown, err
 	}
-	readStart := p.clock.Age()
-	readUntil := min(p.until, readStart+p.policy.ObservationTimeout)
-	readCtx, cancel := context.WithTimeout(ctx, p.policy.ObservationTimeout)
+	if p.policy.ObservationTimeout <= 0 {
+		p.Fail(terminalFailure())
+		return TerminalUnknown, terminalFailure()
+	}
+	readCtx, cancel, readBudget := p.authorityContext(ctx, p.policy.ObservationTimeout)
 	defer cancel()
+	readErr := readCtx.Err()
+	if readErr == nil {
+		readErr = readBudget.Err()
+	}
+	if readErr != nil {
+		p.Fail(readErr)
+		if p.stopIO != nil {
+			p.stopIO()
+		}
+		return TerminalUnknown, terminalFailure()
+	}
 	finished, watched := make(chan struct{}), make(chan struct{})
 	// This owner is independent of the authority callback and the serialized
 	// driver observer gate. A callback ignoring cancellation retains its charge,
@@ -235,7 +298,7 @@ func (p *TerminalPermit) Observe(ctx context.Context, requireCommit bool) (Termi
 			}
 		}
 		for {
-			if p.clock.Check() != nil || p.clock.Age() >= readUntil {
+			if readBudget.Err() != nil {
 				abort(context.DeadlineExceeded)
 				return
 			}
@@ -263,7 +326,7 @@ func (p *TerminalPermit) Observe(ctx context.Context, requireCommit bool) (Termi
 	observation, err := p.policy.Authority.Observe(readCtx, p.transition)
 	close(finished)
 	<-watched
-	if err != nil || readCtx.Err() != nil || p.clock.Check() != nil || p.clock.Age() >= readUntil {
+	if err != nil || readCtx.Err() != nil || readBudget.Err() != nil {
 		if err == nil {
 			err = context.DeadlineExceeded
 		}
@@ -385,11 +448,23 @@ func CompleteTerminalReceipt(ctx context.Context, operation string, expectedRevi
 		return terminalFailure()
 	}
 	clock := driver.TerminalClock()
+	budget, hasBudget := RequestBudgetFromContext(scope.ctx)
+	if hasBudget {
+		// Use the actual complete-frame origin. Sampling at reservation and
+		// subtracting wall remaining would forgive authorization-time suspend.
+		clock = budget.receipt.clock
+		if budget.Err() != nil {
+			return terminalFailure()
+		}
+	}
 	if clock == nil || clock.Check() != nil {
 		return terminalFailure()
 	}
 	wallStart := time.Now()
 	start := clock.Age()
+	if start < 0 || start > time.Duration(math.MaxInt64)-5*time.Second {
+		return terminalFailure()
+	}
 	deadline, ok := scope.ctx.Deadline()
 	if !ok {
 		return terminalFailure()
@@ -398,7 +473,10 @@ func CompleteTerminalReceipt(ctx context.Context, operation string, expectedRevi
 		deadline = minTime(deadline, callerDeadline)
 	}
 	initialRemaining := min(deadline.Sub(wallStart), 5*time.Second)
-	remaining := min(time.Until(deadline), 5*time.Second-time.Since(wallStart))
+	if hasBudget {
+		initialRemaining = min(initialRemaining, budget.until-start)
+	}
+	remaining := min(time.Until(deadline), initialRemaining-time.Since(wallStart))
 	tail := min(initialRemaining/4, 250*time.Millisecond)
 	if tail < 2*terminalPollInterval || remaining-tail <= policy.ObservationTimeout {
 		return terminalFailure()
@@ -409,9 +487,9 @@ func CompleteTerminalReceipt(ctx context.Context, operation string, expectedRevi
 	}
 	failureCtx, failureCancel := context.WithCancel(scope.ctx)
 	defer failureCancel()
-	p := &TerminalPermit{policy: policy, clock: clock, until: start + remaining - tail,
+	p := &TerminalPermit{policy: policy, clock: clock, budget: budget, until: start + remaining - tail,
 		owner: scope, failureCtx: failureCtx, failureCancel: failureCancel, failed: make(chan struct{}), stopIO: driver.StopTerminal,
-		wallUntil: minTime(deadline, wallStart.Add(5*time.Second)).Add(-tail), frame: frame, valid: true,
+		wallUntil: minTime(deadline, wallStart.Add(initialRemaining)).Add(-tail), frame: frame, valid: true,
 		transition: TerminalTransition{Principal: hc.principal, Method: scope.method, Operation: operation, ExpectedRevision: expectedRevision}}
 	p.policy.Authority = terminalChargedAuthority{host: h, authority: policy.Authority}
 	if _, err := rand.Read(p.transition.ReservationID[:]); err != nil {
@@ -491,8 +569,10 @@ func CompleteTerminalReceipt(ctx context.Context, operation string, expectedRevi
 		p.Fail(err)
 		return err
 	}
-	commitCtx, commitCancel := context.WithDeadline(p.failureCtx, p.wallUntil)
+	commitCtx, commitCancel, commitBudget := p.authorityContext(p.failureCtx, 0)
 	defer commitCancel()
+	stopCallerCancel := context.AfterFunc(ctx, commitCancel)
+	defer stopCallerCancel()
 	// Linearize Commit admission against already-published failures, withdrawal,
 	// ownership and both deadlines. No mutex is held across the application call.
 	// A subsequent failure synchronously cancels commitCtx; it cannot roll back
@@ -500,7 +580,7 @@ func CompleteTerminalReceipt(ctx context.Context, operation string, expectedRevi
 	h.mu.Lock()
 	p.mu.Lock()
 	p.checkTimeLocked()
-	if p.failure != nil || writeCtx.Err() != nil || commitCtx.Err() != nil || scope.ctx.Err() != nil || ctx.Err() != nil || h.closed || hc.closing || hc.authorizationRevoked || hc.terminal != p || hc.cancels[cc.id] != cc || !hc.core.terminalPending(cc.id) {
+	if p.failure != nil || writeCtx.Err() != nil || commitCtx.Err() != nil || commitBudget.Err() != nil || scope.ctx.Err() != nil || ctx.Err() != nil || h.closed || hc.closing || hc.authorizationRevoked || hc.terminal != p || hc.cancels[cc.id] != cc || !hc.core.terminalPending(cc.id) {
 		p.failLocked(terminalFailure())
 		p.mu.Unlock()
 		h.mu.Unlock()

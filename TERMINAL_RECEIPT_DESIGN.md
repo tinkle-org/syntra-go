@@ -173,18 +173,51 @@ database-to-socket transaction or a delivery guarantee.
 
 ## Deadline and cleanup
 
+Before initial method authorization, `HostConfig.RequestBudget` may select a
+pure/prompt host cap from the bound principal, validated method and untrusted
+opaque payload. Nil or no override preserves wire/default/`MaxTimeout` selection;
+zero expires and negative durations fail closed. The cap starts at complete-frame
+receipt `R`, before receive-queue or selector delay, not at handler entry. It
+cannot extend any earlier deadline. Built-in recovery routes bypass the
+application selector while retaining original SDK timing and trusted-clock
+enforcement. Expired or invalid original budgets also skip selection. The core and
+callback context use the same selected request deadline, including an earlier
+serving-context deadline.
+
 At reservation start `S`, the absolute deadline and reserved teardown tail are:
 
 ```text
-D = min(RPC deadline, S + 5 seconds)
+request deadline = min(R + wire/default/MaxTimeout budget, R + selected host cap,
+                       serving-context deadline)
+D = min(request deadline, stricter caller deadline, S + 5 seconds)
 T = min(initial remaining time / 4, 250 milliseconds)
 write cutoff = D - T
 ```
+
+Omit the host-cap term when no cap is selected.
 
 Quiescence, commit, proof, selection, and complete local writing share this budget.
 A stricter caller deadline wins. No barrier, callback, retry, or close phase starts
 a new budget. Both trusted suspend-inclusive elapsed time and request/wall
 deadlines apply; unknown continuity and clock regression fail closed.
+When available, the trusted `TerminalClock` age is sampled at original frame
+receipt and retained with the selected request budget. The terminal cutoff is
+also clamped by that original elapsed deadline; it is never reconstructed from
+wall/context remaining time after suspension. Checked elapsed addition fails
+closed on overflow. `RequestBudgetFromContext` exposes read-only `Deadline`,
+`Remaining` and `Err` to authorization, handler, Commit and Observe adapters;
+their individual context deadlines can be earlier and must still be honored.
+All Commit/Observe callbacks receive derived budgets, including periodic driver
+observations with no request-scoped parent values. Commit's cutoff excludes the
+teardown tail; Observe additionally clamps to its read timeout and earlier parent
+context/budget. The budget's Go deadline matches the actual callback deadline,
+projecting the remaining absolute elapsed cutoff into that timer without moving
+the original clock origin or extending its cutoff. Watchdogs remain independent
+fail-closed guards against suspend, discontinuity and noncooperative callbacks.
+Legacy/manual permit fixtures without an original request budget derive from the
+permit's existing absolute elapsed and wall cutoffs, never a fresh allowance.
+The selector does not authorize, enable terminal support, or override default
+denial/recovery routing. `HostConfig` has an added field; use keyed literals.
 
 The Go implementation requires two 10-ms watchdog intervals in the tail and room
 for the declared read bound before the write cutoff. Very small budgets reject

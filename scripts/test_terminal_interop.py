@@ -375,11 +375,221 @@ class EvidenceTests(unittest.TestCase):
                   "payload": "retired", "receipts": 1}],
                 [{"event": "probe", "establishment_denied": True, "calls": 0}])
 
-    def test_matrix_has_fourteen_distinct_cases(self):
-        """Count distinct direction/scenario/network combinations, not attempts."""
+    def test_matrix_preserves_fourteen_baselines_and_six_budget_cases(self):
+        """Retain every baseline tuple and add only three direct cases per direction."""
         cases = interop.matrix()
-        self.assertEqual(14, len(cases))
-        self.assertEqual(14, len({c["id"] for c in cases}))
+        baseline = [c for c in cases if not c["scenario"].startswith("budget-")]
+        self.assertEqual(14, len(baseline))
+        self.assertEqual(20, len(cases))
+        self.assertEqual(20, len({c["id"] for c in cases}))
+        for server, client in (("go", "rust"), ("rust", "go")):
+            self.assertEqual(
+                {(s, n) for s in ("owned", "gap") for n in ("direct", "fragmented")} |
+                {("deny", "direct"), ("unknown", "direct"), ("owned", "partial-loss")},
+                {(c["scenario"], c["network"]) for c in baseline if c["server"] == server})
+            self.assertEqual(
+                {("budget-cap", "direct"), ("budget-short", "direct"), ("budget-late", "direct")},
+                {(c["scenario"], c["network"]) for c in cases
+                 if c["server"] == server and c["client"] == client and c not in baseline})
+
+    def budget_events(self, scenario, language="rust"):
+        """Build explicit, non-secret positive evidence for each new budget contract."""
+        server, client, probe = self.events()
+        cap = 600 if scenario == "budget-late" else 1500
+        peer = 1000 if scenario == "budget-short" else 120000
+        effective = min(cap, peer)
+        evidence = [dict(event="budget_selected", cap_ms=cap, input_valid=True)]
+        for phase, elapsed in (("authorize", 0), ("handler", 200), ("observe", 200), ("commit", 200)):
+            remaining = effective - elapsed
+            if phase == "observe":
+                remaining = min(20 if language == "go" else 100, remaining)
+            elif phase == "commit":
+                remaining -= min(remaining / 4, 250)
+            evidence.append(dict(event="budget", phase=phase, live=True, sdk_budget_present=True,
+                                 remaining_ms=remaining, elapsed_ms=elapsed))
+        client.insert(1, dict(event="peer_budget", timeout_ms=peer))
+        if scenario == "budget-late":
+            evidence.append(dict(event="commit_pending"))
+            evidence.append(dict(event="budget", phase="observe", live=True, sdk_budget_present=True,
+                                 remaining_ms=20, elapsed_ms=300))
+            evidence.append(dict(event="late_commit", expired=True, retained_work=True, contract_violation=True))
+            server.insert(1, dict(event="commit_return"))
+            client[-1] = dict(event="result", outcome="unknown", code="Unavailable", receipts=0)
+        server[0:0] = evidence
+        return server, client, probe
+
+    def test_budget_evidence_fails_closed(self):
+        """Missing, malformed, refreshed, extended or unsuccessful evidence never passes."""
+        variants = ("valid", "missing-selector", "duplicate-selector", "selector-input", "cap",
+                    "peer", "missing-peer", "missing-authorize", "missing-handler", "missing-commit",
+                    "missing-observe", "expired", "negative", "nan", "string", "bool", "extension",
+                    "refreshed", "read-bound", "commits", "handlers", "receipt", "denial", "cleanup")
+        for scenario in ("budget-cap", "budget-short", "budget-late"):
+            for variant in variants:
+                with self.subTest(scenario=scenario, variant=variant):
+                    server, client, probe = self.budget_events(scenario)
+                    budgets = interop.matching(server, "budget")
+                    if variant.startswith("missing-"):
+                        phase = variant.removeprefix("missing-")
+                        if phase == "selector":
+                            server.pop(0)
+                        elif phase == "peer":
+                            client.pop(1)
+                        elif phase == "observe":
+                            server[:] = [e for e in server if e not in budgets or e["phase"] != "observe"]
+                        else:
+                            server.remove(next(e for e in budgets if e["phase"] == phase))
+                    elif variant == "duplicate-selector":
+                        server.insert(0, dict(server[0]))
+                    elif variant == "selector-input":
+                        server[0]["input_valid"] = False
+                    elif variant == "cap":
+                        server[0]["cap_ms"] = 120000
+                    elif variant == "peer":
+                        client[1]["timeout_ms"] = 2000
+                    elif variant in ("expired", "negative", "nan", "string", "bool", "extension"):
+                        key, value = {"expired": ("live", False), "negative": ("remaining_ms", -1),
+                                      "nan": ("remaining_ms", float("nan")), "string": ("elapsed_ms", "0"),
+                                      "bool": ("remaining_ms", True), "extension": ("remaining_ms", 120000)}[variant]
+                        budgets[0][key] = value
+                    elif variant == "refreshed":
+                        next(e for e in budgets if e["phase"] == "commit")["remaining_ms"] = budgets[0]["remaining_ms"]
+                    elif variant == "read-bound":
+                        budgets[-1]["remaining_ms"] = 500
+                    elif variant in ("commits", "handlers"):
+                        server[-1][variant] = 2
+                    elif variant == "receipt":
+                        client[-1]["receipts"] = 1 if scenario == "budget-late" else 0
+                    elif variant == "denial":
+                        server.remove(interop.matching(server, "fresh_denied")[0])
+                    elif variant == "cleanup":
+                        server.remove(interop.matching(server, "connection_closed")[0])
+                    args = (dict(scenario=scenario, network="direct", server="rust"), server, client, probe, None)
+                    if variant == "valid":
+                        interop.validate_case(*args)
+                    else:
+                        with self.assertRaises(AssertionError):
+                            interop.validate_case(*args)
+
+    def test_late_commit_requires_expired_retained_work_and_no_receipt(self):
+        """An ordinary error, absent late work or on-time completion is not late-commit proof."""
+        for variant in ("missing", "expired", "retained_work", "contract_violation", "observed", "untyped"):
+            with self.subTest(variant=variant):
+                server, client, probe = self.budget_events("budget-late")
+                late = interop.matching(server, "late_commit")[0]
+                if variant == "missing":
+                    server.remove(late)
+                elif variant in late:
+                    late[variant] = False
+                elif variant == "observed":
+                    client[-1] = dict(event="result", outcome="observed", payload="retired", receipts=1)
+                else:
+                    client[-1]["code"] = "unexpected"
+                with self.assertRaises(AssertionError):
+                    interop.validate_case(dict(scenario="budget-late", network="direct"), server, client, probe, None)
+
+    def test_late_commit_requires_budgeted_read_inside_pending_callback_range(self):
+        """Initial reads alone cannot prove periodic observation during retained commit work."""
+        for language in ("go", "rust"):
+            for variant in ("valid", "initial-only", "missing-marker", "duplicate-marker",
+                            "marker-before-admission", "read-after-late", "read-after-return", "unbudgeted"):
+                with self.subTest(language=language, variant=variant):
+                    server, client, probe = self.budget_events("budget-late", language)
+                    if language == "go":
+                        server.insert(-1, dict(event="local_write", complete=False))
+                    pending = interop.matching(server, "commit_pending")[0]
+                    late = interop.matching(server, "late_commit")[0]
+                    start, end = server.index(pending), server.index(late)
+                    reads = [e for e in server[start + 1:end] if e.get("event") == "budget" and e.get("phase") == "observe"]
+                    initial_reads = [e for e in server[:start] if e.get("event") == "budget" and e.get("phase") == "observe"]
+                    self.assertTrue(initial_reads, "negative fixture must retain initial observations")
+                    self.assertTrue(reads, "positive fixture must contain pending work evidence")
+                    if variant == "initial-only":
+                        for read in reads:
+                            server.remove(read)
+                    elif variant == "missing-marker":
+                        server.remove(pending)
+                    elif variant == "duplicate-marker":
+                        server.insert(start, dict(pending))
+                    elif variant == "marker-before-admission":
+                        server.remove(pending)
+                        commit = next(e for e in interop.matching(server, "budget") if e["phase"] == "commit")
+                        server.insert(server.index(commit), pending)
+                    elif variant in ("read-after-late", "read-after-return"):
+                        for read in reads:
+                            server.remove(read)
+                        boundary = late if variant == "read-after-late" else interop.matching(server, "commit_return")[0]
+                        index = server.index(boundary) + 1
+                        server[index:index] = reads
+                    elif variant == "unbudgeted":
+                        for read in reads:
+                            read["sdk_budget_present"] = False
+                    self.assertTrue(all(read in server for read in initial_reads))
+                    args = (dict(server=language, scenario="budget-late", network="direct"), server, client, probe, None)
+                    if variant == "valid":
+                        interop.validate_case(*args)
+                    else:
+                        with self.assertRaises(AssertionError):
+                            interop.validate_case(*args)
+
+    def test_every_authority_callback_requires_sdk_budget_without_refresh_exception(self):
+        """Missing SDK budgets fail even on later reads with a live bounded context."""
+        for language in ("go", "rust"):
+            for phase in ("commit", "observe-first", "observe-periodic"):
+                for variant in ("missing", False, None, "true", 1, "legacy-refresh", "read-too-long", "no-tail"):
+                    with self.subTest(language=language, phase=phase, variant=variant):
+                        server, client, probe = self.budget_events("budget-late", language)
+                        if language == "go":
+                            server.insert(-1, dict(event="local_write", complete=False))
+                        callbacks = interop.matching(server, "budget")
+                        event = (next(e for e in callbacks if e["phase"] == "commit") if phase == "commit"
+                                 else [e for e in callbacks if e["phase"] == "observe"][0 if phase == "observe-first" else -1])
+                        if variant == "missing":
+                            del event["sdk_budget_present"]
+                        elif variant == "legacy-refresh":
+                            event["phase"] = "refresh"
+                        elif variant == "read-too-long":
+                            event["remaining_ms"] = 21 if language == "go" else 101
+                        elif variant == "no-tail":
+                            event["remaining_ms"] = 400
+                        else:
+                            event["sdk_budget_present"] = variant
+                        # The last two corruptions apply only to the relevant callback.
+                        if variant == "read-too-long" and phase == "commit" or variant == "no-tail" and phase != "commit":
+                            continue
+                        with self.assertRaises(AssertionError):
+                            interop.validate_case(dict(server=language, scenario="budget-late", network="direct"),
+                                                  server, client, probe, None)
+
+    def test_derived_read_budgets_may_be_shorter_than_read_timeout(self):
+        """Accept any positive SDK read allowance up to the language's configured limit."""
+        for language, limit in (("go", 20), ("rust", 100)):
+            for remaining in (0.001, 1, limit):
+                with self.subTest(language=language, remaining=remaining):
+                    server, client, probe = self.budget_events("budget-late", language)
+                    for event in interop.matching(server, "budget"):
+                        if event["phase"] == "observe":
+                            event["remaining_ms"] = remaining
+                    if language == "go":
+                        server.insert(-1, dict(event="local_write", complete=False))
+                    interop.validate_case(dict(server=language, scenario="budget-late", network="direct"),
+                                          server, client, probe, None)
+
+    def test_go_budget_local_write_must_match_receipt_eligibility(self):
+        """Require actual local handoff success for healthy budgets and refusal for late work."""
+        for scenario in ("budget-cap", "budget-short", "budget-late"):
+            expected = scenario != "budget-late"
+            for complete in (True, False, None, "missing"):
+                with self.subTest(scenario=scenario, complete=complete):
+                    server, client, probe = self.budget_events(scenario, "go")
+                    if complete != "missing":
+                        server.insert(-1, dict(event="local_write", complete=complete))
+                    args = (dict(server="go", scenario=scenario, network="direct"), server, client, probe, None)
+                    if complete is expected:
+                        interop.validate_case(*args)
+                    else:
+                        with self.assertRaises(AssertionError):
+                            interop.validate_case(*args)
 
     def test_owned_and_invalid_evidence(self):
         """Reject setup failures, duplicate commits, missing denial/closure and bad payloads."""
@@ -495,6 +705,47 @@ class EvidenceTests(unittest.TestCase):
 
 class OrchestrationTests(unittest.TestCase):
     """A fresh handshake must not depend on old-connection cleanup finishing."""
+
+    def test_late_probe_requires_actual_transition_after_client_result(self):
+        """A timeout alone cannot launch a withdrawn-binding probe or pass a late case."""
+        for transition in (True, False):
+            with self.subTest(transition=transition), tempfile.TemporaryDirectory() as tmp:
+                server_events, client_events, probe_events = EvidenceTests().budget_events("budget-late")
+                server_events.insert(0, dict(event="listening", address="127.0.0.1:12345"))
+                if not transition:
+                    server_events.remove(interop.matching(server_events, "transition")[0])
+                trace, processes = [], []
+
+                def start(command, directory, prefix, timeout):
+                    """Record event waits and starts without sockets or SDK execution."""
+                    label = prefix.name
+                    trace.append(label + ".start")
+                    proc = mock.Mock()
+                    proc.events = {"server": server_events, "client": client_events, "probe": probe_events}[label]
+                    def event(name):
+                        """Return only actually present structured evidence."""
+                        trace.append(label + ".event." + name)
+                        events = interop.matching(proc.events, name)
+                        if not events:
+                            raise RuntimeError("missing " + name)
+                        return events[0]
+                    proc.wait_event.side_effect = event
+                    processes.append(proc)
+                    return proc
+
+                case = dict(id="late-orchestration", server="rust", client="go",
+                            scenario="budget-late", network="direct")
+                with mock.patch.object(interop, "Process", side_effect=start):
+                    result = interop.run_case(case, dict(go="unused-go", rust="unused-rust"),
+                                              dict(go=Path(tmp), rust=Path(tmp)), Path(tmp))
+                self.assertEqual("PASS" if transition else "FAIL", result["status"], result)
+                self.assertLess(trace.index("client.event.result"), trace.index("server.event.transition"))
+                if transition:
+                    self.assertLess(trace.index("server.event.transition"), trace.index("probe.start"))
+                else:
+                    self.assertNotIn("probe.start", trace)
+                for proc in processes:
+                    proc.close.assert_called_once()
 
     def exercise(self, network, failure=None):
         """Model a ready result with client exit gated on handling the fresh probe."""

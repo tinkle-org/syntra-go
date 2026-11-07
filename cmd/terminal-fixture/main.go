@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -53,12 +54,64 @@ type fixtureAuthority struct {
 	denials     int
 	committing  bool
 	gapObserved chan struct{}
+	// budgetStarted is a local monotonic measurement origin, not a wire timestamp.
+	budgetStarted time.Time
+}
+
+// budgetCase identifies only the explicitly opted-in application fixture matrix.
+func budgetCase(scenario string) bool { return strings.HasPrefix(scenario, "budget-") }
+
+// hostCap selects a short failure budget only for the deliberately late callback.
+func hostCap(scenario string) time.Duration {
+	if scenario == "budget-late" {
+		return 600 * time.Millisecond
+	}
+	return 1500 * time.Millisecond
+}
+
+// observeBudget measures the actual SDK value on every callback. Missing values
+// fail evidence validation even when the context itself has a live deadline;
+// observation budgets must already include the SDK's derived read cutoff.
+func (a *fixtureAuthority) observeBudget(ctx context.Context, phase string) {
+	if !budgetCase(a.scenario) {
+		return
+	}
+	a.mu.Lock()
+	started := a.budgetStarted
+	a.mu.Unlock()
+	b, ok := syntra.RequestBudgetFromContext(ctx)
+	remaining := b.Remaining()
+	live := ok && b.Err() == nil && ctx.Err() == nil
+	if phase == "observe" {
+		deadline, hasDeadline := ctx.Deadline()
+		live = live && hasDeadline && !deadline.After(b.Deadline())
+	}
+	emit(map[string]any{"event": "budget", "phase": phase, "live": live, "sdk_budget_present": ok,
+		"remaining_ms": float64(remaining) / float64(time.Millisecond), "elapsed_ms": float64(time.Since(started)) / float64(time.Millisecond)})
 }
 
 // Commit conditionally records exactly one transition; gap waits for a real read.
 func (a *fixtureAuthority) Commit(ctx context.Context, transition syntra.TerminalTransition) error {
+	a.observeBudget(ctx, "commit")
+	if a.scenario == "budget-late" {
+		b, ok := syntra.RequestBudgetFromContext(ctx)
+		if !ok {
+			return errors.New("fixture missing commit budget")
+		}
+		// TEST-ONLY CONTRACT VIOLATION: admitted external work deliberately
+		// ignores cancellation. Waiting on the original deadline and a retained
+		// timer models late completion without blocking authorization or polling.
+		// This event opens the evidence range: initial reads cannot substitute
+		// for an SDK-budgeted read before the late mutation below completes.
+		emit(map[string]any{"event": "commit_pending"})
+		timer := time.NewTimer(b.Remaining() + 250*time.Millisecond)
+		defer timer.Stop()
+		<-timer.C
+		emit(map[string]any{"event": "late_commit", "expired": b.Err() != nil,
+			"retained_work": true, "contract_violation": true})
+	}
 	a.mu.Lock()
-	if ctx.Err() != nil || a.owner != nil || transition.ExpectedRevision != 1 {
+	if (ctx.Err() != nil && a.scenario != "budget-late") || a.owner != nil || transition.ExpectedRevision != 1 {
 		a.mu.Unlock()
 		return errors.New("fixture conditional transition refused")
 	}
@@ -83,6 +136,7 @@ func (a *fixtureAuthority) Commit(ctx context.Context, transition syntra.Termina
 
 // Observe records gap evidence only while the commit callback is still pending.
 func (a *fixtureAuthority) Observe(ctx context.Context, transition syntra.TerminalTransition) (syntra.TerminalObservation, error) {
+	a.observeBudget(ctx, "observe")
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if ctx.Err() != nil {
@@ -141,7 +195,7 @@ func main() {
 	timeout := flag.Duration("timeout", 30*time.Second, "whole fixture lifetime")
 	payload := flag.String("payload", "", "opaque client input; receipt remains fixed retired")
 	drop := flag.Bool("drop-receipt", false, "server: fail after a partial receipt prefix")
-	scenario := flag.String("scenario", "owned", "owned, gap, deny, or unknown; client expects the selected outcome")
+	scenario := flag.String("scenario", "owned", "owned, gap, deny, unknown, budget-cap, budget-short, or budget-late")
 	probe := flag.Bool("probe", false, "client: fresh Returning only; never invoke a method")
 	flag.Parse()
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))
@@ -150,7 +204,7 @@ func main() {
 		logger.Error("invalid fixture limits")
 		os.Exit(2)
 	}
-	if *scenario != "owned" && *scenario != "gap" && *scenario != "deny" && *scenario != "unknown" {
+	if *scenario != "owned" && *scenario != "gap" && *scenario != "deny" && *scenario != "unknown" && *scenario != "budget-cap" && *scenario != "budget-short" && *scenario != "budget-late" {
 		logger.Error("invalid fixture scenario")
 		os.Exit(2)
 	}
@@ -191,6 +245,18 @@ func main() {
 func serve(ctx context.Context, address string, count int, drop bool, scenario string, static securechannel.StaticKey) error {
 	authority := &fixtureAuthority{scenario: scenario, gapObserved: make(chan struct{})}
 	server, err := connection.NewServer(syntra.HostConfig{
+		RequestBudget: func(principal, name string, payload []byte) (time.Duration, bool) {
+			if !budgetCase(scenario) {
+				return 0, false
+			}
+			authority.mu.Lock()
+			authority.budgetStarted = time.Now()
+			authority.mu.Unlock()
+			cap := hostCap(scenario)
+			emit(map[string]any{"event": "budget_selected", "cap_ms": cap.Milliseconds(),
+				"input_valid": principal == "fixture-principal" && name == method && len(payload) == 0})
+			return cap, true
+		},
 		ChannelPolicy: func(ctx context.Context, id syntra.ChannelIdentity, credential []byte) (string, error) {
 			if ctx.Err() != nil || id.Mode != "returning" || id.Scope != scope || id.Epoch != 2 || id.Handle != fixtureHandle || string(credential) != "terminal-fixture" {
 				return "", securechannel.ErrAuth
@@ -198,6 +264,7 @@ func serve(ctx context.Context, address string, count int, drop bool, scenario s
 			return "fixture-principal", nil
 		},
 		Authorize: func(ctx context.Context, _ string, name string) error {
+			authority.observeBudget(ctx, "authorize")
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
@@ -211,6 +278,18 @@ func serve(ctx context.Context, address string, count int, drop bool, scenario s
 			authority.mu.Lock()
 			authority.handlers++
 			authority.mu.Unlock()
+			if budgetCase(scenario) {
+				// A cooperative async delay demonstrates that handler/commit phases
+				// spend the original allowance rather than receiving a fresh one.
+				timer := time.NewTimer(200 * time.Millisecond)
+				defer timer.Stop()
+				select {
+				case <-timer.C:
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+				authority.observeBudget(ctx, "handler")
+			}
 			err := syntra.CompleteTerminalReceipt(ctx, "fixture-retire", 1)
 			emit(map[string]any{"event": "local_write", "complete": err == nil, "peer_receipt_proven": false})
 			return nil, err
@@ -274,7 +353,15 @@ func call(ctx context.Context, address, payload, scenario string, probe bool, st
 		return errors.New("fresh Returning unexpectedly established")
 	}
 	emit(map[string]any{"event": "established"})
-	result, err := client.Call(ctx, method, []byte(payload), 2000)
+	peerBudget := uint32(2000)
+	if budgetCase(scenario) {
+		peerBudget = 120000
+		if scenario == "budget-short" {
+			peerBudget = 1000
+		}
+		emit(map[string]any{"event": "peer_budget", "timeout_ms": peerBudget})
+	}
+	result, err := client.Call(ctx, method, []byte(payload), peerBudget)
 	if err != nil {
 		var rpc *syntra.RpcError
 		if !errors.As(err, &rpc) {
@@ -287,7 +374,10 @@ func call(ctx context.Context, address, payload, scenario string, probe bool, st
 		if rpc.Code == syntra.ErrorCodeUnauthenticated {
 			code = "Unauthenticated"
 		}
-		if scenario == "deny" && (code == "Unauthenticated" || code == "Unavailable") || scenario == "unknown" && code == "Unavailable" {
+		if rpc.Code == syntra.ErrorCodeDeadlineExceeded {
+			code = "DeadlineExceeded"
+		}
+		if scenario == "deny" && (code == "Unauthenticated" || code == "Unavailable") || scenario == "unknown" && code == "Unavailable" || scenario == "budget-late" && (code == "Unavailable" || code == "DeadlineExceeded") {
 			emit(map[string]any{"event": "result", "outcome": "unknown", "code": code, "receipts": 0, "replayed": false})
 			if closeErr := client.Close(); closeErr != nil {
 				return closeErr
@@ -296,7 +386,7 @@ func call(ctx context.Context, address, payload, scenario string, probe bool, st
 		}
 		return err
 	}
-	if scenario == "deny" || scenario == "unknown" || string(result) != "retired" {
+	if scenario == "deny" || scenario == "unknown" || scenario == "budget-late" || string(result) != "retired" {
 		return errors.New("unexpected fixture result")
 	}
 	emit(map[string]any{"event": "result", "outcome": "observed", "payload": string(result), "receipts": 1, "durable_storage_proven": false})

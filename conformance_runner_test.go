@@ -1,10 +1,8 @@
-// Shared conformance runner — Go legs (pairings `go-pure`, `go-ffi`,
-// `interop`).
+// File conformance_runner_test.go exercises SDK-local protocol scenarios.
 //
-// Exercises selected cases described in conformance/runner/scenarios.yaml
-// with the Syntra core. Recovery tests run separately.
-// Interop compares executed decodes of shared corpus bytes; it does
-// not establish a live cross-language connection.
+// Golden-input tests decode repository fixtures and check semantic fields;
+// they do not require byte-identical encodings from every valid serializer.
+// Recovery tests run separately.
 package syntra
 
 import (

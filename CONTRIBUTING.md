@@ -15,6 +15,14 @@ Maintainers should follow [RELEASING.md](RELEASING.md) for RC versions, release
 verification, and promotion to stable. Release publication runs only after the
 required Go CI jobs succeed on `main`.
 
+## Standalone verification
+
+Tests and verification tooling must be owned and run by this SDK. They must not
+depend on another SDK's checkout, toolchain, or release. Keep developer-only
+experiments and their evidence outside source control and public SDK documentation.
+Normative specification provenance checks, local wire and cryptographic golden
+fixtures, and standalone Go consumer smoke checks remain part of SDK verification.
+
 ## Local checks
 
 ```sh

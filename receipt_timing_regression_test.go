@@ -46,22 +46,32 @@ func (f *legacyReceiptFixture) Recv(context.Context) ([]byte, error) {
 }
 
 // TestReceiptSDKWrappersAndLegacyFallback checks ownership and recovery wrappers
-// without permitting a capability forwarder to bypass recovery ingress checks.
+// without permitting a capability forwarder to bypass closed, detached or
+// mismatched recovery ingress checks.
 func TestReceiptSDKWrappersAndLegacyFallback(t *testing.T) {
 	clock := &terminalReviewClock{}
 	original := CaptureFrameReceipt(clock)
 	fixture := &receiptTransportFixture{frame: []byte("frame"), receipt: original}
-	for _, wrapper := range []string{"owned", "recovery", "hidden-optional", "legacy", "closed-recovery"} {
+	for _, wrapper := range []string{"owned", "recovery", "hidden-optional", "legacy", "closed-recovery", "detached-recovery", "mismatched-recovery"} {
 		t.Run(wrapper, func(t *testing.T) {
 			fixture.received = false
 			var transport Transport = &ownedTransport{Transport: fixture}
 			switch wrapper {
-			case "recovery", "closed-recovery":
+			case "recovery", "closed-recovery", "detached-recovery", "mismatched-recovery":
 				inbox, err := NewRecoveryInbox(DefaultRecoveryLimits())
 				if err != nil {
 					t.Fatal(err)
 				}
 				client := &Client{recoveryInbox: inbox}
+				switch wrapper {
+				case "detached-recovery":
+					client.recoveryInbox = nil
+				case "mismatched-recovery":
+					client.recoveryInbox, err = NewRecoveryInbox(DefaultRecoveryLimits())
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
 				transport = WrapRecoveryTransport(transport, client, inbox)
 				if wrapper == "closed-recovery" {
 					inbox.Close()
@@ -73,9 +83,9 @@ func TestReceiptSDKWrappersAndLegacyFallback(t *testing.T) {
 				transport = &ownedTransport{Transport: &legacyReceiptFixture{fixture}}
 			}
 			raw, receipt, err := recvWithReceipt(context.Background(), transport)
-			if wrapper == "closed-recovery" {
-				if err == nil || raw != nil || fixture.received {
-					t.Fatal("timed receive bypassed closed ingress")
+			if wrapper == "closed-recovery" || wrapper == "detached-recovery" || wrapper == "mismatched-recovery" {
+				if err == nil || raw != nil || receipt != (FrameReceipt{}) || fixture.received {
+					t.Fatalf("timed receive bypassed ingress: raw=%q receipt=%v err=%v inner Recv=%v", raw, receipt, err, fixture.received)
 				}
 				return
 			}

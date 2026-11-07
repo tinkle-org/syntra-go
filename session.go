@@ -928,9 +928,9 @@ func (c *Client) pump(ctx context.Context, t Transport) (pumpErr error) {
 	go func() {
 		defer close(recvDone)
 		for {
-			raw, err := t.Recv(pumpCtx)
+			raw, receipt, err := recvWithReceipt(pumpCtx, t)
 			select {
-			case recvCh <- recvResult{raw: raw, err: err, receivedAt: time.Now()}:
+			case recvCh <- recvResult{raw: raw, err: err, receivedAt: receipt.ReceivedAt()}:
 			case <-pumpCtx.Done():
 				return
 			}
@@ -2203,10 +2203,9 @@ func (h *Host) serveLoop(ctx context.Context, t Transport, hc *hostConn) (serveE
 		defer h.owned.Done()
 		defer close(recvDone)
 		for {
-			raw, err := t.Recv(pumpCtx)
-			receipt := captureRequestReceipt(t)
+			raw, receipt, err := recvWithReceipt(pumpCtx, t)
 			select {
-			case recvCh <- recvResult{raw: raw, err: err, receivedAt: receipt.at, receipt: receipt}:
+			case recvCh <- recvResult{raw: raw, err: err, receivedAt: receipt.ReceivedAt(), receipt: receipt.receipt}:
 			case <-pumpCtx.Done():
 				return
 			}

@@ -99,7 +99,15 @@ func (t *readyTransport) TerminalReceiptDriver() syntra.TerminalReceiptDriver {
 	return t.Transport.TerminalReceiptDriver()
 }
 
+// Recv preserves readiness setup when metadata is not requested by the caller.
 func (t *readyTransport) Recv(ctx context.Context) ([]byte, error) {
+	frame, _, err := t.RecvWithReceipt(ctx)
+	return frame, err
+}
+
+// RecvWithReceipt retains the ordered batch origin without bypassing the initial
+// application handshake phase setup when the root receive pump requests timing.
+func (t *readyTransport) RecvWithReceipt(ctx context.Context) ([]byte, syntra.FrameReceipt, error) {
 	t.phaseOnce.Do(func() {
 		// Host's runtime handshake context carries its configured timeout.
 		// Capture its remaining budget in the channel's trusted clock domain.
@@ -111,7 +119,7 @@ func (t *readyTransport) Recv(ctx context.Context) ([]byte, error) {
 		t.stopPhase = cancel
 		t.phase <- phase
 	})
-	return t.Transport.Recv(ctx)
+	return t.Transport.RecvWithReceipt(ctx)
 }
 
 func (t *readyTransport) Send(ctx context.Context, frame []byte) error {

@@ -150,10 +150,25 @@ There is no timer reset at handler or terminal reservation entry. Missing
 `Authorize` still denies every method, and built-in recovery keeps its normal
 authorization and routing.
 
+Ordered transports capture one `FrameReceipt` before assembling each completing
+input batch. Every frame completed by that batch retains the same original
+timestamp and trusted age through buffering and authorization. A fragmented
+frame uses its completion batch, not its first fragment. Assembly is checked
+against its existing limits before those limits can be replaced.
+
+Custom transports can implement `FrameReceiptTransport.RecvWithReceipt` to return
+the frame and its timing atomically. Capture the metadata with
+`CaptureFrameReceipt` on the original transport clock. Wrappers that override
+`Recv` must preserve the same behavior in `RecvWithReceipt`, including readiness
+and ingress checks. A legacy transport exposing only `Recv` remains supported,
+but its unavailable assembly/buffering time cannot be recovered: its timing
+origin is captured when `Recv` returns.
+
 `RequestBudgetFromContext(ctx) (RequestBudget, bool)` exposes read-only SDK timing
 to authorizers, handlers and terminal authority adapters. `Deadline()` returns the
 selected Go deadline; `Remaining()` and `Err()` also check trusted elapsed time
-when the driver supplies `TerminalReceiptDriver.TerminalClock`. The clock's age
+when the receiving transport supplies its original clock. The ordered driver
+preserves that timing even when terminal receipts are disabled. The clock's age
 is captured at frame receipt before queueing or authorization, so time spent
 suspended is not forgiven at terminal reservation. Discontinuity, regression and
 invalid elapsed arithmetic fail closed. Drivers without that clock retain normal
@@ -174,7 +189,11 @@ matches the actual callback context deadline; both reflect the permit's wall and
 trusted elapsed cutoffs immediately, rather than relying only on later watchdog
 polling. Derivation retains the original clock origin and never extends an
 absolute elapsed cutoff. Legacy/manual permits without a captured request budget
-derive directly from their actual absolute permit cutoffs.
+retain their declared permit cutoffs but cannot recover a parent's elapsed time
+before attachment. For SDK-issued budgets, an earlier scheduler-only parent is
+also conservatively bounded by the original receipt pair, so suspension before
+callback attachment cannot renew it. SDK-created narrower timers retain their
+existing elapsed provenance rather than charging the same suspension twice.
 
 This adds a field to exported `HostConfig`; use keyed composite literals.
 Downstream unkeyed literals can require a source update.

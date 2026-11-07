@@ -183,11 +183,13 @@ func (p *TerminalPermit) checkTimeLocked() {
 }
 
 // authorityContext derives callback timing from the permit's absolute cutoffs,
-// retaining the original receipt/clock origin rather than rebuilding elapsed time
-// from wall remaining. A positive timeout additionally bounds one observation;
+// retaining the original receipt/clock origin. Scheduler-only parent and permit
+// cutoffs are projected once into that domain, and can only shorten it.
+// A positive timeout additionally bounds one observation;
 // zero means the operation cutoff (Commit). Driver refresh parents need not carry
-// SDK values. Legacy/manual permits derive directly from their absolute clock
-// cutoff. The supplied parent's earlier deadline and cancellation remain intact.
+// SDK values. Without an original receipt pair, manual permits retain their
+// declared cutoffs but can only project a parent's allowance from attachment,
+// not its unknown creation time. Parent cancellation remains intact.
 func (p *TerminalPermit) authorityContext(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc, RequestBudget) {
 	b := p.budget
 	if b.deadline.IsZero() {
@@ -195,14 +197,30 @@ func (p *TerminalPermit) authorityContext(ctx context.Context, timeout time.Dura
 	}
 	b.deadline = minTime(b.deadline, p.wallUntil)
 	b.until = min(b.until, p.until)
-	now := time.Now()
 	age := p.clock.Age()
+	now := time.Now()
 	if p.clock.Check() != nil || age < 0 || age < b.receipt.age || age >= b.until || b.invalid {
 		b.invalid = true
 		b.deadline = minTime(b.deadline, now)
 	} else {
-		remaining := b.until - age
-		if parentBudget, ok := RequestBudgetFromContext(ctx); ok {
+		// Project scheduler cutoffs ONCE using elapsed-before-scheduler samples.
+		// Resampling age after computing remaining would forgive suspension.
+		remaining := min(b.until-age, b.deadline.Sub(now))
+		parentBudget, hasParentBudget := RequestBudgetFromContext(ctx)
+		if d, ok := ctx.Deadline(); ok {
+			remaining = min(remaining, d.Sub(now))
+			if !b.receipt.at.IsZero() && b.receipt.clock != nil && (!hasParentBudget || !d.Equal(parentBudget.deadline)) {
+				// Also charge suspension BEFORE attachment. The original pair
+				// conservatively maps even a parent created after an earlier suspend.
+				// An unchanged SDK deadline already has its own elapsed cutoff;
+				// projecting its scheduler timer again would double-charge suspend.
+				parent := requestBudgetAt(b.receipt, d)
+				b.until = min(b.until, parent.until)
+				b.invalid = b.invalid || parent.invalid
+				remaining = min(remaining, b.until-age)
+			}
+		}
+		if hasParentBudget {
 			// A parent can already carry a tighter elapsed bound even when
 			// suspend has not advanced its Go context timer. Conservatively
 			// shrink this permit-clock allowance; never move its origin.
@@ -213,10 +231,11 @@ func (p *TerminalPermit) authorityContext(ctx context.Context, timeout time.Dura
 		}
 		// remaining <= until-age makes this addition nonoverflowing and
 		// never extends the original absolute permit cutoff.
-		b.until = age + remaining
+		b.until = min(b.until, age+max(0, remaining))
 		// The actual context timer must honor the elapsed cutoff at this
 		// sample, not wait for a later watchdog poll to notice it.
-		b.deadline = minTime(b.deadline, now.Add(remaining))
+		timerNow := time.Now()
+		b.deadline = minTime(b.deadline, timerNow.Add(b.Remaining()))
 	}
 	if d, ok := ctx.Deadline(); ok {
 		b.deadline = minTime(b.deadline, d)
@@ -460,8 +479,8 @@ func CompleteTerminalReceipt(ctx context.Context, operation string, expectedRevi
 	if clock == nil || clock.Check() != nil {
 		return terminalFailure()
 	}
-	wallStart := time.Now()
 	start := clock.Age()
+	wallStart := time.Now()
 	if start < 0 || start > time.Duration(math.MaxInt64)-5*time.Second {
 		return terminalFailure()
 	}
@@ -475,6 +494,13 @@ func CompleteTerminalReceipt(ctx context.Context, operation string, expectedRevi
 	initialRemaining := min(deadline.Sub(wallStart), 5*time.Second)
 	if hasBudget {
 		initialRemaining = min(initialRemaining, budget.until-start)
+		// Do not mint SDK write timing from an already elapsed caller deadline.
+		// An unchanged SDK timer carries its cutoff; other deadlines use the receipt.
+		callerBudget, hasCallerBudget := RequestBudgetFromContext(ctx)
+		if !hasCallerBudget || !deadline.Equal(callerBudget.deadline) {
+			callerBudget = requestBudgetAt(budget.receipt, deadline)
+		}
+		initialRemaining = min(initialRemaining, callerBudget.Remaining())
 	}
 	remaining := min(time.Until(deadline), initialRemaining-time.Since(wallStart))
 	tail := min(initialRemaining/4, 250*time.Millisecond)
@@ -520,7 +546,9 @@ func CompleteTerminalReceipt(ctx context.Context, operation string, expectedRevi
 	h.mu.Unlock()
 	// Install close ownership BEFORE any application transaction. This timer
 	// interrupts I/O without joining a writer/authority callback from itself.
-	writeCtx, cancel := context.WithDeadline(context.WithoutCancel(scope.ctx), p.wallUntil)
+	// Carry its known elapsed cutoff so observers do not reproject the timer
+	// through the original receipt and charge the same suspension twice.
+	writeCtx, cancel, _ := p.authorityContext(context.WithoutCancel(scope.ctx), 0)
 	defer cancel()
 	watchDone := make(chan struct{})
 	h.owned.Add(1)

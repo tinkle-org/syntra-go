@@ -346,7 +346,7 @@ func (g *goClientCore) close() error {
 type hostCall struct {
 	deadline  time.Time
 	receipt   requestReceipt // complete-frame origin, retained across dispatch delay
-	budget    *RequestBudget // selected before authorization; immutable thereafter
+	budget    *RequestBudget // bound at admission, only narrowed before authorization
 	cancelled bool
 	selected  *RpcResult
 }
@@ -507,8 +507,10 @@ func (g *goHostCore) onRequestLocked(f *Frame, receipt requestReceipt) *RpcError
 		budget = g.cfg.maxTimeout
 	}
 	deadline := receipt.at.Add(budget)
+	// Protect immediate rejections and pending calls before selector dispatch.
+	originalBudget := requestBudgetAt(receipt, deadline)
 	fail := func(code ErrorCode, msg string) *RpcError {
-		if !time.Now().Before(deadline) {
+		if originalBudget.Err() != nil {
 			code, msg = ErrorCodeDeadlineExceeded, "syntra: deadline exceeded"
 		}
 		if len(g.outbound) >= g.cfg.writerCapacity+g.cfg.maxPending {
@@ -520,7 +522,7 @@ func (g *goHostCore) onRequestLocked(f *Frame, receipt requestReceipt) *RpcError
 	if req == nil {
 		return fail(ErrorCodeInvalidArgument, "syntra: nil request")
 	}
-	if !time.Now().Before(deadline) {
+	if originalBudget.Err() != nil {
 		return fail(ErrorCodeDeadlineExceeded, "syntra: deadline exceeded")
 	}
 	if err := ValidateMethod(req.GetMethod()); err != nil {
@@ -532,7 +534,7 @@ func (g *goHostCore) onRequestLocked(f *Frame, receipt requestReceipt) *RpcError
 	if len(g.outstanding) >= g.cfg.maxPending {
 		return fail(ErrorCodeResourceExhausted, "syntra: too many concurrent RPCs")
 	}
-	g.outstanding[id] = &hostCall{deadline: deadline, receipt: receipt}
+	g.outstanding[id] = &hostCall{deadline: deadline, receipt: receipt, budget: &originalBudget}
 	g.pending = append(g.pending, pendingReq{id: id, req: req})
 	return nil
 }

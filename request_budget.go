@@ -88,17 +88,13 @@ type requestReceipt struct {
 // captureRequestReceipt samples the driver's original clock outside protocol
 // locks and raw I/O. A missing clock leaves ordinary wall-only requests supported.
 func captureRequestReceipt(t Transport) requestReceipt {
-	r := requestReceipt{at: time.Now()}
+	var clock TerminalClock
 	if provider, ok := t.(TerminalReceiptProvider); ok {
 		if driver := provider.TerminalReceiptDriver(); driver != nil {
-			r.clock = driver.TerminalClock()
-			if r.clock != nil {
-				r.age = r.clock.Age()
-				r.invalid = r.age < 0 || r.clock.Check() != nil
-			}
+			clock = driver.TerminalClock()
 		}
 	}
-	return r
+	return CaptureFrameReceipt(clock).receipt
 }
 
 // selectRequestBudget clamps immutable receipt timing before any authorization.
@@ -129,7 +125,7 @@ func selectRequestBudget(receipt requestReceipt, deadline time.Time, ctx context
 // requestBudgetAt binds an absolute deadline to the original trusted receipt
 // age. Invalid arithmetic cannot be repaired by a later application selector.
 func requestBudgetAt(receipt requestReceipt, deadline time.Time) RequestBudget {
-	b := RequestBudget{deadline: deadline, receipt: receipt, invalid: receipt.invalid}
+	b := RequestBudget{deadline: deadline, receipt: receipt, invalid: receipt.invalid || receipt.at.IsZero()}
 	if receipt.clock != nil {
 		duration := b.deadline.Sub(receipt.at)
 		if duration <= 0 || receipt.age > time.Duration(math.MaxInt64)-duration {

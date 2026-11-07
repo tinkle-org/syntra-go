@@ -184,6 +184,14 @@ enforcement. Expired or invalid original budgets also skip selection. The core a
 callback context use the same selected request deadline, including an earlier
 serving-context deadline.
 
+The ordered driver's frame owner captures a single origin before each decoder
+push and preserves it for all frames completed by that batch. Timing is delivered
+atomically through `FrameReceiptTransport`, including ownership, readiness and
+recovery-ingress wrappers. Old assembly bounds are checked before completion can
+clear them or a trailing partial can replace them. Custom transports must provide
+that optional timing contract to account for assembly and buffering; legacy
+`Recv` alone supplies only a delivery-time origin.
+
 At reservation start `S`, the absolute deadline and reserved teardown tail are:
 
 ```text
@@ -215,7 +223,13 @@ projecting the remaining absolute elapsed cutoff into that timer without moving
 the original clock origin or extending its cutoff. Watchdogs remain independent
 fail-closed guards against suspend, discontinuity and noncooperative callbacks.
 Legacy/manual permit fixtures without an original request budget derive from the
-permit's existing absolute elapsed and wall cutoffs, never a fresh allowance.
+permit's declared cutoffs and attachment-time parent allowance; they cannot infer
+an unknown earlier parent origin. SDK-issued receipt pairs additionally bound
+earlier parent deadlines in the trusted domain before attachment or reservation.
+Elapsed capture precedes scheduler capture when projecting such deadlines; timer
+projection samples scheduler time before elapsed remaining. These conservative
+conversions may shorten an allowance, never renew it. Existing SDK-derived timers
+keep their elapsed provenance and are not projected twice.
 The selector does not authorize, enable terminal support, or override default
 denial/recovery routing. `HostConfig` has an added field; use keyed literals.
 

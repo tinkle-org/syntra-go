@@ -111,7 +111,11 @@ func TestRequestBudgetSelectionAndCoreCoherence(t *testing.T) {
 				}
 				// Both mutexes must be available during application selection.
 				h.mu.Lock()
+				closed := h.closed
 				h.mu.Unlock()
+				if closed {
+					t.Error("host closed during request budget selection")
+				}
 				_, _ = hc.core.callDeadline(1)
 				return test.cap, test.selected
 			}

@@ -259,6 +259,9 @@ func TestNotifyContinuesPastBoundedHTTPSBacklog(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Initial managed controls enable native admission asynchronously. Wait
+	// before dialing so startup rejection cannot replace the backlog scenario.
+	until(t, func() bool { return !l.Snapshot().Server.Paused })
 	ctx := testContext(t)
 	destination := netip.MustParseAddrPort(l.LocalAddr().String())
 	bad, err := syntrahttp.Dial(ctx, destination, authority, provider, cc, syntra.ClientConfig{}, ordered.Options{})

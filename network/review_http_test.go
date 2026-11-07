@@ -29,6 +29,8 @@ func applicationAdmissionListener(t *testing.T, n *Network, admit func(context.C
 	if err != nil {
 		t.Fatal(err)
 	}
+	// One-shot dials must wait for the initial native admission fence to lift.
+	until(t, func() bool { return !l.Snapshot().Server.Paused })
 	return l, func(ctx context.Context, budget *ordered.EstablishmentBudget) (*connection.Client, error) {
 		return syntrahttp.Dial(ctx, netip.MustParseAddrPort(l.LocalAddr().String()), authority, nil, cc, syntra.ClientConfig{}, ordered.Options{Budget: budget})
 	}

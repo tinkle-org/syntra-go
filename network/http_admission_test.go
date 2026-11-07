@@ -38,6 +38,8 @@ func TestSharedAdmissionTCPHTTPFIFOAndIdleDoesNotHoard(t *testing.T) {
 			if n.admission.Available() != 1 || http.Snapshot().Admitted != 0 {
 				t.Fatal("idle listeners reserved shared admission")
 			}
+			// Do not let initial paused admission reject the one-shot idle socket.
+			until(t, func() bool { return !http.Snapshot().Server.Paused })
 			// Even accepted sockets without an open header remain native/unbound;
 			// neither stream is an application association yet.
 			idle, err := net.Dial("tcp", http.LocalAddr().String())

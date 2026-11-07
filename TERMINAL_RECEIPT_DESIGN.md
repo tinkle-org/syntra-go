@@ -259,42 +259,17 @@ ownership, fixed-frame bounds, exact/sticky evidence, revisions, barriers,
 partial loss, cancellation, deadline/read bounds, fatal input, fresh Returning
 denial, retained charges, and callback-reentrant host controls.
 
-Recorded verification on 2026-11-06 includes a full race run across all 13
-test-bearing packages, `go vet`, formatting, and whitespace checks passing after
-the revision-preflight regression. The CGO-disabled Go 1.23.12 compatibility
-suite also passed. Reproduce checks against the final tree after any subsequent
-edit; no aggregate top-level test count is asserted here.
+Run the SDK checks in [CONTRIBUTING.md](CONTRIBUTING.md) against the tree being
+evaluated. Test source identifies intended coverage, not a passing result for a
+particular revision. Local tests do not prove production durability, platform
+suspend behavior, formal conformance, or custom-carrier support.
 
-[Cross-language fixture evidence](TERMINAL_RECEIPT_INTEROP.md) records **14
-distinct passing cases** across Go-server/Rust-client and Rust-server/Go-client:
-owned and commit/return-gap success over direct and fragmented TCP, denial,
-unknown authority, and partial receipt loss. Every case includes a fresh
-Returning probe with no RPC and checked authority denial. The recorded run-2
-hashes, report location, availability, and limits belong to that note.
-It is not evidence for later edits until rerun.
+## Normative reference
 
-`cmd/terminal-fixture/main.go` is a loopback-only volatile authority fixture, not a
-production adapter. See the interop note for reproducible harness use rather than
-copying fixture credentials into deployments. Neither fixture success nor local
-race tests prove production durability, platform suspend behavior, formal
-conformance, custom-carrier support, or application Logout acceptance.
-
-## Reference and adoption
-
-The shared contract is connection §6 at
-`syntra/specifications/connection.md#6-scoped-terminal-receipt`
-(requires a sibling checkout), with linked RPC, security, and transport
-requirements. That section is not present at the accepted
-specification commit `c6a28abf2c52b3f21a7362366d3f5891f33601d5`, so no pinned
-hosted URL for this uncommitted adoption is claimed.
-The sibling shared branch contains canonical adoption of thirteen
-`SNTR-TRC-*` requirements and fourteen
-registered case groups; registration is not formal execution. Its uncommitted
-adoption changes must merge before they can be cited as the merged reference.
+The normative contract is [connection §6, scoped terminal receipt](https://github.com/tinkle-org/syntra/blob/985d90eb5ee6d7aec0d20ea088430f271eed7cd7/specifications/connection.md#6-scoped-terminal-receipt)
+at specification commit `985d90eb5ee6d7aec0d20ea088430f271eed7cd7`, including its
+linked RPC, security, and transport requirements. All thirteen `SNTR-TRC-*`
+requirements apply together; the specification does not establish SDK support
+or activate host policy.
 The SDK uses existing `Frame`/`RpcResult`; no wire message, peer option,
 negotiation, protobuf source, or generated binding change is required.
-
-See [the merge and release handoff](TERMINAL_RECEIPT_HANDOFF.md) for verification
-and manual release ordering. [Issue 17](https://github.com/tinkle-org/syntra-go/issues/17)
-remains open: the SDK capability is implemented and fixture-tested, but consumer
-adaptation and application acceptance are separate obligations.

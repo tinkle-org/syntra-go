@@ -203,16 +203,13 @@ boundary first, then attempts only the exact owned
 result and closes. A nil return means complete local writing, not peer receipt or
 joined cleanup. Loss remains unknown; nothing is automatically retried or replayed.
 
-The verified stock composition is ordered/TCP, including connection ownership
+The supported stock composition is ordered/TCP, including connection ownership
 wrappers. Other stock carriers, uncoordinated custom paths, and hosts with Recovery
-reject before mutation. See [the implementation contract and fixture](TERMINAL_RECEIPT_DESIGN.md)
+reject before mutation. See [the implementation contract](TERMINAL_RECEIPT_DESIGN.md)
 for authority evidence, the 1024-byte complete-frame limit, deadline/teardown
 budgets, and last-observation race. Existing clients parse the same `RpcResult`;
 there is no new wire message or peer option. Ordinary withdrawal and
-`Host.DisconnectPrincipal` are unchanged. The
-[20-case bidirectional fixture report](TERMINAL_RECEIPT_INTEROP.md) is bounded SDK
-evidence, not production durability or application acceptance. See the
-[handoff](TERMINAL_RECEIPT_HANDOFF.md) for manual merge/release and consumer order.
+`Host.DisconnectPrincipal` are unchanged.
 
 ## Optional update recovery
 

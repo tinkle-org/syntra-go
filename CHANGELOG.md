@@ -13,8 +13,7 @@
 - Root Host + ordered/TCP support, including connection ownership/readiness
   wrappers. Recovery-enabled Go hosts, raw drivers, other stock carriers, and
   uncoordinated custom paths refuse before mutation. Ordinary withdrawal defaults
-  and wire messages are unchanged. See [usage and limits](TERMINAL_RECEIPT_DESIGN.md)
-  and the [manual release/consumer handoff](TERMINAL_RECEIPT_HANDOFF.md).
+  and wire messages are unchanged. See [usage and limits](TERMINAL_RECEIPT_DESIGN.md).
 
 ## 1.0.0-rc.2 (2026-11-07)
 

@@ -24,7 +24,7 @@ type RequestBudgetFunc func(principal, method string, payload []byte) (time.Dura
 // terminal authority adapters. Its zero value is expired. Remaining also checks
 // trusted suspend-inclusive elapsed time when the transport supports it; Deadline
 // alone is a Go context deadline and may not account for machine suspension.
-// Derived terminal budgets also recheck retained ancestor clocks and cutoffs.
+// Dispatch and terminal budgets also recheck retained ancestor clocks and cutoffs.
 // Expiry cancels eligibility, not durable effects already admitted externally.
 type RequestBudget struct {
 	deadline time.Time
@@ -127,6 +127,8 @@ func clampParentRequest(ctx context.Context, b RequestBudget) (RequestBudget, ti
 			b.invalid = b.invalid || projected.invalid
 			return projected.Remaining()
 		}
+		// Scheduler-only receipts must retain plain bounds hidden in SDK lineage too.
+		b.deadline = minTime(b.deadline, d)
 		return time.Until(d)
 	})
 	if hasParent {
@@ -156,14 +158,15 @@ func captureRequestReceipt(t Transport) requestReceipt {
 	return CaptureFrameReceipt(clock).receipt
 }
 
-// selectRequestBudget clamps immutable receipt timing before any authorization.
-// Arithmetic uses only the already-bounded effective duration, so even a maximum
-// positive host cap cannot overflow an elapsed addition or extend the peer cap.
+// selectRequestBudget clamps immutable receipt timing and retains serving-context
+// ancestry before every selector exit and authorization. Caps preserve existing
+// parent projections; even a maximum cap cannot overflow or extend that budget.
 func selectRequestBudget(receipt requestReceipt, deadline time.Time, ctx context.Context, choose RequestBudgetFunc, principal string, req *RpcRequest) RequestBudget {
 	if d, ok := ctx.Deadline(); ok {
 		deadline = minTime(deadline, d)
 	}
 	b := requestBudgetAt(receipt, deadline)
+	b, _ = clampParentRequest(ctx, b)
 	// Application policy cannot change reserved recovery behavior or run on
 	// exhausted/invalid original timing. Still expose and enforce that budget.
 	if choose == nil || strings.HasPrefix(req.GetMethod(), RecoveryMethodPrefix) || ctx.Err() != nil || b.Err() != nil {
@@ -178,7 +181,11 @@ func selectRequestBudget(receipt requestReceipt, deadline time.Time, ctx context
 		b.deadline = minTime(b.deadline, receipt.at)
 		return b
 	}
-	return requestBudgetAt(receipt, minTime(deadline, receipt.at.Add(cap)))
+	capped := requestBudgetAt(receipt, minTime(b.deadline, receipt.at.Add(cap)))
+	capped.parents = b.parents
+	capped.until = min(capped.until, b.until)
+	capped.invalid = capped.invalid || b.invalid
+	return capped
 }
 
 // requestBudgetAt binds an absolute deadline to the original trusted receipt

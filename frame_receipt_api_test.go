@@ -8,6 +8,7 @@ import (
 	"time"
 
 	syntra "github.com/tinkle-org/syntra-go"
+	"github.com/tinkle-org/syntra-go/securechannel"
 )
 
 // receiptAPIDriver publishes trusted local timing through ordinary Recv.
@@ -130,23 +131,38 @@ func (w *receiptAPIBufferWrapper) Recv(ctx context.Context) ([]byte, error) {
 	return raw, nil
 }
 
-// TestReceiptPublicBufferAcrossCalls retains original timing after the first
-// receive context is canceled, with no second read or receipt recapture.
+// TestReceiptPublicBufferAcrossCalls preserves each frame's distinct original
+// receipt across prefetch and cancellation, without rereading or recapturing time.
 func TestReceiptPublicBufferAcrossCalls(t *testing.T) {
-	original := syntra.CaptureFrameReceipt(nil)
-	driver := &receiptAPIDriver{receipt: original}
+	// Drive elapsed time so the two origins differ even if scheduler samples match.
+	var elapsed time.Duration
+	clock := securechannel.NewClockWithSource(securechannel.ElapsedFunc(func() (time.Duration, bool) {
+		return elapsed, true
+	}))
+	firstOriginal := syntra.CaptureFrameReceipt(clock)
+	elapsed = time.Millisecond
+	secondOriginal := syntra.CaptureFrameReceipt(clock)
+	if firstOriginal == secondOriginal {
+		t.Fatal("fixture must supply distinct original receipts")
+	}
+	driver := &receiptAPIDriver{receipt: firstOriginal}
+	driver.check = func(context.Context) {
+		if driver.recvCalls == 2 {
+			driver.receipt = secondOriginal
+		}
+	}
 	filter := &receiptAPIFilter{FrameReceiptTransport: driver}
 	wrapper := &receiptAPIBufferWrapper{Transport: filter}
 	firstCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	first, receipt, err := syntra.RecvWithReceipt(firstCtx, wrapper)
-	if err != nil || string(first) != "accepted frame" || receipt != original {
-		t.Fatalf("prefetch lost original receipt: err=%v", err)
+	if err != nil || string(first) != "accepted frame" || receipt != firstOriginal {
+		t.Fatalf("prefetch lost first original receipt: same receipt=%v err=%v", receipt == firstOriginal, err)
 	}
 	cancel()
 	second, receipt, err := syntra.RecvWithReceipt(context.Background(), wrapper)
-	if err != nil || string(second) != "accepted frame" || receipt != original || &second[0] == &driver.last[0] {
-		t.Fatalf("buffered copy lost original receipt: err=%v", err)
+	if err != nil || string(second) != "accepted frame" || receipt != secondOriginal || &second[0] == &driver.last[0] {
+		t.Fatalf("buffered copy lost second original receipt: same receipt=%v err=%v", receipt == secondOriginal, err)
 	}
 	if filter.calls != 2 || driver.recvCalls != 2 || driver.timedCalls != 0 || wrapper.pending != nil {
 		t.Fatal("buffered delivery reread the driver, bypassed policy or retained the buffer")

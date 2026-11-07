@@ -186,11 +186,15 @@ serving-context deadline.
 
 The ordered driver's frame owner captures a single origin before each decoder
 push and preserves it for all frames completed by that batch. Timing is delivered
-atomically through `FrameReceiptTransport`, including ownership, readiness and
-recovery-ingress wrappers. Old assembly bounds are checked before completion can
-clear them or a trailing partial can replace them. Custom transports must provide
-that optional timing contract to account for assembly and buffering; legacy
-`Recv` alone supplies only a delivery-time origin.
+with its owned frame through bounded, per-call metadata publication. Root receives
+always use the outer `Recv`; a promoted `RecvWithReceipt` cannot bypass wrapper
+policy. Drivers and copying/buffering wrappers publish the original receipt for
+the returned buffer with `FrameReceipt.Publish`. Stock ownership, readiness and
+recovery-ingress wrappers preserve the same checks. Old assembly bounds are
+checked before completion can clear them or a trailing partial can replace them.
+Custom transports must preserve that timing contract to account for assembly and
+buffering; a legacy receive publishing no metadata supplies only a delivery-time
+origin.
 
 At reservation start `S`, the absolute deadline and reserved teardown tail are:
 
@@ -228,8 +232,11 @@ an unknown earlier parent origin. SDK-issued receipt pairs additionally bound
 earlier parent deadlines in the trusted domain before attachment or reservation.
 Elapsed capture precedes scheduler capture when projecting such deadlines; timer
 projection samples scheduler time before elapsed remaining. These conservative
-conversions may shorten an allowance, never renew it. Existing SDK-derived timers
-keep their elapsed provenance and are not projected twice.
+conversions may shorten an allowance, never renew it. SDK-derived driver and
+authority timers retain their own elapsed cutoff and immutable parent lineage,
+including the scheduler projection before parent clamping. Only undeclared plain
+deadlines require receipt-based projection. Existing SDK timers are not projected
+twice, while an intervening stricter plain parent remains binding.
 The selector does not authorize, enable terminal support, or override default
 denial/recovery routing. `HostConfig` has an added field; use keyed literals.
 

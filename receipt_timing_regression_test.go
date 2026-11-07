@@ -15,23 +15,34 @@ type receiptPairClock struct {
 	afterSample time.Time
 }
 
-// receiptTransportFixture makes timed versus legacy dispatch observable.
+// receiptTransportFixture makes outer Recv dispatch and receipt publication observable.
 type receiptTransportFixture struct {
 	Transport
-	frame   []byte
-	receipt FrameReceipt
-	legacy  bool
+	frame    []byte
+	receipt  FrameReceipt
+	received bool
 }
 
-// Recv records an accidental fallback rather than exposing original timing.
-func (f *receiptTransportFixture) Recv(context.Context) ([]byte, error) {
-	f.legacy = true
-	return f.frame, nil
+// Recv publishes original timing while preserving the ordinary receive entry point.
+func (f *receiptTransportFixture) Recv(ctx context.Context) ([]byte, error) {
+	f.received = true
+	raw, _, err := f.RecvWithReceipt(ctx)
+	return raw, err
 }
 
 // RecvWithReceipt returns the frame and its immutable original timing together.
-func (f *receiptTransportFixture) RecvWithReceipt(context.Context) ([]byte, FrameReceipt, error) {
+func (f *receiptTransportFixture) RecvWithReceipt(ctx context.Context) ([]byte, FrameReceipt, error) {
+	f.receipt.Publish(ctx, f.frame)
 	return f.frame, f.receipt, nil
+}
+
+// legacyReceiptFixture deliberately supplies no receive metadata.
+type legacyReceiptFixture struct{ *receiptTransportFixture }
+
+// Recv exposes only legacy delivery timing, with no receipt publication.
+func (f *legacyReceiptFixture) Recv(context.Context) ([]byte, error) {
+	f.received = true
+	return f.frame, nil
 }
 
 // TestReceiptSDKWrappersAndLegacyFallback checks ownership and recovery wrappers
@@ -40,9 +51,9 @@ func TestReceiptSDKWrappersAndLegacyFallback(t *testing.T) {
 	clock := &terminalReviewClock{}
 	original := CaptureFrameReceipt(clock)
 	fixture := &receiptTransportFixture{frame: []byte("frame"), receipt: original}
-	for _, wrapper := range []string{"owned", "recovery", "legacy", "closed-recovery"} {
+	for _, wrapper := range []string{"owned", "recovery", "hidden-optional", "legacy", "closed-recovery"} {
 		t.Run(wrapper, func(t *testing.T) {
-			fixture.legacy = false
+			fixture.received = false
 			var transport Transport = &ownedTransport{Transport: fixture}
 			switch wrapper {
 			case "recovery", "closed-recovery":
@@ -55,13 +66,15 @@ func TestReceiptSDKWrappersAndLegacyFallback(t *testing.T) {
 				if wrapper == "closed-recovery" {
 					inbox.Close()
 				}
-			case "legacy":
-				// Hide the optional method, as a custom legacy wrapper would.
+			case "hidden-optional":
+				// Hiding optional methods must not hide context-carried metadata.
 				transport = &ownedTransport{Transport: struct{ Transport }{fixture}}
+			case "legacy":
+				transport = &ownedTransport{Transport: &legacyReceiptFixture{fixture}}
 			}
 			raw, receipt, err := recvWithReceipt(context.Background(), transport)
 			if wrapper == "closed-recovery" {
-				if err == nil || raw != nil {
+				if err == nil || raw != nil || fixture.received {
 					t.Fatal("timed receive bypassed closed ingress")
 				}
 				return
@@ -70,10 +83,10 @@ func TestReceiptSDKWrappersAndLegacyFallback(t *testing.T) {
 				t.Fatalf("wrapper receive: raw=%q err=%v", raw, err)
 			}
 			if wrapper == "legacy" {
-				if !fixture.legacy || receipt.ReceivedAt().Before(original.ReceivedAt()) || receipt.receipt.clock != nil {
+				if !fixture.received || receipt.ReceivedAt().Before(original.ReceivedAt()) || receipt.receipt.clock != nil {
 					t.Fatal("legacy fallback manufactured unavailable original timing")
 				}
-			} else if fixture.legacy || receipt != original {
+			} else if !fixture.received || receipt != original {
 				t.Fatal("wrapper lost the atomic original frame receipt")
 			}
 		})

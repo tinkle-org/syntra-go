@@ -830,6 +830,7 @@ func (t *Transport) Recv(ctx context.Context) ([]byte, error) {
 // RecvWithReceipt atomically removes an owned frame and the timing captured
 // BEFORE its completing decoder push, including time spent in peer authorization.
 // Concurrent receivers share the same bounded admission and serialized queue.
+// It also publishes that exact pair to the current SDK receive context.
 func (t *Transport) RecvWithReceipt(ctx context.Context) ([]byte, syntra.FrameReceipt, error) {
 	release, err := t.acquire(ctx, t.recvAdmission, t.recvGate)
 	if err != nil {
@@ -862,6 +863,7 @@ func (t *Transport) RecvWithReceipt(ctx context.Context) ([]byte, syntra.FrameRe
 			t.frames = t.frames[1:]
 			t.helloComplete(false)
 			t.confirmed.Do(func() { close(t.confirm) })
+			frame.receipt.Publish(ctx, frame.raw)
 			return frame.raw, frame.receipt, nil
 		}
 		readCtx, cancel := elapsedContext(ctx, t.channel.Clock(), until)

@@ -156,13 +156,20 @@ timestamp and trusted age through buffering and authorization. A fragmented
 frame uses its completion batch, not its first fragment. Assembly is checked
 against its existing limits before those limits can be replaced.
 
-Custom transports can implement `FrameReceiptTransport.RecvWithReceipt` to return
-the frame and its timing atomically. Capture the metadata with
-`CaptureFrameReceipt` on the original transport clock. Wrappers that override
-`Recv` must preserve the same behavior in `RecvWithReceipt`, including readiness
-and ingress checks. A legacy transport exposing only `Recv` remains supported,
-but its unavailable assembly/buffering time cannot be recovered: its timing
-origin is captured when `Recv` returns.
+Root receives always invoke the outer `Recv`, so an embedded optional method
+cannot bypass a wrapper's filtering, readiness or ingress checks. Drivers capture
+metadata with `CaptureFrameReceipt` on the original transport clock and publish
+the original frame/receipt through `FrameReceipt.Publish(ctx, frame)` before
+returning. `FrameReceiptTransport.RecvWithReceipt` remains available to direct
+transport consumers; implementing it alone does not replace `Recv` policy.
+
+Transparent wrappers forward the receive context and the unchanged frame buffer.
+Copying, transforming or buffering wrappers must retain and publish the original
+receipt for the buffer they return, never recapture time. Correlation is bounded
+to 32 recent publications per receive call and validates buffer identity, length
+and contents. Known unmatched, invalid or evicted metadata fails closed. Legacy
+transports that publish no metadata retain delivery-time capture; unavailable
+assembly/buffering timing cannot be recovered.
 
 `RequestBudgetFromContext(ctx) (RequestBudget, bool)` exposes read-only SDK timing
 to authorizers, handlers and terminal authority adapters. `Deadline()` returns the
@@ -193,7 +200,9 @@ retain their declared permit cutoffs but cannot recover a parent's elapsed time
 before attachment. For SDK-issued budgets, an earlier scheduler-only parent is
 also conservatively bounded by the original receipt pair, so suspension before
 callback attachment cannot renew it. SDK-created narrower timers retain their
-existing elapsed provenance rather than charging the same suspension twice.
+own declared elapsed cutoff and parent lineage rather than charging the same
+suspension twice. A fresh ordered I/O deadline remains usable within the original
+request/operation bound; an independently stricter plain parent still wins.
 
 This adds a field to exported `HostConfig`; use keyed composite literals.
 Downstream unkeyed literals can require a source update.

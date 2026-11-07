@@ -146,7 +146,7 @@ func TestReceiptAssemblyRechecksOldBounds(t *testing.T) {
 // TestReceiptBufferedBeforeHostLoopChargesPreauthorization proves that stock
 // assembly metadata survives the root handshake, owned wrapper and receive pump.
 func TestReceiptBufferedBeforeHostLoopChargesPreauthorization(t *testing.T) {
-	for _, stage := range []string{"assembly", "channel-authorization", "host-policy"} {
+	for _, stage := range []string{"assembly", "channel-authorization", "host-policy", "recv-filter"} {
 		t.Run(stage, func(t *testing.T) {
 			var age atomic.Int64
 			tr, client, m := timingReceiver(t, &age, Options{})
@@ -162,6 +162,17 @@ func TestReceiptBufferedBeforeHostLoopChargesPreauthorization(t *testing.T) {
 					}}
 			}
 			var authorizations atomic.Int32
+			var transport syntra.Transport = tr
+			if stage == "recv-filter" {
+				transport = &receiptPolicyTransport{Transport: tr, recv: func(ctx context.Context) ([]byte, error) {
+					raw, err := tr.Recv(ctx)
+					if err == nil && string(raw) == "discard" {
+						raw, err = tr.Recv(ctx)
+					}
+					age.Store(int64(80 * time.Millisecond))
+					return raw, err
+				}}
+			}
 			host, err := syntra.OpenHost(syntra.HostConfig{
 				Policy: func(context.Context, []byte) (string, error) {
 					if stage == "host-policy" {
@@ -181,11 +192,15 @@ func TestReceiptBufferedBeforeHostLoopChargesPreauthorization(t *testing.T) {
 			defer host.Close()
 			hello, _ := syntra.MarshalFrame(syntra.NewHelloFrame(&syntra.ClientHello{MinVersion: 1, MaxVersion: 1}, 1))
 			request, _ := syntra.MarshalFrame(syntra.NewRequestFrame(1, 1, &syntra.RpcRequest{Method: "/example.Echo/Echo", TimeoutMs: 1000}))
-			putRecord(t, m, client, append(envelope(hello), envelope(request)...))
+			plain := envelope(hello)
+			if stage == "recv-filter" {
+				plain = append(plain, envelope([]byte("discard"))...)
+			}
+			putRecord(t, m, client, append(plain, envelope(request)...))
 			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 			defer cancel()
 			done := make(chan error, 1)
-			go func() { done <- host.Serve(ctx, tr) }()
+			go func() { done <- host.Serve(ctx, transport) }()
 			defer func() { cancel(); _ = tr.Close(); <-done }()
 			var decoder securechannel.FrameDecoder
 			for results := 0; results < 2; {

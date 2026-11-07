@@ -6,6 +6,8 @@ import (
 	"math"
 	"strings"
 	"time"
+
+	"github.com/tinkle-org/syntra-go/internal/elapsedctx"
 )
 
 // RequestBudgetFunc optionally selects a host cap for one validated request,
@@ -76,6 +78,30 @@ func RequestBudgetFromContext(ctx context.Context) (RequestBudget, bool) {
 
 // requestBudgetKey prevents callers from manufacturing SDK timing scope.
 type requestBudgetKey struct{}
+
+// clampParentRequest preserves explicit SDK elapsed provenance while charging
+// plain deadlines against the original receipt, including pre-attachment suspend.
+// Known cutoffs from unrelated clocks intersect by remaining duration, never age.
+// The returned budget also retains exact receipt-projected plain absolute bounds.
+func clampParentRequest(ctx context.Context, b RequestBudget) (RequestBudget, time.Duration) {
+	parent, hasParent := RequestBudgetFromContext(ctx)
+	remaining := elapsedctx.Remaining(ctx, func(d time.Time) time.Duration {
+		if hasParent && d.Equal(parent.deadline) {
+			return parent.Remaining()
+		}
+		if !b.receipt.at.IsZero() && b.receipt.clock != nil {
+			projected := requestBudgetAt(b.receipt, d)
+			b.until = min(b.until, projected.until)
+			b.invalid = b.invalid || projected.invalid
+			return projected.Remaining()
+		}
+		return time.Until(d)
+	})
+	if hasParent {
+		remaining = min(remaining, parent.Remaining())
+	}
+	return b, remaining
+}
 
 // requestReceipt captures both origins before the received frame is queued.
 type requestReceipt struct {

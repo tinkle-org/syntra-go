@@ -360,31 +360,31 @@ type recoveryIngressTransport struct {
 	inbox  *RecoveryInbox
 }
 
-// Recv retains ingress validation for callers that do not request timing metadata.
+// Recv checks ingress ownership before calling the underlying receive policy.
+// The context carries any original frame receipt through unchanged.
 func (t *recoveryIngressTransport) Recv(ctx context.Context) ([]byte, error) {
-	frame, _, err := t.RecvWithReceipt(ctx)
-	return frame, err
-}
-
-// RecvWithReceipt forwards frame timing only after the same ingress checks as Recv.
-func (t *recoveryIngressTransport) RecvWithReceipt(ctx context.Context) ([]byte, FrameReceipt, error) {
 	if t.inbox == nil {
-		return nil, FrameReceipt{}, recoveryInvalid()
+		return nil, recoveryInvalid()
 	}
 	_, closed := t.inbox.ingressState()
 	if closed {
-		return nil, FrameReceipt{}, NewRpcError(ErrorCodeUnavailable, "syntra: recovery ingress closed")
+		return nil, NewRpcError(ErrorCodeUnavailable, "syntra: recovery ingress closed")
 	}
 	if t.client == nil {
-		return nil, FrameReceipt{}, recoveryInvalid()
+		return nil, recoveryInvalid()
 	}
 	t.client.mu.Lock()
 	attached := t.client.recoveryInbox == t.inbox
 	t.client.mu.Unlock()
 	if !attached {
-		return nil, FrameReceipt{}, recoveryInvalid()
+		return nil, recoveryInvalid()
 	}
-	return recvWithReceipt(ctx, t.Transport)
+	return t.Transport.Recv(ctx)
+}
+
+// RecvWithReceipt retains the same ingress checks and underlying Recv policy.
+func (t *recoveryIngressTransport) RecvWithReceipt(ctx context.Context) ([]byte, FrameReceipt, error) {
+	return recvWithReceipt(ctx, t)
 }
 func (t *recoveryIngressTransport) Close() error {
 	if t.inbox != nil {

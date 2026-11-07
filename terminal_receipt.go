@@ -9,6 +9,8 @@ import (
 	"math"
 	"sync"
 	"time"
+
+	"github.com/tinkle-org/syntra-go/internal/elapsedctx"
 )
 
 // TerminalAuthorityState classifies a fresh operation-aware authority read.
@@ -183,11 +185,12 @@ func (p *TerminalPermit) checkTimeLocked() {
 }
 
 // authorityContext derives callback timing from the permit's absolute cutoffs,
-// retaining the original receipt/clock origin. Scheduler-only parent and permit
-// cutoffs are projected once into that domain, and can only shorten it.
+// retaining the original receipt/clock origin. Declared SDK timers retain their
+// own absolute elapsed cutoffs; scheduler-only parents are conservatively mapped
+// through the original pair. Every intersection can only shorten the allowance.
 // A positive timeout additionally bounds one observation;
 // zero means the operation cutoff (Commit). Driver refresh parents need not carry
-// SDK values. Without an original receipt pair, manual permits retain their
+// a root RequestBudget. Without an original receipt pair, manual permits retain their
 // declared cutoffs but can only project a parent's allowance from attachment,
 // not its unknown creation time. Parent cancellation remains intact.
 func (p *TerminalPermit) authorityContext(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc, RequestBudget) {
@@ -206,26 +209,12 @@ func (p *TerminalPermit) authorityContext(ctx context.Context, timeout time.Dura
 		// Project scheduler cutoffs ONCE using elapsed-before-scheduler samples.
 		// Resampling age after computing remaining would forgive suspension.
 		remaining := min(b.until-age, b.deadline.Sub(now))
-		parentBudget, hasParentBudget := RequestBudgetFromContext(ctx)
-		if d, ok := ctx.Deadline(); ok {
-			remaining = min(remaining, d.Sub(now))
-			if !b.receipt.at.IsZero() && b.receipt.clock != nil && (!hasParentBudget || !d.Equal(parentBudget.deadline)) {
-				// Also charge suspension BEFORE attachment. The original pair
-				// conservatively maps even a parent created after an earlier suspend.
-				// An unchanged SDK deadline already has its own elapsed cutoff;
-				// projecting its scheduler timer again would double-charge suspend.
-				parent := requestBudgetAt(b.receipt, d)
-				b.until = min(b.until, parent.until)
-				b.invalid = b.invalid || parent.invalid
-				remaining = min(remaining, b.until-age)
-			}
-		}
-		if hasParentBudget {
-			// A parent can already carry a tighter elapsed bound even when
-			// suspend has not advanced its Go context timer. Conservatively
-			// shrink this permit-clock allowance; never move its origin.
-			remaining = min(remaining, parentBudget.Remaining())
-		}
+		// SDK driver timers retain their own absolute elapsed cutoff. Only
+		// undeclared plain deadlines are projected through the original pair;
+		// metadata inheritance alone cannot exempt a stricter plain child.
+		var parentRemaining time.Duration
+		b, parentRemaining = clampParentRequest(ctx, b)
+		remaining = min(remaining, parentRemaining)
 		if timeout > 0 {
 			remaining = min(remaining, timeout)
 		}
@@ -240,7 +229,7 @@ func (p *TerminalPermit) authorityContext(ctx context.Context, timeout time.Dura
 	if d, ok := ctx.Deadline(); ok {
 		b.deadline = minTime(b.deadline, d)
 	}
-	callbackCtx, cancel := context.WithDeadline(context.WithValue(ctx, requestBudgetKey{}, b), b.deadline)
+	callbackCtx, cancel := elapsedctx.WithDeadline(context.WithValue(ctx, requestBudgetKey{}, b), b.receipt.clock, b.until, b.deadline)
 	return callbackCtx, cancel, b
 }
 
@@ -494,14 +483,11 @@ func CompleteTerminalReceipt(ctx context.Context, operation string, expectedRevi
 	initialRemaining := min(deadline.Sub(wallStart), 5*time.Second)
 	if hasBudget {
 		initialRemaining = min(initialRemaining, budget.until-start)
-		// Do not mint SDK write timing from an already elapsed caller deadline.
-		// An unchanged SDK timer carries its cutoff; other deadlines use the receipt.
-		callerBudget, hasCallerBudget := RequestBudgetFromContext(ctx)
-		if !hasCallerBudget || !deadline.Equal(callerBudget.deadline) {
-			callerBudget = requestBudgetAt(budget.receipt, deadline)
-		}
-		initialRemaining = min(initialRemaining, callerBudget.Remaining())
 	}
+	// Preserve declared driver timing but never renew an earlier plain
+	// caller, including one exhausted before reservation attachment.
+	_, callerRemaining := clampParentRequest(ctx, budget)
+	initialRemaining = min(initialRemaining, callerRemaining)
 	remaining := min(time.Until(deadline), initialRemaining-time.Since(wallStart))
 	tail := min(initialRemaining/4, 250*time.Millisecond)
 	if tail < 2*terminalPollInterval || remaining-tail <= policy.ObservationTimeout {

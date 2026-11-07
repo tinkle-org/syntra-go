@@ -14,6 +14,19 @@
   wrappers. Recovery-enabled Go hosts, raw drivers, other stock carriers, and
   uncoordinated custom paths refuse before mutation. Ordinary withdrawal defaults
   and wire messages are unchanged. See [usage and limits](TERMINAL_RECEIPT_DESIGN.md).
+- Optional `HostConfig.RequestBudget` selects a receipt-origin host cap before
+  authorization. `RequestBudgetFromContext` exposes readonly remaining time to
+  authorization, handlers, and terminal authority callbacks.
+- `FrameReceipt`, `CaptureFrameReceipt`, and `FrameReceiptTransport` preserve
+  completing-batch timing for direct transport consumers. Drivers publish the
+  original receipt through `FrameReceipt.Publish`; root receives retain the
+  ordinary `Recv` policy path.
+
+### Changed
+
+- `HostConfig` has a new field. Nonempty unkeyed literals written against the
+  previous version no longer compile; convert them to keyed literals before
+  upgrading. Empty `HostConfig{}` literals remain valid.
 
 ## 1.0.0-rc.2 (2026-11-07)
 

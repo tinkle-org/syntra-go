@@ -119,6 +119,103 @@ receive a context bounded by the call budget and must stop and join their own
 work when it ends. Return `NewSuccessResult` for success or a typed `RpcError`
 with safe public text for a method failure.
 
+### Optional request-wide host cap
+
+`HostConfig.RequestBudget` is an optional `RequestBudgetFunc`:
+
+```go
+func(principal, method string, payload []byte) (time.Duration, bool)
+```
+
+It runs for live application requests after envelope/method/payload bounds and
+before `Authorize`, outside protocol locks and raw I/O. It must be pure, prompt,
+bounded and concurrency-safe;
+do not perform authorization, storage or network work. Payload is untrusted opaque
+borrowed data: do not mutate or retain it. Built-in `RecoveryMethodPrefix` routes
+skip this application selector and retain their original read-only budget and
+trusted-clock enforcement. Already-expired or invalid original budgets also skip
+the selector; application policy cannot rescue them. The SDK has no
+application-specific method names, payload schema, or terminal-operation duration
+built in.
+
+Returning `false` leaves timeout selection unchanged; nil disables selection.
+Returning `true` selects a cap measured from **original complete-frame receipt**,
+including receive-queue time, selector execution and initial authorization. Zero
+expires immediately; a negative duration (including negative arithmetic overflow)
+fails closed without authorization. Larger caps never extend the peer timeout,
+default timeout, `MaxTimeout`, or an earlier serving-context deadline. Duration
+addition against the trusted elapsed origin is checked for overflow. The core's
+expiry/cancel/result decisions and callback context share the selected deadline.
+There is no timer reset at handler or terminal reservation entry. Missing
+`Authorize` still denies every method, and built-in recovery keeps its normal
+authorization and routing.
+
+Ordered transports capture one `FrameReceipt` before assembling each completing
+input batch. Every frame completed by that batch retains the same original
+timestamp and trusted age through buffering and authorization. A fragmented
+frame uses its completion batch, not its first fragment. Assembly is checked
+against its existing limits before those limits can be replaced.
+
+Root receives always invoke the outer `Recv`, so an embedded optional method
+cannot bypass a wrapper's filtering, readiness or ingress checks. Drivers capture
+metadata with `CaptureFrameReceipt` on the original transport clock and publish
+the original frame/receipt through `FrameReceipt.Publish(ctx, frame)` before
+returning. `FrameReceiptTransport.RecvWithReceipt` remains available to direct
+transport consumers; implementing it alone does not replace `Recv` policy.
+
+Transparent wrappers forward the receive context and the unchanged frame buffer.
+Copying, transforming or buffering wrappers must retain and publish the original
+receipt for the buffer they return, never recapture time. Use the package-level
+`RecvWithReceipt(ctx, inner)` helper to obtain that receipt while still running
+the inner transport's `Recv` checks; then publish it for the copied or buffered
+return value. Do not select an optional promoted method past those checks.
+Correlation is bounded
+to 32 recent publications per receive call and validates buffer identity, length
+and contents. Known unmatched, invalid or evicted metadata fails closed. Legacy
+transports that publish no metadata retain delivery-time capture; unavailable
+assembly/buffering timing cannot be recovered.
+
+`RequestBudgetFromContext(ctx) (RequestBudget, bool)` exposes read-only SDK timing
+to authorizers, handlers and terminal authority adapters. `Deadline()` returns the
+selected Go deadline; `Remaining()` and `Err()` also check trusted elapsed time
+when the receiving transport supplies its original clock. The ordered driver
+preserves that timing even when terminal receipts are disabled. The clock's age
+is captured at frame receipt before queueing or authorization, so time spent
+suspended is not forgiven at terminal reservation. Discontinuity, regression and
+invalid elapsed arithmetic fail closed. Drivers without that clock retain normal
+context/wall timing; this does not grant unsupported terminal receipt capability.
+Ordinary expiry cancellation is supervised at the existing 10-ms pump cadence;
+callback boundaries and terminal decisions check the budget independently.
+
+Adapters must honor their callback context as well as this SDK budget: a child
+context or an individual observation can have an earlier deadline. Timeout does
+not undo durable external work. Noncooperative callbacks retain their execution
+charges until actual return and cannot restore expired receipt eligibility.
+
+Every terminal authority callback, including periodic driver refresh observations
+whose parent has no request values, receives a derived SDK budget. Commit's
+budget excludes the teardown tail. Observe's budget is additionally clamped by
+the per-read timeout and any earlier parent context/budget. Its `Deadline()`
+matches the actual callback context deadline; both reflect the permit's wall and
+trusted elapsed cutoffs immediately, rather than relying only on later watchdog
+polling. Derivation retains the original clock origin and never extends an
+absolute elapsed cutoff. Legacy/manual permits without a captured request budget
+retain their declared permit cutoffs but cannot recover a parent's elapsed time
+before attachment. For SDK-issued budgets, an earlier scheduler-only parent is
+also conservatively bounded by the original receipt pair, so suspension before
+callback attachment cannot renew it. SDK-created narrower timers retain their
+own declared elapsed cutoff and parent lineage rather than charging the same
+suspension twice. A fresh ordered I/O deadline remains usable within the original
+request/operation bound; an independently stricter plain parent still wins.
+Derived budgets retain ancestor timing values and resample each declared clock
+during observation, after callback return, and at terminal handoff. An expired or
+discontinuous ancestor cannot be repaired by a live derived timer. A distant,
+nonbinding parent is clamped to the effective budget before projection, so it
+cannot invalidate a live short budget through irrelevant arithmetic overflow.
+
+This adds a field to exported `HostConfig`; use keyed composite literals.
+Downstream unkeyed literals can require a source update.
+
 `Host.NotifyDirected` targets all connections of a principal. `Host.NotifyAll`
 broadcasts to active connections. Successful enqueue is not a delivery
 acknowledgement. Running clients receive live updates automatically through
@@ -143,16 +240,13 @@ boundary first, then attempts only the exact owned
 result and closes. A nil return means complete local writing, not peer receipt or
 joined cleanup. Loss remains unknown; nothing is automatically retried or replayed.
 
-The verified stock composition is ordered/TCP, including connection ownership
+The supported stock composition is ordered/TCP, including connection ownership
 wrappers. Other stock carriers, uncoordinated custom paths, and hosts with Recovery
-reject before mutation. See [the implementation contract and fixture](TERMINAL_RECEIPT_DESIGN.md)
+reject before mutation. See [the implementation contract](TERMINAL_RECEIPT_DESIGN.md)
 for authority evidence, the 1024-byte complete-frame limit, deadline/teardown
 budgets, and last-observation race. Existing clients parse the same `RpcResult`;
 there is no new wire message or peer option. Ordinary withdrawal and
-`Host.DisconnectPrincipal` are unchanged. The
-[14-case bidirectional fixture report](TERMINAL_RECEIPT_INTEROP.md) is bounded SDK
-evidence, not production durability or application acceptance. See the
-[handoff](TERMINAL_RECEIPT_HANDOFF.md) for manual merge/release and consumer order.
+`Host.DisconnectPrincipal` are unchanged.
 
 ## Optional update recovery
 

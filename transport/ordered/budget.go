@@ -1,3 +1,4 @@
+// File budget.go enforces ordered-driver establishment and elapsed operation bounds.
 package ordered
 
 import (
@@ -5,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/tinkle-org/syntra-go/internal/elapsedctx"
 	"github.com/tinkle-org/syntra-go/securechannel"
 )
 
@@ -143,11 +145,14 @@ func (b *EstablishmentBudget) claim(o Options) (*securechannel.Clock, time.Durat
 
 // elapsedContext uses timers for prompt cancellation and samples the trusted
 // elapsed domain while blocked. The caller must also check after synchronous
-// dependencies return: cancellation cannot preempt a Go function.
+// dependencies return: cancellation cannot preempt a Go function. Retain the
+// absolute cutoff and its own scheduler projection before any parent clamp.
 func elapsedContext(parent context.Context, clock *securechannel.Clock, until time.Duration) (context.Context, context.CancelFunc) {
 	until = min(until, securechannel.MaxAge)
+	// A later elapsed sample may only shorten this scheduler projection.
+	timerNow := time.Now()
 	remaining := until - clock.Age()
-	timed, stopTimer := context.WithTimeout(parent, max(0, remaining))
+	timed, stopTimer := elapsedctx.WithDeadline(parent, clock, until, timerNow.Add(max(0, remaining)))
 	ctx, retire := context.WithCancelCause(timed)
 	done := make(chan struct{})
 	go func() {

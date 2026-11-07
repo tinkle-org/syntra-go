@@ -297,6 +297,12 @@ type hostCore interface {
 	// mismatch) is returned and the caller MUST close the connection.
 	onFrame(frame []byte) (responses [][]byte, cancelIDs []uint64, fatal *RpcError)
 	onFrameAt([]byte, time.Time) ([][]byte, []uint64, *RpcError)
+	// onFrameReceipt retains trusted receipt timing from the receive pump.
+	onFrameReceipt([]byte, requestReceipt) ([][]byte, []uint64, *RpcError)
+	// callReceipt reads timing before policy executes outside core locks.
+	callReceipt(uint64) (requestReceipt, time.Time, bool)
+	// setRequestBudget clamps core expiry and result selection before Authorize.
+	setRequestBudget(uint64, RequestBudget)
 	callDeadline(uint64) (time.Time, bool)
 	terminalPending(uint64) bool
 	fenceTerminal()
@@ -877,6 +883,7 @@ type recvResult struct {
 	raw        []byte
 	err        error
 	receivedAt time.Time
+	receipt    requestReceipt // host-only trusted origin captured before queueing
 }
 
 // pumpTick bounds deadline granularity for calls whose budget expires
@@ -921,9 +928,9 @@ func (c *Client) pump(ctx context.Context, t Transport) (pumpErr error) {
 	go func() {
 		defer close(recvDone)
 		for {
-			raw, err := t.Recv(pumpCtx)
+			raw, receipt, err := recvWithReceipt(pumpCtx, t)
 			select {
-			case recvCh <- recvResult{raw: raw, err: err, receivedAt: time.Now()}:
+			case recvCh <- recvResult{raw: raw, err: err, receivedAt: receipt.ReceivedAt()}:
 			case <-pumpCtx.Done():
 				return
 			}
@@ -1435,6 +1442,7 @@ type resolvedHostConfig struct {
 	channelPolicy    ChannelPolicy
 	handler          HandlerFunc
 	authorize        AuthorizeFunc
+	requestBudget    RequestBudgetFunc
 	timeout          time.Duration
 	maxPending       int
 	writeTimeout     time.Duration
@@ -1530,6 +1538,10 @@ type HostConfig struct {
 	// Authorize is the per-method policy evaluated with the bound principal
 	// before handler effects. Nil selects DenyAllAuthorize.
 	Authorize AuthorizeFunc
+	// RequestBudget optionally caps live application requests before Authorize. Nil
+	// preserves wire/default/MaxTimeout selection. See RequestBudgetFunc for the
+	// pure, prompt selector contract and zero/negative duration semantics.
+	RequestBudget RequestBudgetFunc
 	// DefaultTimeout applies when a request passes timeoutMs zero. Zero
 	// selects DefaultRPCTimeout. Values must be positive and at most 24h;
 	// the effective call budget is clamped by MaxTimeout.
@@ -1568,6 +1580,7 @@ func resolveHostConfig(cfg HostConfig) (resolvedHostConfig, error) {
 		channelPolicy:    cfg.ChannelPolicy,
 		handler:          cfg.Handler,
 		authorize:        cfg.Authorize,
+		requestBudget:    cfg.RequestBudget,
 		timeout:          cfg.DefaultTimeout,
 		maxPending:       cfg.MaxConcurrent,
 		writeTimeout:     cfg.WriteTimeout,
@@ -2190,9 +2203,9 @@ func (h *Host) serveLoop(ctx context.Context, t Transport, hc *hostConn) (serveE
 		defer h.owned.Done()
 		defer close(recvDone)
 		for {
-			raw, err := t.Recv(pumpCtx)
+			raw, receipt, err := recvWithReceipt(pumpCtx, t)
 			select {
-			case recvCh <- recvResult{raw: raw, err: err, receivedAt: time.Now()}:
+			case recvCh <- recvResult{raw: raw, err: err, receivedAt: receipt.ReceivedAt(), receipt: receipt.receipt}:
 			case <-pumpCtx.Done():
 				return
 			}
@@ -2264,7 +2277,7 @@ func (h *Host) serveLoop(ctx context.Context, t Transport, hc *hostConn) (serveE
 			if len(h.cfg.terminalMethods) != 0 {
 				h.mu.Lock()
 			}
-			responses, cancelIDs, fatal := hc.core.onFrameAt(r.raw, r.receivedAt)
+			responses, cancelIDs, fatal := hc.core.onFrameReceipt(r.raw, r.receipt)
 			if len(h.cfg.terminalMethods) != 0 {
 				h.mu.Unlock()
 			}
@@ -2345,17 +2358,21 @@ drain:
 	if hc.workers >= h.cfg.maxPending {
 		return h.answer(ctx, t, hc, id, NewWireErrorResult(ErrorCodeResourceExhausted, "syntra: too many running handlers"))
 	}
-	deadline, pending := hc.core.callDeadline(id)
+	receipt, deadline, pending := hc.core.callReceipt(id)
 	if !pending {
 		return nil
 	}
-	if !time.Now().Before(deadline) {
+	budget := selectRequestBudget(receipt, deadline, ctx, h.cfg.requestBudget, hc.principal, req)
+	hc.core.setRequestBudget(id, budget)
+	deadline = budget.Deadline()
+	if budget.Err() != nil || ctx.Err() != nil {
 		return h.answer(ctx, t, hc, id, NewWireErrorResult(ErrorCodeDeadlineExceeded, "syntra: deadline exceeded"))
 	}
 	if !h.cfg.executions.acquire() {
 		return h.answer(ctx, t, hc, id, NewWireErrorResult(ErrorCodeResourceExhausted, "syntra: too many live callbacks"))
 	}
 	hctx, stop := context.WithDeadline(ctx, deadline)
+	hctx = context.WithValue(hctx, requestBudgetKey{}, budget)
 	if hc.recovery != nil {
 		hctx = WithRecoveryHostSession(hctx, hc.recovery)
 	}
@@ -2379,6 +2396,12 @@ drain:
 		defer h.owned.Done()
 		defer h.cfg.executions.release()
 		var out *RpcResult
+		// A worker may be scheduled after admission expired (including suspend).
+		// Otherwise preserve authorization's sticky-denial observation even if
+		// a sibling terminal reservation has already cancelled this context.
+		if budget.Err() != nil {
+			out = NewWireErrorResult(ErrorCodeDeadlineExceeded, "syntra: deadline exceeded")
+		}
 		if hc.recovery != nil && hc.recovery.Revoked() {
 			h.publishAuthorizationRevocation(hc, cc)
 			out = NewWireErrorResult(ErrorCodeUnauthenticated, "syntra: credential not accepted")
@@ -2412,6 +2435,9 @@ drain:
 		}
 		// Authorizers may return nil after cancellation. Never start handler
 		// effects on a context already cancelled by revocation or teardown.
+		if out == nil && budget.Err() != nil {
+			out = NewWireErrorResult(ErrorCodeDeadlineExceeded, "syntra: deadline exceeded")
+		}
 		if out == nil && hctx.Err() != nil {
 			out = NewWireErrorResult(mapContextErr(hctx.Err()).Code, "syntra: handler context ended")
 		}

@@ -173,18 +173,80 @@ database-to-socket transaction or a delivery guarantee.
 
 ## Deadline and cleanup
 
+Before initial method authorization, `HostConfig.RequestBudget` may select a
+pure/prompt host cap from the bound principal, validated method and untrusted
+opaque payload. Nil or no override preserves wire/default/`MaxTimeout` selection;
+zero expires and negative durations fail closed. The cap starts at complete-frame
+receipt `R`, before receive-queue or selector delay, not at handler entry. It
+cannot extend any earlier deadline. Built-in recovery routes bypass the
+application selector while retaining original SDK timing and trusted-clock
+enforcement. Expired or invalid original budgets also skip selection. The core and
+callback context use the same selected request deadline, including an earlier
+serving-context deadline.
+
+The ordered driver's frame owner captures a single origin before each decoder
+push and preserves it for all frames completed by that batch. Timing is delivered
+with its owned frame through bounded, per-call metadata publication. Root receives
+always use the outer `Recv`; a promoted `RecvWithReceipt` cannot bypass wrapper
+policy. Drivers and copying/buffering wrappers publish the original receipt for
+the returned buffer with `FrameReceipt.Publish`. Adapters obtain the inner pair
+with the package-level `RecvWithReceipt` helper, which executes ordinary `Recv`
+rather than capability-dispatching a promoted method. Stock ownership, readiness and
+recovery-ingress wrappers preserve the same checks. Old assembly bounds are
+checked before completion can clear them or a trailing partial can replace them.
+Custom transports must preserve that timing contract to account for assembly and
+buffering; a legacy receive publishing no metadata supplies only a delivery-time
+origin.
+
 At reservation start `S`, the absolute deadline and reserved teardown tail are:
 
 ```text
-D = min(RPC deadline, S + 5 seconds)
+request deadline = min(R + wire/default/MaxTimeout budget, R + selected host cap,
+                       serving-context deadline)
+D = min(request deadline, stricter caller deadline, S + 5 seconds)
 T = min(initial remaining time / 4, 250 milliseconds)
 write cutoff = D - T
 ```
+
+Omit the host-cap term when no cap is selected.
 
 Quiescence, commit, proof, selection, and complete local writing share this budget.
 A stricter caller deadline wins. No barrier, callback, retry, or close phase starts
 a new budget. Both trusted suspend-inclusive elapsed time and request/wall
 deadlines apply; unknown continuity and clock regression fail closed.
+When available, the trusted `TerminalClock` age is sampled at original frame
+receipt and retained with the selected request budget. The terminal cutoff is
+also clamped by that original elapsed deadline; it is never reconstructed from
+wall/context remaining time after suspension. Checked elapsed addition fails
+closed on overflow. `RequestBudgetFromContext` exposes read-only `Deadline`,
+`Remaining` and `Err` to authorization, handler, Commit and Observe adapters;
+their individual context deadlines can be earlier and must still be honored.
+All Commit/Observe callbacks receive derived budgets, including periodic driver
+observations with no request-scoped parent values. Commit's cutoff excludes the
+teardown tail; Observe additionally clamps to its read timeout and earlier parent
+context/budget. The budget's Go deadline matches the actual callback deadline,
+projecting the remaining absolute elapsed cutoff into that timer without moving
+the original clock origin or extending its cutoff. Watchdogs remain independent
+fail-closed guards against suspend, discontinuity and noncooperative callbacks.
+Legacy/manual permit fixtures without an original request budget derive from the
+permit's declared cutoffs and attachment-time parent allowance; they cannot infer
+an unknown earlier parent origin. SDK-issued receipt pairs additionally bound
+earlier parent deadlines in the trusted domain before attachment or reservation.
+Elapsed capture precedes scheduler capture when projecting such deadlines; timer
+projection samples scheduler time before elapsed remaining. These conservative
+conversions may shorten an allowance, never renew it. SDK-derived driver and
+authority timers retain their own elapsed cutoff and immutable parent lineage,
+including the scheduler projection before parent clamping. Only undeclared plain
+deadlines require receipt-based projection. Existing SDK timers are not projected
+twice, while an intervening stricter plain parent remains binding.
+Derived budgets retain immutable ancestor timing values, not parent contexts or
+context callbacks. Watchdog, post-callback, Commit and serialized handoff decisions
+resample those clocks. Caller-only ancestry survives reservation, and ancestor
+failure remains fatal even when the derived clock and scheduler timer are live.
+Plain deadline projection first intersects the effective current deadline;
+overflow in a distant, nonbinding deadline cannot poison a valid short cutoff.
+The selector does not authorize, enable terminal support, or override default
+denial/recovery routing. `HostConfig` has an added field; use keyed literals.
 
 The Go implementation requires two 10-ms watchdog intervals in the tail and room
 for the declared read bound before the write cutoff. Very small budgets reject
@@ -226,42 +288,17 @@ ownership, fixed-frame bounds, exact/sticky evidence, revisions, barriers,
 partial loss, cancellation, deadline/read bounds, fatal input, fresh Returning
 denial, retained charges, and callback-reentrant host controls.
 
-Recorded verification on 2026-11-06 includes a full race run across all 13
-test-bearing packages, `go vet`, formatting, and whitespace checks passing after
-the revision-preflight regression. The CGO-disabled Go 1.23.12 compatibility
-suite also passed. Reproduce checks against the final tree after any subsequent
-edit; no aggregate top-level test count is asserted here.
+Run the SDK checks in [CONTRIBUTING.md](CONTRIBUTING.md) against the tree being
+evaluated. Test source identifies intended coverage, not a passing result for a
+particular revision. Local tests do not prove production durability, platform
+suspend behavior, formal conformance, or custom-carrier support.
 
-[Cross-language fixture evidence](TERMINAL_RECEIPT_INTEROP.md) records **14
-distinct passing cases** across Go-server/Rust-client and Rust-server/Go-client:
-owned and commit/return-gap success over direct and fragmented TCP, denial,
-unknown authority, and partial receipt loss. Every case includes a fresh
-Returning probe with no RPC and checked authority denial. The recorded run-2
-hashes, report location, availability, and limits belong to that note.
-It is not evidence for later edits until rerun.
+## Normative reference
 
-`cmd/terminal-fixture/main.go` is a loopback-only volatile authority fixture, not a
-production adapter. See the interop note for reproducible harness use rather than
-copying fixture credentials into deployments. Neither fixture success nor local
-race tests prove production durability, platform suspend behavior, formal
-conformance, custom-carrier support, or application Logout acceptance.
-
-## Reference and adoption
-
-The shared contract is connection §6 at
-`syntra/specifications/connection.md#6-scoped-terminal-receipt`
-(requires a sibling checkout), with linked RPC, security, and transport
-requirements. That section is not present at the accepted
-specification commit `c6a28abf2c52b3f21a7362366d3f5891f33601d5`, so no pinned
-hosted URL for this uncommitted adoption is claimed.
-The sibling shared branch contains canonical adoption of thirteen
-`SNTR-TRC-*` requirements and fourteen
-registered case groups; registration is not formal execution. Its uncommitted
-adoption changes must merge before they can be cited as the merged reference.
+The normative contract is [connection §6, scoped terminal receipt](https://github.com/tinkle-org/syntra/blob/985d90eb5ee6d7aec0d20ea088430f271eed7cd7/specifications/connection.md#6-scoped-terminal-receipt)
+at specification commit `985d90eb5ee6d7aec0d20ea088430f271eed7cd7`, including its
+linked RPC, security, and transport requirements. All thirteen `SNTR-TRC-*`
+requirements apply together; the specification does not establish SDK support
+or activate host policy.
 The SDK uses existing `Frame`/`RpcResult`; no wire message, peer option,
 negotiation, protobuf source, or generated binding change is required.
-
-See [the merge and release handoff](TERMINAL_RECEIPT_HANDOFF.md) for verification
-and manual release ordering. [Issue 17](https://github.com/tinkle-org/syntra-go/issues/17)
-remains open: the SDK capability is implemented and fixture-tested, but consumer
-adaptation and application acceptance are separate obligations.

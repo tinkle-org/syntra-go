@@ -360,6 +360,8 @@ type recoveryIngressTransport struct {
 	inbox  *RecoveryInbox
 }
 
+// Recv checks ingress ownership before calling the underlying receive policy.
+// The context carries any original frame receipt through unchanged.
 func (t *recoveryIngressTransport) Recv(ctx context.Context) ([]byte, error) {
 	if t.inbox == nil {
 		return nil, recoveryInvalid()
@@ -378,6 +380,11 @@ func (t *recoveryIngressTransport) Recv(ctx context.Context) ([]byte, error) {
 		return nil, recoveryInvalid()
 	}
 	return t.Transport.Recv(ctx)
+}
+
+// RecvWithReceipt retains the same ingress checks and underlying Recv policy.
+func (t *recoveryIngressTransport) RecvWithReceipt(ctx context.Context) ([]byte, FrameReceipt, error) {
+	return recvWithReceipt(ctx, t)
 }
 func (t *recoveryIngressTransport) Close() error {
 	if t.inbox != nil {

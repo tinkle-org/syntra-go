@@ -98,8 +98,6 @@ hosts with Recovery reject before mutation. See
 explicit last-observation race, and evidence limits. Authority callback contexts
 are SDK-owned; bind application identity through the transition's scope and current
 authority rather than assuming downstream request-context values are preserved.
-The [bidirectional TCP fixture report](TERMINAL_RECEIPT_INTEROP.md) records its
-exact run separately from the [manual integration handoff](TERMINAL_RECEIPT_HANDOFF.md).
 
 ## Run a client
 

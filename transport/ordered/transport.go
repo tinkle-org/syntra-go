@@ -257,9 +257,25 @@ type Transport struct {
 	sendAdmission, recvAdmission    chan struct{}
 	sendPlain, sendCipher           []byte
 	recvPlain, recvCipher           []byte
-	decoder                         securechannel.FrameDecoder
-	frames                          [][]byte
+	decoder                         frameDecoder
+	frames                          []receivedFrame
 	frameDeadline, deliveryDeadline time.Duration
+}
+
+// receivedFrame keeps one owned envelope and its immutable assembly-batch origin.
+type receivedFrame struct {
+	raw     []byte
+	receipt syntra.FrameReceipt
+}
+
+// frameDecoder permits per-owner assembly instrumentation without shared hooks.
+type frameDecoder interface {
+	// Push completes zero or more owned frames from authenticated plaintext.
+	Push([]byte) ([][]byte, error)
+	// IsPartial reports a retained incomplete envelope.
+	IsPartial() bool
+	// Close erases retained assembly state after receive owners join.
+	Close()
 }
 
 var _ syntra.Transport = (*Transport)(nil)
@@ -269,6 +285,7 @@ var _ syntra.ChannelIdentityProvider = (*Transport)(nil)
 func newTransport(carrier MessageIO, ch *securechannel.Channel, cfg *securechannel.ServerConfig, o Options) *Transport {
 	ctx, cancel := context.WithCancel(context.Background())
 	t := &Transport{io: carrier, channel: ch, server: cfg, opts: o, ctx: ctx, cancel: cancel,
+		decoder:      &securechannel.FrameDecoder{},
 		terminalWake: make(chan struct{}, 1),
 		peerGate:     make(chan struct{}, 1), peerRequired: cfg != nil,
 		done: make(chan struct{}), carrierStopped: make(chan struct{}), stopped: make(chan struct{}), lifetimeStopped: make(chan struct{}), clockStopped: make(chan struct{}), confirm: make(chan struct{}),
@@ -458,7 +475,7 @@ func (t *Transport) supervise() {
 			t.sendPlain, t.sendCipher, t.recvPlain, t.recvCipher = nil, nil, nil, nil
 			t.decoder.Close()
 			for _, frame := range t.frames {
-				clear(frame)
+				clear(frame.raw)
 			}
 			t.frames = nil
 			t.server = nil
@@ -806,9 +823,18 @@ func (t *Transport) Ping(ctx context.Context) error {
 // The absolute frame clock begins with its first authenticated prefix byte,
 // including when that byte was buffered alongside a preceding frame.
 func (t *Transport) Recv(ctx context.Context) ([]byte, error) {
+	frame, _, err := t.RecvWithReceipt(ctx)
+	return frame, err
+}
+
+// RecvWithReceipt atomically removes an owned frame and the timing captured
+// BEFORE its completing decoder push, including time spent in peer authorization.
+// Concurrent receivers share the same bounded admission and serialized queue.
+// It also publishes that exact pair to the current SDK receive context.
+func (t *Transport) RecvWithReceipt(ctx context.Context) ([]byte, syntra.FrameReceipt, error) {
 	release, err := t.acquire(ctx, t.recvAdmission, t.recvGate)
 	if err != nil {
-		return nil, err
+		return nil, syntra.FrameReceipt{}, err
 	}
 	defer release()
 	for {
@@ -821,23 +847,24 @@ func (t *Transport) Recv(ctx context.Context) ([]byte, error) {
 		}
 		if err := t.checkOperation(ctx, until); err != nil {
 			t.abort(err)
-			return nil, err
+			return nil, syntra.FrameReceipt{}, err
 		}
 		if len(t.frames) != 0 {
 			if err := t.checkPeer(ctx, until, true); err != nil {
 				t.abort(err)
-				return nil, err
+				return nil, syntra.FrameReceipt{}, err
 			}
 			if err := t.checkOperation(ctx, until); err != nil {
 				t.abort(err)
-				return nil, err
+				return nil, syntra.FrameReceipt{}, err
 			}
 			frame := t.frames[0]
-			t.frames[0] = nil
+			t.frames[0] = receivedFrame{}
 			t.frames = t.frames[1:]
 			t.helloComplete(false)
 			t.confirmed.Do(func() { close(t.confirm) })
-			return frame, nil
+			frame.receipt.Publish(ctx, frame.raw)
+			return frame.raw, frame.receipt, nil
 		}
 		readCtx, cancel := elapsedContext(ctx, t.channel.Clock(), until)
 		ciphertext, err := t.io.ReadMessage(readCtx, t.recvCipher[:0])
@@ -848,29 +875,38 @@ func (t *Transport) Recv(ctx context.Context) ([]byte, error) {
 			out := publicError(readCtx, err)
 			cancel()
 			t.abort(out)
-			return nil, out
+			return nil, syntra.FrameReceipt{}, out
 		}
 		cancel()
 		plain, err := t.channel.Decrypt(t.recvPlain[:0], ciphertext)
 		if err != nil {
-			return nil, t.cipherFailure(err)
+			return nil, syntra.FrameReceipt{}, t.cipherFailure(err)
 		}
 		t.rememberIdentity()
+		receipt := syntra.CaptureFrameReceipt(t.channel.Clock())
 		frames, err := t.decoder.Push(plain)
 		clear(plain)
 		if err != nil {
 			t.abort(ErrProtocol)
-			return nil, ErrProtocol
+			return nil, syntra.FrameReceipt{}, ErrProtocol
 		}
-		t.frames = frames
-		now := t.channel.Age()
+		for _, raw := range frames {
+			t.frames = append(t.frames, receivedFrame{raw: raw, receipt: receipt})
+		}
+		// Synchronous assembly may exhaust the OLD record/frame/Hello/Ready
+		// bound. Check it before updating activity or erasing partial state.
+		if err := t.checkOperation(ctx, until); err != nil {
+			t.abort(err)
+			return nil, syntra.FrameReceipt{}, err
+		}
+		now := receipt.ElapsedAge()
 		t.mu.Lock()
 		t.lastRecordAt = now
 		firstHello := t.responder && t.helloPending
 		t.mu.Unlock()
 		if firstHello && len(frames) != 0 && (len(frames) != 1 || t.decoder.IsPartial()) {
 			t.abort(ErrProtocol)
-			return nil, ErrProtocol
+			return nil, syntra.FrameReceipt{}, ErrProtocol
 		}
 		if !t.decoder.IsPartial() {
 			t.frameDeadline = 0
@@ -878,14 +914,18 @@ func (t *Transport) Recv(ctx context.Context) ([]byte, error) {
 			t.frameDeadline = now + t.opts.FrameTimeout
 		}
 		t.deliveryDeadline = now + t.opts.WriteTimeout
+		if t.frameDeadline != 0 {
+			until = min(until, t.frameDeadline)
+		}
+		until = min(until, t.deliveryDeadline)
 		if err := t.checkOperation(ctx, until); err != nil {
 			t.abort(err)
-			return nil, err
+			return nil, syntra.FrameReceipt{}, err
 		}
 		if t.peerReady() {
 			if err := t.checkPeer(ctx, until, false); err != nil {
 				t.abort(err)
-				return nil, err
+				return nil, syntra.FrameReceipt{}, err
 			}
 		}
 	}

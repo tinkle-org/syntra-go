@@ -26,7 +26,7 @@ func dispatchBudgetTerminal(t *testing.T, h *Host, hc *hostConn) {
 	}
 }
 
-// joinBudgetTerminal joins the retained handler and observes its actual return.
+// joinBudgetTerminal receives published completion, not an actual ownership join.
 func joinBudgetTerminal(t *testing.T, hc *hostConn) {
 	t.Helper()
 	select {
@@ -174,6 +174,15 @@ func TestRequestBudgetTerminalLateExternalWorkKeepsCharges(t *testing.T) {
 			}
 			once.Do(func() { close(release) })
 			joinBudgetTerminal(t, hc)
+			// Completion precedes deferred charge release; join all actual owners.
+			if err := h.Close(); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			t.Cleanup(cancel)
+			if err := h.Wait(ctx); err != nil {
+				t.Fatalf("terminal ownership did not exit: %v", err)
+			}
 			if err := <-result; err == nil || authority.commits.Load() != 1 || driver.handoffs.Load() != 0 || budget.Live() != 0 {
 				t.Fatalf("late %s: err=%v commits=%d handoffs=%d charge=%d", stage, err, authority.commits.Load(), driver.handoffs.Load(), budget.Live())
 			}

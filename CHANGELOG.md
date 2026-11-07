@@ -16,6 +16,15 @@
   and wire messages are unchanged. See [usage and limits](TERMINAL_RECEIPT_DESIGN.md)
   and the [manual release/consumer handoff](TERMINAL_RECEIPT_HANDOFF.md).
 
+## 1.0.0-rc.2 (2026-11-07)
+
+## What's Changed
+* feat(receipt): add opt-in scoped terminal receipts by @oscarlaw in https://github.com/tinkle-org/syntra-go/pull/18
+* test(network): synchronize native HTTP admission fixtures by @oscarlaw in https://github.com/tinkle-org/syntra-go/pull/20
+
+
+**Full Changelog**: https://github.com/tinkle-org/syntra-go/compare/v1.0.0-rc.1...v1.0.0-rc.2
+
 ## 1.0.0-rc.1 (2026-11-05)
 
 ## What's Changed

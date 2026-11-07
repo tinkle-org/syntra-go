@@ -18,9 +18,10 @@
   authorization. `RequestBudgetFromContext` exposes readonly remaining time to
   authorization, handlers, and terminal authority callbacks.
 - `FrameReceipt`, `CaptureFrameReceipt`, and `FrameReceiptTransport` preserve
-  completing-batch timing for direct transport consumers. Drivers publish the
-  original receipt through `FrameReceipt.Publish`; root receives retain the
-  ordinary `Recv` policy path.
+  completing-batch timing for direct transport consumers. The package-level
+  `RecvWithReceipt` helper runs ordinary receive policy while obtaining original
+  timing for copying and buffering adapters. Drivers publish the original receipt
+  through `FrameReceipt.Publish`; root receives retain the ordinary `Recv` path.
 
 ### Changed
 

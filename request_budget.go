@@ -24,12 +24,14 @@ type RequestBudgetFunc func(principal, method string, payload []byte) (time.Dura
 // terminal authority adapters. Its zero value is expired. Remaining also checks
 // trusted suspend-inclusive elapsed time when the transport supports it; Deadline
 // alone is a Go context deadline and may not account for machine suspension.
+// Derived terminal budgets also recheck retained ancestor clocks and cutoffs.
 // Expiry cancels eligibility, not durable effects already admitted externally.
 type RequestBudget struct {
 	deadline time.Time
 	receipt  requestReceipt
 	until    time.Duration // absolute age on receipt.clock, never reconstructed later
 	invalid  bool
+	parents  *requestBudgetParents // immutable timing-only ancestry; keeps the value comparable
 }
 
 // Deadline returns the selected absolute Go deadline, including an earlier
@@ -37,7 +39,8 @@ type RequestBudget struct {
 // operation/read deadline. It never renews the allowance.
 func (b RequestBudget) Deadline() time.Time { return b.deadline }
 
-// Remaining returns nonnegative time left under both original timing domains.
+// Remaining returns nonnegative time left under the original timing domains and
+// all retained ancestor constraints, resampling each declared clock in its domain.
 // Invalid continuity or duration arithmetic returns zero (fail closed).
 func (b RequestBudget) Remaining() time.Duration {
 	if b.invalid || b.deadline.IsZero() {
@@ -53,6 +56,9 @@ func (b RequestBudget) Remaining() time.Duration {
 			return 0
 		}
 		remaining = min(remaining, b.until-age)
+	}
+	if b.parents != nil {
+		remaining = min(remaining, b.parents.remaining())
 	}
 	return max(0, remaining)
 }
@@ -79,6 +85,30 @@ func RequestBudgetFromContext(ctx context.Context) (RequestBudget, bool) {
 // requestBudgetKey prevents callers from manufacturing SDK timing scope.
 type requestBudgetKey struct{}
 
+// requestBudgetParents retains only SDK timing values, never user contexts or
+// context callbacks. Plain bounds are projected once into the derived clock;
+// declared and inherited budget clocks keep their original absolute cutoffs.
+type requestBudgetParents struct {
+	declared     elapsedctx.Constraints
+	inherited    RequestBudget
+	hasInherited bool
+	previous     *requestBudgetParents
+}
+
+// remaining dynamically intersects retained domains without renewing any cutoff.
+// Only trusted, prompt Clock methods are invoked, so no context callback can run
+// when a permit rechecks these constraints at its serialized handoff decision.
+func (p *requestBudgetParents) remaining() time.Duration {
+	remaining := p.declared.Remaining()
+	if p.hasInherited {
+		remaining = min(remaining, p.inherited.Remaining())
+	}
+	if p.previous != nil {
+		remaining = min(remaining, p.previous.remaining())
+	}
+	return remaining
+}
+
 // clampParentRequest preserves explicit SDK elapsed provenance while charging
 // plain deadlines against the original receipt, including pre-attachment suspend.
 // Known cutoffs from unrelated clocks intersect by remaining duration, never age.
@@ -90,7 +120,9 @@ func clampParentRequest(ctx context.Context, b RequestBudget) (RequestBudget, ti
 			return parent.Remaining()
 		}
 		if !b.receipt.at.IsZero() && b.receipt.clock != nil {
-			projected := requestBudgetAt(b.receipt, d)
+			// A distant nonbinding parent must not overflow projection of an
+			// otherwise valid short budget. Effective overflow still fails closed.
+			projected := requestBudgetAt(b.receipt, minTime(d, b.deadline))
 			b.until = min(b.until, projected.until)
 			b.invalid = b.invalid || projected.invalid
 			return projected.Remaining()
@@ -100,6 +132,7 @@ func clampParentRequest(ctx context.Context, b RequestBudget) (RequestBudget, ti
 	if hasParent {
 		remaining = min(remaining, parent.Remaining())
 	}
+	b.parents = &requestBudgetParents{declared: elapsedctx.Capture(ctx), inherited: parent, hasInherited: hasParent, previous: b.parents}
 	return b, remaining
 }
 

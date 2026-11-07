@@ -32,6 +32,36 @@ type deadline struct {
 	parent         *deadline
 }
 
+// Constraints is an immutable snapshot of declared absolute clock cutoffs. It
+// retains no parent context or context callbacks. Its zero value adds no constraint.
+type Constraints struct{ lineage *deadline }
+
+// Capture retains SDK declarations for repeated checks after context attachment.
+// Plain scheduler deadlines must still be projected by Remaining at attachment.
+func Capture(ctx context.Context) Constraints {
+	lineage, _ := ctx.Value(deadlineKey{}).(*deadline)
+	return Constraints{lineage: lineage}
+}
+
+// Remaining resamples each retained clock against its original absolute cutoff
+// and scheduler projection. It never rebuilds a fresh now-plus-remaining budget,
+// compares clock identities, or invokes context methods. No constraints returns
+// MaxInt64. Trusted Clock methods must remain prompt and safe concurrently.
+func (c Constraints) Remaining() time.Duration {
+	remaining := time.Duration(math.MaxInt64)
+	for node := c.lineage; node != nil; node = node.parent {
+		if node.clock == nil || node.clock.Check() != nil {
+			return 0
+		}
+		age := node.clock.Age()
+		if age < 0 || age >= node.until {
+			return 0
+		}
+		remaining = min(remaining, node.until-age, time.Until(node.projected))
+	}
+	return max(0, remaining)
+}
+
 // WithDeadline declares an SDK-owned absolute elapsed cutoff and its own Go
 // scheduler projection BEFORE parent clamp. It preserves parent cancellation and
 // timing lineage; it does not renew or infer an elapsed origin for plain parents.
@@ -51,25 +81,18 @@ func WithDeadline(parent context.Context, clock Clock, until time.Duration, proj
 // No constraints returns MaxInt64. This function grants no timing beyond a bound;
 // callers must also enforce context cancellation and their original request cap.
 func Remaining(ctx context.Context, plain func(time.Time) time.Duration) time.Duration {
-	lineage, _ := ctx.Value(deadlineKey{}).(*deadline)
+	constraints := Capture(ctx)
+	lineage := constraints.lineage
 	remaining := time.Duration(math.MaxInt64)
 	if d, ok := ctx.Deadline(); ok {
 		remaining = min(remaining, schedulerRemaining(d, lineage, plain))
 	}
 	for node := lineage; node != nil; node = node.parent {
-		if node.clock == nil || node.clock.Check() != nil {
-			return 0
-		}
-		age := node.clock.Age()
-		if age < 0 || age >= node.until {
-			return 0
-		}
-		remaining = min(remaining, node.until-age, time.Until(node.projected))
 		if !node.parentDeadline.IsZero() {
 			remaining = min(remaining, schedulerRemaining(node.parentDeadline, node.parent, plain))
 		}
 	}
-	return max(0, remaining)
+	return max(0, min(remaining, constraints.Remaining()))
 }
 
 // schedulerRemaining recognizes only an explicitly declared own projection;

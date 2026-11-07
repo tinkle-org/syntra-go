@@ -189,7 +189,9 @@ push and preserves it for all frames completed by that batch. Timing is delivere
 with its owned frame through bounded, per-call metadata publication. Root receives
 always use the outer `Recv`; a promoted `RecvWithReceipt` cannot bypass wrapper
 policy. Drivers and copying/buffering wrappers publish the original receipt for
-the returned buffer with `FrameReceipt.Publish`. Stock ownership, readiness and
+the returned buffer with `FrameReceipt.Publish`. Adapters obtain the inner pair
+with the package-level `RecvWithReceipt` helper, which executes ordinary `Recv`
+rather than capability-dispatching a promoted method. Stock ownership, readiness and
 recovery-ingress wrappers preserve the same checks. Old assembly bounds are
 checked before completion can clear them or a trailing partial can replace them.
 Custom transports must preserve that timing contract to account for assembly and
@@ -237,6 +239,12 @@ authority timers retain their own elapsed cutoff and immutable parent lineage,
 including the scheduler projection before parent clamping. Only undeclared plain
 deadlines require receipt-based projection. Existing SDK timers are not projected
 twice, while an intervening stricter plain parent remains binding.
+Derived budgets retain immutable ancestor timing values, not parent contexts or
+context callbacks. Watchdog, post-callback, Commit and serialized handoff decisions
+resample those clocks. Caller-only ancestry survives reservation, and ancestor
+failure remains fatal even when the derived clock and scheduler timer are live.
+Plain deadline projection first intersects the effective current deadline;
+overflow in a distant, nonbinding deadline cannot poison a valid short cutoff.
 The selector does not authorize, enable terminal support, or override default
 denial/recovery routing. `HostConfig` has an added field; use keyed literals.
 

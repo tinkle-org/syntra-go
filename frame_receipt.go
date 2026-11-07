@@ -45,6 +45,8 @@ func (r FrameReceipt) ElapsedAge() time.Duration { return r.receipt.age }
 // or transforms a frame must explicitly publish its original receipt for the new
 // buffer; it must not recapture time. Wrappers buffering across calls must retain
 // and publish the original receipt when returning the buffered frame.
+// Use the package-level RecvWithReceipt helper to obtain the inner receipt while
+// preserving the inner transport's ordinary Recv policy.
 // Only the most recent 32 publications per call are retained. An unmatched or
 // evicted frame fails closed if any metadata was published, rather than receiving
 // a fresh delivery-time budget. Publication is synchronized, but the caller must
@@ -68,6 +70,27 @@ type FrameReceiptTransport interface {
 	// RecvWithReceipt returns the next frame and its completing-batch origin.
 	// Error returns must not expose a frame; successful receipts must be nonzero.
 	RecvWithReceipt(context.Context) ([]byte, FrameReceipt, error)
+}
+
+// RecvWithReceipt calls t.Recv and returns its frame with correlated local timing.
+// It never dispatches an optional RecvWithReceipt method that embedding could
+// promote past a wrapper's Recv policy. A nil transport returns InvalidArgument.
+//
+// The call is synchronous and propagates ctx cancellation, deadline and values;
+// t.Recv must honor cancellation. Metadata capture is bounded and scoped to this
+// call, closes on return, and forwards its matched receipt to any enclosing SDK
+// receive. Copying or buffering wrappers can retain the returned receipt and
+// Publish it with their returned buffer into that outer receive's context.
+//
+// Receipts are trusted SDK-local transport metadata, never peer-supplied timing.
+// This helper grants no identity, authorization or terminal capability. For
+// legacy transports publishing no metadata, it captures delivery timing only;
+// unavailable assembly and buffering timing cannot be inferred.
+func RecvWithReceipt(ctx context.Context, t Transport) ([]byte, FrameReceipt, error) {
+	if t == nil {
+		return nil, FrameReceipt{}, NewRpcError(ErrorCodeInvalidArgument, "syntra: nil transport")
+	}
+	return recvWithReceipt(ctx, t)
 }
 
 // frameReceiptKey scopes metadata to one outer Recv, including all filtered reads.

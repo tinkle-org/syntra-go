@@ -165,7 +165,11 @@ transport consumers; implementing it alone does not replace `Recv` policy.
 
 Transparent wrappers forward the receive context and the unchanged frame buffer.
 Copying, transforming or buffering wrappers must retain and publish the original
-receipt for the buffer they return, never recapture time. Correlation is bounded
+receipt for the buffer they return, never recapture time. Use the package-level
+`RecvWithReceipt(ctx, inner)` helper to obtain that receipt while still running
+the inner transport's `Recv` checks; then publish it for the copied or buffered
+return value. Do not select an optional promoted method past those checks.
+Correlation is bounded
 to 32 recent publications per receive call and validates buffer identity, length
 and contents. Known unmatched, invalid or evicted metadata fails closed. Legacy
 transports that publish no metadata retain delivery-time capture; unavailable
@@ -203,6 +207,11 @@ callback attachment cannot renew it. SDK-created narrower timers retain their
 own declared elapsed cutoff and parent lineage rather than charging the same
 suspension twice. A fresh ordered I/O deadline remains usable within the original
 request/operation bound; an independently stricter plain parent still wins.
+Derived budgets retain ancestor timing values and resample each declared clock
+during observation, after callback return, and at terminal handoff. An expired or
+discontinuous ancestor cannot be repaired by a live derived timer. A distant,
+nonbinding parent is clamped to the effective budget before projection, so it
+cannot invalidate a live short budget through irrelevant arithmetic overflow.
 
 This adds a field to exported `HostConfig`; use keyed composite literals.
 Downstream unkeyed literals can require a source update.

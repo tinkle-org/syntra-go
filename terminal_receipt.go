@@ -143,7 +143,8 @@ type TerminalPermit struct {
 	transition    TerminalTransition
 	policy        TerminalMethodPolicy
 	clock         TerminalClock
-	budget        RequestBudget // immutable original receipt budget, when available
+	budget        RequestBudget         // immutable original receipt budget, when available
+	parents       *requestBudgetParents // immutable caller timing, also enforced through handoff
 	until         time.Duration
 	wallUntil     time.Time
 	frame         []byte
@@ -182,6 +183,13 @@ func (p *TerminalPermit) checkTimeLocked() {
 	if p.clock.Check() != nil || p.clock.Age() >= p.until || !time.Now().Before(p.wallUntil) {
 		p.failLocked(context.DeadlineExceeded)
 	}
+	parents := p.parents
+	if parents == nil {
+		parents = p.budget.parents
+	}
+	if parents != nil && parents.remaining() == 0 {
+		p.failLocked(context.DeadlineExceeded)
+	}
 }
 
 // authorityContext derives callback timing from the permit's absolute cutoffs,
@@ -197,6 +205,11 @@ func (p *TerminalPermit) authorityContext(ctx context.Context, timeout time.Dura
 	b := p.budget
 	if b.deadline.IsZero() {
 		b = RequestBudget{deadline: p.wallUntil, receipt: requestReceipt{clock: p.clock}, until: p.until}
+	}
+	if p.parents != nil {
+		// Reservation captured caller-only timing absent from scope.ctx.
+		// Its ancestry already includes the original budget's constraints.
+		b.parents = p.parents
 	}
 	b.deadline = minTime(b.deadline, p.wallUntil)
 	b.until = min(b.until, p.until)
@@ -269,6 +282,8 @@ func (p *TerminalPermit) failLocked(err error) {
 // Once committed, a stale Active read cannot resurrect state.
 // Every authority callback, including driver refresh, receives an SDK budget and
 // context deadline clamped by the permit, this read's bound and the parent.
+// Retained ancestor clocks are rechecked by the watchdog and after callback return;
+// a valid-looking observation cannot repair an expired or discontinuous ancestor.
 func (p *TerminalPermit) Observe(ctx context.Context, requireCommit bool) (TerminalAuthorityState, error) {
 	if err := p.CheckTime(); err != nil {
 		return TerminalUnknown, err
@@ -486,7 +501,7 @@ func CompleteTerminalReceipt(ctx context.Context, operation string, expectedRevi
 	}
 	// Preserve declared driver timing but never renew an earlier plain
 	// caller, including one exhausted before reservation attachment.
-	_, callerRemaining := clampParentRequest(ctx, budget)
+	callerBudget, callerRemaining := clampParentRequest(ctx, budget)
 	initialRemaining = min(initialRemaining, callerRemaining)
 	remaining := min(time.Until(deadline), initialRemaining-time.Since(wallStart))
 	tail := min(initialRemaining/4, 250*time.Millisecond)
@@ -499,7 +514,7 @@ func CompleteTerminalReceipt(ctx context.Context, operation string, expectedRevi
 	}
 	failureCtx, failureCancel := context.WithCancel(scope.ctx)
 	defer failureCancel()
-	p := &TerminalPermit{policy: policy, clock: clock, budget: budget, until: start + remaining - tail,
+	p := &TerminalPermit{policy: policy, clock: clock, budget: budget, parents: callerBudget.parents, until: start + remaining - tail,
 		owner: scope, failureCtx: failureCtx, failureCancel: failureCancel, failed: make(chan struct{}), stopIO: driver.StopTerminal,
 		wallUntil: minTime(deadline, wallStart.Add(initialRemaining)).Add(-tail), frame: frame, valid: true,
 		transition: TerminalTransition{Principal: hc.principal, Method: scope.method, Operation: operation, ExpectedRevision: expectedRevision}}

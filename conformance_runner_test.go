@@ -31,6 +31,29 @@ func (r *runnerRecordedTransport) Send(_ context.Context, raw []byte) error {
 	return nil
 }
 
+// runnerSendRecorder counts underlying sends that reached the wrapped
+// transport so the duplicate-request test can prove the first copy hit the
+// wire even when the host closes the loopback before the second copy.
+type runnerSendRecorder struct {
+	Transport
+	successful atomic.Int32
+}
+
+// Send forwards one frame and counts it only when the wrapped transport
+// reports success.
+func (r *runnerSendRecorder) Send(ctx context.Context, raw []byte) error {
+	if err := r.Transport.Send(ctx, raw); err != nil {
+		return err
+	}
+	r.successful.Add(1)
+	return nil
+}
+
+// succeeded reports how many underlying sends reached the wrapped transport.
+func (r *runnerSendRecorder) succeeded() int {
+	return int(r.successful.Load())
+}
+
 func runnerDuplicateFaults(t *testing.T) *seededFaults {
 	t.Helper()
 	f := newSeededFaults(0x5EED1234)
@@ -341,24 +364,61 @@ func TestRunnerDuplicateRequestThroughTransport(t *testing.T) {
 	if runnerRecv(t, ctx, b).GetReady() == nil {
 		t.Fatal("no ready")
 	}
-	ft := &faultTransport{Transport: b, faults: runnerDuplicateFaults(t)}
+	ft := &faultTransport{Transport: &runnerSendRecorder{Transport: b}, faults: runnerDuplicateFaults(t)}
 	runnerSend(t, ctx, b, NewRequestFrame(1, 7, &RpcRequest{Method: "/example.Echo/Echo", Payload: []byte("held"), TimeoutMs: 4000}))
 	select {
 	case <-started:
 	case <-ctx.Done():
 		t.Fatal("handler did not start")
 	}
-	runnerSend(t, ctx, ft, NewRequestFrame(1, 7, &RpcRequest{Method: "/example.Echo/Echo", Payload: []byte("held"), TimeoutMs: 4000}))
+	dupRaw, err := MarshalFrame(NewRequestFrame(1, 7, &RpcRequest{Method: "/example.Echo/Echo", Payload: []byte("held"), TimeoutMs: 4000}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ft.Send(ctx, dupRaw); err != nil {
+		// The duplicate request is fatal: the host closes the loopback as
+		// soon as it consumes the first copy. When the host wins the race,
+		// the second copy fails with UNAVAILABLE ("loopback peer closed").
+		// That close is the expected terminal path, not a harness failure.
+		// Context errors are never accepted: they mean the test deadline
+		// expired before the wire outcome was known.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+			t.Fatalf("duplicate send context expired: %v", err)
+		}
+		var rpcErr *RpcError
+		if !errors.As(err, &rpcErr) || rpcErr.Code != ErrorCodeUnavailable {
+			t.Fatalf("duplicate send = %v, want success or UNAVAILABLE close", err)
+		}
+	}
+	recorder, ok := ft.Transport.(*runnerSendRecorder)
+	if !ok {
+		t.Fatal("fault transport must wrap a send recorder")
+	}
+	firstSendOK := recorder.succeeded() >= 1
 	if raw, err := b.Recv(ctx); err == nil {
 		t.Fatalf("duplicate ID must close without an offending-ID result: %x", raw)
+	} else {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+			t.Fatalf("loopback Recv context expired (firstSendOK=%v): %v", firstSendOK, err)
+		}
+		var rpcErr *RpcError
+		if !errors.As(err, &rpcErr) || rpcErr.Code != ErrorCodeUnavailable {
+			t.Fatalf("duplicate ID must close with UNAVAILABLE, got %v (firstSendOK=%v)", err, firstSendOK)
+		}
 	}
 	if dispatched.Load() != 1 {
 		t.Fatal("duplicate request dispatched twice")
 	}
 	close(release)
 	_, requests, results := ft.counts()
-	if requests != 1 || results != 0 || dispatched.Load() != 1 {
-		t.Fatalf("duplicates req=%d result=%d dispatch=%d", requests, results, dispatched.Load())
+	// When the host closes between the two duplicate copies, the second copy
+	// never reaches the wire and requests stays 0. Either 0 or 1 proves the
+	// duplicate path was exercised; the single dispatch and closed transport
+	// above are the authoritative assertions. firstSendOK guarantees at least
+	// the first copy reached the wire, so a context deadline cannot make a
+	// failed first send appear to pass.
+	if !firstSendOK || (requests != 0 && requests != 1) || results != 0 || dispatched.Load() != 1 {
+		t.Fatalf("duplicates req=%d result=%d dispatch=%d firstSendOK=%v", requests, results, dispatched.Load(), firstSendOK)
 	}
 	quiet, stop := context.WithTimeout(ctx, 20*time.Millisecond)
 	defer stop()

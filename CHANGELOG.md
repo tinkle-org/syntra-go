@@ -29,6 +29,23 @@
   previous version no longer compile; convert them to keyed literals before
   upgrading. Empty `HostConfig{}` literals remain valid.
 
+## 1.0.0-rc.3 (2026-11-08)
+
+## What's Changed
+* feat(runtime): add receipt-origin request budgets by @oscarlaw in https://github.com/tinkle-org/syntra-go/pull/21
+* chore(actions): bump actions/setup-go from 5.6.0 to 7.0.0 by @dependabot[bot] in https://github.com/tinkle-org/syntra-go/pull/2
+* chore(deps): bump google.golang.org/protobuf from 1.36.6 to 1.36.12 by @dependabot[bot] in https://github.com/tinkle-org/syntra-go/pull/3
+* chore(actions): bump github/codeql-action/analyze from e1c541575b54ca50e5f5dcc7da77615756cf9f51 to 4bfa242aa49c5f7c6770b98670d354a7dfac05f8 by @dependabot[bot] in https://github.com/tinkle-org/syntra-go/pull/4
+* chore(actions): bump actions/setup-python from 5.6.0 to 7.1.0 by @dependabot[bot] in https://github.com/tinkle-org/syntra-go/pull/7
+* chore(actions): bump github/codeql-action/init from e1c541575b54ca50e5f5dcc7da77615756cf9f51 to 4bfa242aa49c5f7c6770b98670d354a7dfac05f8 by @dependabot[bot] in https://github.com/tinkle-org/syntra-go/pull/5
+* fix(test): tolerate duplicate-request close race in loopback harness by @oscarlaw in https://github.com/tinkle-org/syntra-go/pull/23
+* chore(actions): bump actions/checkout from 4.4.0 to 7.0.1 by @dependabot[bot] in https://github.com/tinkle-org/syntra-go/pull/6
+
+## New Contributors
+* @dependabot[bot] made their first contribution in https://github.com/tinkle-org/syntra-go/pull/2
+
+**Full Changelog**: https://github.com/tinkle-org/syntra-go/compare/v1.0.0-rc.2...v1.0.0-rc.3
+
 ## 1.0.0-rc.2 (2026-11-07)
 
 ## What's Changed

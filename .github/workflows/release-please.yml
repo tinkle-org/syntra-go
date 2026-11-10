@@ -52,7 +52,7 @@ jobs:
       # GITHUB_TOKEN is the built-in Actions token; no PAT setup required.
       # Note: pushes made with GITHUB_TOKEN do not trigger other GitHub
       # Actions workflows. Verify new releases here, not via release events.
-      - uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         id: release
         if: steps.current.outputs.current == 'true'
         with:

@@ -25,6 +25,10 @@ const (
 	TerminalOwnedCommitted
 	// TerminalDenied means external withdrawal, expiry, or superseding hard denial.
 	TerminalDenied
+	// TerminalOwnedPending proves the withdrawal but no application result yet.
+	TerminalOwnedPending
+	// TerminalOwnedOutcome proves the withdrawal and its exact application result.
+	TerminalOwnedOutcome
 )
 
 // TerminalTransition is private authority-adapter input, never wire data. The
@@ -50,10 +54,15 @@ type TerminalObservation struct {
 	State      TerminalAuthorityState
 	Transition TerminalTransition
 	Revision   uint64
+	// OutcomeID is the one-based OutcomePayloads index for OwnedOutcome only.
+	// All other states require zero. The ID is private evidence, not wire data.
+	OutcomeID uint8
 }
 
 // TerminalAuthority owns application persistence. Commit must atomically record
 // ownership from the expected active revision and all fixed-receipt conditions.
+// For outcome policies the adapter must also commit the effect and immutable
+// result together, joined to this exact owned withdrawal (see TERMINAL_RECEIPT_DESIGN.md).
 // Observe must be a fresh, authoritative read covering expiry, key/enrollment and
 // application authority, including superseding denial; caches/replicas unable to
 // establish that are unsupported. Both methods must honor cancellation and return
@@ -84,6 +93,33 @@ type TerminalMethodPolicy struct {
 	SuccessPayload     []byte
 	Authority          TerminalAuthority
 	ObservationTimeout time.Duration
+	// OutcomePayloads opts into authority-selected results instead of SuccessPayload.
+	// Supply 1..8 fixed, non-sensitive payloads (empty bytes are valid) and leave
+	// SuccessPayload nil. OpenHost snapshots the list and each payload.
+	OutcomePayloads [][]byte
+}
+
+// reserveFrames validates the complete policy at construction (maximum varint
+// widths) and reserves every candidate with the actual correlation before Commit.
+func (policy TerminalMethodPolicy) reserveFrames(version uint32, requestID uint64) ([][]byte, error) {
+	payloads := policy.OutcomePayloads
+	if payloads == nil {
+		payloads = [][]byte{policy.SuccessPayload}
+	} else if policy.SuccessPayload != nil || len(payloads) == 0 || len(payloads) > 8 {
+		return nil, terminalFailure()
+	}
+	frames := make([][]byte, len(payloads))
+	for i, payload := range payloads {
+		if len(payload) > 1024 {
+			return nil, terminalFailure()
+		}
+		frame, err := MarshalFrame(NewResultFrame(version, requestID, NewSuccessResult(payload)))
+		if err != nil || len(frame) > 1024 {
+			return nil, terminalFailure()
+		}
+		frames[i] = frame
+	}
+	return frames, nil
 }
 
 // TerminalClock is a driver's trusted suspend-inclusive elapsed origin. Check
@@ -149,8 +185,9 @@ type TerminalPermit struct {
 	wallUntil     time.Time
 	frame         []byte
 	valid         bool
-	owned         bool
-	revision      uint64
+	owned         bool   // final evidence; pending alone never authorizes handoff
+	revision      uint64 // pinned by the first owned observation, including pending
+	outcomeID     uint8
 	selected      bool
 	consumed      bool
 	failure       error
@@ -367,31 +404,56 @@ func (p *TerminalPermit) Observe(ctx context.Context, requireCommit bool) (Termi
 	if p.failure != nil {
 		return TerminalUnknown, p.failure
 	}
-	valid := observation.Transition == p.transition
-	switch observation.State {
-	case TerminalActive:
-		valid = valid && !p.owned && observation.Revision == p.transition.ExpectedRevision && !requireCommit
-	case TerminalOwnedCommitted:
-		valid = valid && observation.Revision > p.transition.ExpectedRevision && (!p.owned || observation.Revision == p.revision)
-	default:
-		valid = false
-	}
-	if !valid {
+	if !p.acceptObservationLocked(observation, requireCommit) {
 		p.failLocked(terminalFailure())
 		return TerminalUnknown, p.failure
-	}
-	if observation.State == TerminalOwnedCommitted {
-		p.owned, p.revision = true, observation.Revision
 	}
 	return observation.State, nil
 }
 
-// Frame returns an owned copy of the sole predeclared result for the driver.
+// acceptObservationLocked advances evidence monotonically. All owned shapes
+// identify the same withdrawal; finality adds evidence, never a new revision.
+func (p *TerminalPermit) acceptObservationLocked(o TerminalObservation, requireFinal bool) bool {
+	if o.Transition != p.transition {
+		return false
+	}
+	if o.State == TerminalActive {
+		return !requireFinal && p.revision == 0 && o.Revision == p.transition.ExpectedRevision && o.OutcomeID == 0
+	}
+	if o.Revision <= p.transition.ExpectedRevision || (p.revision != 0 && o.Revision != p.revision) {
+		return false
+	}
+	outcomes := p.policy.OutcomePayloads
+	switch o.State {
+	case TerminalOwnedPending:
+		if outcomes == nil || o.OutcomeID != 0 || p.owned || requireFinal {
+			return false
+		}
+	case TerminalOwnedOutcome:
+		if o.OutcomeID == 0 || int(o.OutcomeID) > len(outcomes) || (p.owned && o.OutcomeID != p.outcomeID) {
+			return false
+		}
+	case TerminalOwnedCommitted:
+		if outcomes != nil || o.OutcomeID != 0 {
+			return false
+		}
+	default:
+		return false
+	}
+	p.revision, p.outcomeID = o.Revision, o.OutcomeID
+	p.owned = o.State != TerminalOwnedPending
+	return true
+}
+
+// Frame returns an owned copy of the fixed frame, or nil for an outcome policy
+// until the proven frame has been selected. It does not grant write permission.
 func (p *TerminalPermit) Frame() []byte {
 	if p == nil || !p.valid {
 		return nil
 	}
-	return append([]byte(nil), p.frame...)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return bytes.Clone(p.frame)
 }
 
 // MatchesChannel checks exact authenticated enrollment scope for a trusted driver.
@@ -442,7 +504,7 @@ type terminalRequest struct {
 }
 
 // CompleteTerminalReceipt reserves, fences, conditionally commits, validates,
-// selects and attempts the configured fixed result for this authorized handler.
+// selects and attempts the result proven for this authorized handler.
 // It must be called BEFORE application mutation; only the configured authority's
 // Commit performs the terminal transition. No payload or caller-created permit
 // is accepted. It writes independently of handler return, then closes this
@@ -508,17 +570,20 @@ func CompleteTerminalReceipt(ctx context.Context, operation string, expectedRevi
 	if tail < 2*terminalPollInterval || remaining-tail <= policy.ObservationTimeout {
 		return terminalFailure()
 	}
-	frame, err := MarshalFrame(NewResultFrame(hc.version, cc.id, NewSuccessResult(policy.SuccessPayload)))
-	if err != nil || len(frame) > 1024 {
-		return terminalFailure()
+	frames, err := policy.reserveFrames(hc.version, cc.id)
+	if err != nil {
+		return err
 	}
 	failureCtx, failureCancel := context.WithCancel(scope.ctx)
 	defer failureCancel()
 	p := &TerminalPermit{policy: policy, clock: clock, budget: budget, parents: callerBudget.parents, until: start + remaining - tail,
 		owner: scope, failureCtx: failureCtx, failureCancel: failureCancel, failed: make(chan struct{}), stopIO: driver.StopTerminal,
-		wallUntil: minTime(deadline, wallStart.Add(initialRemaining)).Add(-tail), frame: frame, valid: true,
+		wallUntil: minTime(deadline, wallStart.Add(initialRemaining)).Add(-tail), valid: true,
 		transition: TerminalTransition{Principal: hc.principal, Method: scope.method, Operation: operation, ExpectedRevision: expectedRevision}}
 	p.policy.Authority = terminalChargedAuthority{host: h, authority: policy.Authority}
+	if policy.OutcomePayloads == nil {
+		p.frame = frames[0]
+	}
 	if _, err := rand.Read(p.transition.ReservationID[:]); err != nil {
 		return terminalFailure()
 	}
@@ -609,7 +674,7 @@ func CompleteTerminalReceipt(ctx context.Context, operation string, expectedRevi
 	h.mu.Lock()
 	p.mu.Lock()
 	p.checkTimeLocked()
-	if p.failure != nil || writeCtx.Err() != nil || commitCtx.Err() != nil || commitBudget.Err() != nil || scope.ctx.Err() != nil || ctx.Err() != nil || h.closed || hc.closing || hc.authorizationRevoked || hc.terminal != p || hc.cancels[cc.id] != cc || !hc.core.terminalPending(cc.id) {
+	if p.failure != nil || p.revision != 0 || writeCtx.Err() != nil || commitCtx.Err() != nil || commitBudget.Err() != nil || scope.ctx.Err() != nil || ctx.Err() != nil || h.closed || hc.closing || hc.authorizationRevoked || hc.terminal != p || hc.cancels[cc.id] != cc || !hc.core.terminalPending(cc.id) {
 		p.failLocked(terminalFailure())
 		p.mu.Unlock()
 		h.mu.Unlock()
@@ -630,14 +695,20 @@ func CompleteTerminalReceipt(ctx context.Context, operation string, expectedRevi
 	h.mu.Lock()
 	p.mu.Lock()
 	p.checkTimeLocked()
-	if p.failure != nil || scope.ctx.Err() != nil || ctx.Err() != nil || hc.cancels[cc.id] != cc || h.closed || hc.closing || hc.authorizationRevoked || !hc.core.terminalPending(cc.id) {
+	if p.failure != nil || !p.owned || scope.ctx.Err() != nil || ctx.Err() != nil || hc.cancels[cc.id] != cc || h.closed || hc.closing || hc.authorizationRevoked || !hc.core.terminalPending(cc.id) {
 		p.mu.Unlock()
 		h.mu.Unlock()
 		p.Fail(context.Canceled)
 		return terminalFailure()
 	}
-	selected, _, err := hc.core.answer(cc.id, NewSuccessResult(policy.SuccessPayload))
+	frame, payload := frames[0], policy.SuccessPayload
+	if policy.OutcomePayloads != nil {
+		i := p.outcomeID - 1 // acceptObservationLocked pinned a valid one-based ID
+		frame, payload = frames[i], policy.OutcomePayloads[i]
+	}
+	selected, _, err := hc.core.answer(cc.id, NewSuccessResult(payload))
 	if err == nil && bytes.Equal(selected, frame) {
+		p.frame = frame
 		p.selected = true
 	} else {
 		err = terminalFailure()

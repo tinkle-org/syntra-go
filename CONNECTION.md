@@ -86,9 +86,14 @@ a bounded denial drain. Handlers must respect their contexts.
 `terminal_receipt.go`, this additionally requires a confirmed Returning-mode
 channel binding; Bootstrap rejects before reservation or mutation, even with
 successful authentication, method authorization, and both opt-ins. It fences
-ordinary traffic, establishes a full-frame barrier before the configured authority's
-conditional commit, and permits only one fixed result with fresh exact-owned
-evidence, then closes. Call before mutation; a nil return reports complete local
+ordinary traffic and establishes a full-frame barrier before the configured
+authority's conditional commit. Each method can use a fixed `SuccessPayload` or
+declare 1–8 `OutcomePayloads`. The SDK reserves every candidate frame before
+mutation. After commit, fresh `TerminalOwnedCommitted` evidence permits the fixed
+result; for an outcome method, fresh `TerminalOwnedOutcome` evidence selects one
+reserved frame by its one-based ID. `TerminalOwnedPending` permits no write and
+does not extend the deadline. The connection closes after the receipt attempt.
+Call before mutation; a nil return reports complete local
 writing, not peer receipt or joined cleanup. Both defaults are off; ordinary
 withdrawal and `DisconnectPrincipal` remain immediate abort. The supported stock
 composition is ordered/TCP; raw/custom paths without coordination, other stock carriers, and

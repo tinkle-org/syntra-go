@@ -41,6 +41,8 @@ type terminalTCPOptions struct {
 	serverOptions                ordered.Options
 	disabledHost, disabledDriver bool
 	payload                      []byte
+	outcomes                     [][]byte
+	method                       string
 	revision                     uint64
 	commit                       func(context.Context)
 	observe                      func(syntra.TerminalObservation) (syntra.TerminalObservation, error)
@@ -50,6 +52,7 @@ type terminalTCPOptions struct {
 	observeContext               func(context.Context, syntra.TerminalObservation) (syntra.TerminalObservation, error)
 	observationTimeout           time.Duration
 	handler                      func(context.Context, *syntra.RpcRequest) (*syntra.RpcResult, error)
+	configure                    func(*syntra.HostConfig, *securechannel.ServerConfig) // before OpenHost and the first accept
 }
 
 // terminalTCP starts a real encrypted loopback responder and registers joined cleanup.
@@ -79,6 +82,14 @@ func terminalTCP(t *testing.T, options terminalTCPOptions) *terminalTCPFixture {
 	if options.payload != nil {
 		policy.SuccessPayload = options.payload
 	}
+	if options.outcomes != nil {
+		policy.SuccessPayload = nil
+		policy.OutcomePayloads = options.outcomes
+	}
+	method := options.method
+	if method == "" {
+		method = retireMethod
+	}
 	revision := options.revision
 	if revision == 0 {
 		revision = 1
@@ -90,9 +101,9 @@ func terminalTCP(t *testing.T, options terminalTCPOptions) *terminalTCPFixture {
 	cfg := syntra.HostConfig{ExecutionBudget: budget,
 		ChannelPolicy:   func(context.Context, syntra.ChannelIdentity, []byte) (string, error) { return "fixture", nil },
 		Authorize:       syntra.AllowAllAuthorize,
-		TerminalMethods: map[string]syntra.TerminalMethodPolicy{retireMethod: policy},
+		TerminalMethods: map[string]syntra.TerminalMethodPolicy{method: policy},
 		Handler: func(ctx context.Context, req *syntra.RpcRequest) (*syntra.RpcResult, error) {
-			if req.GetMethod() != retireMethod {
+			if req.GetMethod() != method {
 				return syntra.NewSuccessResult(req.GetPayload()), nil
 			}
 			return nil, syntra.CompleteTerminalReceipt(ctx, "fixture-operation", revision)
@@ -102,6 +113,9 @@ func terminalTCP(t *testing.T, options terminalTCPOptions) *terminalTCPFixture {
 	}
 	if options.disabledHost {
 		cfg.TerminalMethods = nil
+	}
+	if options.configure != nil {
+		options.configure(&cfg, &security)
 	}
 	host, err := syntra.OpenHost(cfg)
 	if err != nil {

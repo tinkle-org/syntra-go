@@ -7,9 +7,12 @@
 - Default-disabled scoped terminal receipts through `HostConfig.TerminalMethods`
   and `ordered.Options.EnableTerminalReceipts`; both opt-ins are required.
   `CompleteTerminalReceipt` coordinates fencing, the full-frame barrier, a
-  conditional `TerminalAuthority.Commit`, fresh typed observations, and one fixed
+  conditional `TerminalAuthority.Commit`, fresh typed observations, and one
   correlated result before retirement. Success means complete local writing, not
   peer receipt or joined cleanup; loss is unknown and never automatically replayed.
+- A single host can serve fixed terminal methods and methods with `OutcomePayloads`.
+  For the latter, fresh `TerminalOwnedOutcome` evidence selects one of up to eight
+  predeclared payloads; `TerminalOwnedPending` alone never authorizes a reply.
 - Root Host + ordered/TCP support, including connection ownership/readiness
   wrappers. Recovery-enabled Go hosts, raw drivers, other stock carriers, and
   uncoordinated custom paths refuse before mutation. Ordinary withdrawal defaults
@@ -28,6 +31,10 @@
 - `HostConfig` has a new field. Nonempty unkeyed literals written against the
   previous version no longer compile; convert them to keyed literals before
   upgrading. Empty `HostConfig{}` literals remain valid.
+- **Upgrade:** `TerminalMethodPolicy` gained `OutcomePayloads`, and
+  `TerminalObservation` gained `OutcomeID`. Existing nonempty unkeyed literals
+  of either type no longer compile; convert them to keyed literals. Existing
+  keyed fixed-receipt code can omit both fields. The wire format is unchanged.
 
 ## 1.0.0-rc.3 (2026-11-08)
 

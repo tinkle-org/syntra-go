@@ -18,6 +18,7 @@
 package syntra
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -1596,15 +1597,21 @@ func resolveHostConfig(cfg HostConfig) (resolvedHostConfig, error) {
 	if len(cfg.TerminalMethods) != 0 {
 		out.terminalMethods = make(map[string]TerminalMethodPolicy, len(cfg.TerminalMethods))
 		for method, policy := range cfg.TerminalMethods {
-			if ValidateMethod(method) != nil || strings.HasPrefix(method, RecoveryMethodPrefix) || policy.Authority == nil || policy.ObservationTimeout <= 0 || policy.ObservationTimeout > time.Second || len(policy.SuccessPayload) > 1024 {
+			if ValidateMethod(method) != nil || strings.HasPrefix(method, RecoveryMethodPrefix) || policy.Authority == nil || policy.ObservationTimeout <= 0 || policy.ObservationTimeout > time.Second {
 				return resolvedHostConfig{}, terminalFailure()
 			}
-			policy.SuccessPayload = append([]byte(nil), policy.SuccessPayload...)
 			// Budget the complete correlated frame at maximum varint widths.
 			// Explicit core version ranges are not capped at the binding singleton.
-			frame, err := MarshalFrame(NewResultFrame(math.MaxUint32, math.MaxUint64, NewSuccessResult(policy.SuccessPayload)))
-			if err != nil || len(frame) > 1024 {
-				return resolvedHostConfig{}, terminalFailure()
+			if _, err := policy.reserveFrames(math.MaxUint32, math.MaxUint64); err != nil {
+				return resolvedHostConfig{}, err
+			}
+			policy.SuccessPayload = bytes.Clone(policy.SuccessPayload)
+			if policy.OutcomePayloads != nil {
+				payloads := make([][]byte, len(policy.OutcomePayloads))
+				for i, payload := range policy.OutcomePayloads {
+					payloads[i] = bytes.Clone(payload)
+				}
+				policy.OutcomePayloads = payloads
 			}
 			out.terminalMethods[method] = policy
 		}

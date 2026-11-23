@@ -1,7 +1,7 @@
 # Scoped terminal receipts
 
 A scoped terminal receipt lets one authorized, self-withdrawing operation attempt
-one fixed success result on its initiating encrypted connection. It is disabled
+one predeclared success result on its initiating encrypted connection. It is disabled
 by default. Authority withdrawal is not delayed until the client receives a reply,
 and a lost reply never restores authority or authorizes an automatic retry.
 
@@ -51,6 +51,24 @@ Constructor validation marshals the full result at maximum version/request-ID
 varint widths and rejects oversized templates before any connection or callback
 can start. The per-request complete-frame check remains in place too.
 
+For a method with more than one possible application result, set
+`OutcomePayloads` **instead of** `SuccessPayload`. For example, for a proto3
+message with a non-optional bool at field 1:
+
+```go
+OutcomePayloads: [][]byte{{0x08, 0x01}, {}}, // ID 1: true; ID 2: false
+```
+
+IDs are one-based positions in a list of 1–8 entries. Keep their meanings
+stable wherever results are persisted. An empty payload is valid; an empty
+list is not. A nil list preserves the fixed API (including nil/empty fixed
+success). A non-nil list with any non-nil `SuccessPayload` is invalid. Use
+keyed policy and observation literals. `OpenHost` copies the list and its
+contents and checks each complete frame at maximum correlation widths. Before
+mutation the SDK reserves **all** candidate frames with the live call's actual
+version and request ID. Neither the handler nor `Commit` supplies reply bytes
+or selects an ID. The ID is never sent to the client.
+
 Inside the authorized handler, call `CompleteTerminalReceipt` **before** making
 the terminal mutation. Only the configured authority's `Commit` performs it:
 
@@ -97,7 +115,8 @@ type TerminalAuthority interface {
 `TerminalTransition` contains the SDK-generated private `ReservationID`, bound
 principal and channel identity, server key ID, handshake hash, method, application
 operation, and expected revision. Atomically compare the expected active revision
-and persist the complete transition owner, the newer revision, and every
+and persist the complete transition owner, the newer revision, and (for the
+fixed policy) every
 application condition represented by the fixed success payload. Do not log or
 expose the reservation, or accept it from a peer.
 
@@ -120,6 +139,8 @@ external withdrawal or unknown state merely because the callback is pending.
 | --- | --- |
 | `TerminalActive` | Exact transition and revision equal to expected; remain fenced without ordinary output or a receipt |
 | `TerminalOwnedCommitted` | Exact transition and strictly newer revision; eligible only for the reserved result and remaining gates |
+| `TerminalOwnedPending` | Outcome policy only: exact owned withdrawal, strictly newer revision, no final result yet; remain fenced, never write |
+| `TerminalOwnedOutcome` | Outcome policy only: exact owned withdrawal and proven application `OutcomeID` in this method's list; eligible only for that frame and remaining gates |
 | `TerminalDenied` | External withdrawal, expiry, or superseding denial; sticky abort |
 | `TerminalUnknown`, error, timeout, or mismatched evidence | Sticky abort |
 
@@ -128,6 +149,39 @@ revision: `7 -> 11` is valid, but then changing owned evidence to `12` aborts ev
 with the same owner. Returning Active after an owned commit also aborts. Delayed
 positive evidence cannot clear failure. An external denial must remain observable
 after the owned commit; retaining only a first-owner tombstone is insufficient.
+
+`TerminalOwnedCommitted` is fixed-policy evidence only. Only `TerminalOwnedOutcome`
+may carry a nonzero `OutcomeID`. The first Pending **or** Outcome pins the exact
+owner and withdrawal revision. Pending may repeat or advance to Outcome at the
+same revision. Outcome can also be observed directly; once observed, its ID must
+match on every later read, including the read after encryption at handoff.
+Regression to Active or from Outcome to Pending, owner/revision drift, and mixed
+policy/evidence shapes fail closed. Pending merely keeps the in-commit watch
+alive within its original budget. After `Commit` returns without error, a fresh
+final read is mandatory; there is no waiting period, fallback result, or budget
+renewal. None of these states authorize ordinary traffic.
+
+### When withdrawal and effect have different transaction owners
+
+1. In the authority store, compare the expected active revision and record the
+   withdrawal, complete `TerminalTransition` owner, and new revision **in the
+   same transaction**. From that point ordinary access is withdrawn immediately.
+2. At the application effect owner, commit the effect (or decided no-op) and
+   its immutable allowlisted result **in the same transaction**. Persist a join
+   to this exact operation and withdrawal, not just a principal, method, or
+   latest result. Reconcile ambiguous calls and retry idempotently using the
+   same operation identity; never rerun the effect merely because a reply was lost.
+3. For each observation, freshly establish that the exact owned withdrawal is
+   still current and non-superseded and that the result belongs to that operation.
+   Pending requires proof of the withdrawal and an unresolved result; a failed
+   read is not Pending. Return Outcome only for a proven result, including a
+   proven false/no-op. Missing rows, ambiguous joins, stale replicas, and
+   generic downstream success do not prove a result. If the adapter cannot
+   establish this evidence, return Unknown/error (Denied for a known denial).
+
+These transactions need not share a database. Implementing their join and
+idempotency is an adapter obligation; the SDK implements neither distributed
+commit nor recovery of an abandoned operation.
 
 `ObservationTimeout` must be positive and at most **one second**. Each read has
 its own elapsed and context deadline within the original operation budget.
@@ -283,7 +337,9 @@ denial silently ignored. No support is inherited by another carrier or FFI embed
 Current source coverage is in `terminal_receipt_test.go`,
 `terminal_review_regression_test.go`, `transport/tcp/terminal_receipt_test.go`,
 `transport/tcp/terminal_matrix_test.go`, and
-`transport/tcp/terminal_review_regression_test.go`. It covers opt-ins and wrapper
+`transport/tcp/terminal_review_regression_test.go`. Outcome-specific native TCP
+coverage is in `transport/tcp/terminal_outcome_test.go`, including pending during
+commit, both protobuf results, fixed Logout and rejection at handoff. The suite covers opt-ins and wrapper
 ownership, fixed-frame bounds, exact/sticky evidence, revisions, barriers,
 partial loss, cancellation, deadline/read bounds, fatal input, fresh Returning
 denial, retained charges, and callback-reentrant host controls.

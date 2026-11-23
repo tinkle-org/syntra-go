@@ -90,6 +90,44 @@ func TestTerminalEvidenceIsStickyAndExact(t *testing.T) {
 	}
 }
 
+// TestTerminalPendingPinsWithdrawal checks the interval where the withdrawal is
+// owned but the operation has no result. Neither ownership nor time can reset.
+func TestTerminalPendingPinsWithdrawal(t *testing.T) {
+	for _, fault := range []string{"revision", "operation", "active", "expiry"} {
+		t.Run(fault, func(t *testing.T) {
+			tr := TerminalTransition{ExpectedRevision: 7, Operation: "one"}
+			a := &terminalTestAuthority{observation: TerminalObservation{State: TerminalOwnedPending, Revision: 11, Transition: tr}}
+			clock := &terminalReviewClock{}
+			p := &TerminalPermit{valid: true, transition: tr, clock: clock, until: time.Second, wallUntil: time.Now().Add(time.Second),
+				policy: TerminalMethodPolicy{Authority: a, OutcomePayloads: make([][]byte, 8), ObservationTimeout: time.Second}}
+			clock.elapsed.Store(int64(time.Second / 2))
+			for i := 0; i < 2; i++ {
+				if _, err := p.Observe(context.Background(), false); err != nil || p.owned || p.Frame() != nil {
+					t.Fatalf("pending must remain fenced without a result: %v", err)
+				}
+			}
+			a.observation.State, a.observation.OutcomeID = TerminalOwnedOutcome, 8
+			switch fault {
+			case "revision":
+				a.observation.Revision++
+			case "operation":
+				a.observation.Transition.Operation = "two"
+			case "active":
+				a.observation.State, a.observation.Revision, a.observation.OutcomeID = TerminalActive, 7, 0
+			case "expiry":
+				clock.elapsed.Store(int64(time.Second))
+			}
+			if _, err := p.Observe(context.Background(), false); err == nil {
+				t.Fatal("lost pending pin or renewed time budget")
+			}
+			a.observation = TerminalObservation{State: TerminalOwnedOutcome, Revision: 11, Transition: tr, OutcomeID: 8}
+			if _, err := p.Observe(context.Background(), true); err == nil {
+				t.Fatal("late result cleared failure")
+			}
+		})
+	}
+}
+
 // TestTerminalQuiesceSuppressesQueuedNotActive retains the active full frame
 // while discarding queued ordinary output and rejecting later output silently.
 func TestTerminalQuiesceSuppressesQueuedNotActive(t *testing.T) {

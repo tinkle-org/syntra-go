@@ -126,3 +126,48 @@ func TestTerminalConfigOwnsPolicyCopies(t *testing.T) {
 		t.Fatal("copying configuration invoked authority callbacks")
 	}
 }
+
+// TestTerminalOutcomeConfig validates even the last candidate, including its
+// correlated envelope, and checks ownership of both levels of the input slice.
+func TestTerminalOutcomeConfig(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		fixed    []byte
+		outcomes [][]byte
+		valid    bool
+	}{
+		{"one-empty", nil, [][]byte{nil}, true},
+		{"eight", nil, make([][]byte, 8), true},
+		{"exact", nil, [][]byte{nil, make([]byte, 1001)}, true},
+		{"missing-candidates", nil, [][]byte{}, false},
+		{"too-many", nil, make([][]byte, 9), false},
+		{"mixed-even-if-empty", []byte{}, [][]byte{nil}, false},
+		{"oversize-envelope", nil, [][]byte{nil, make([]byte, 1002)}, false},
+		{"oversize-payload", nil, [][]byte{nil, make([]byte, 1025)}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := &terminalConfigAuthority{}
+			h, err := OpenHost(HostConfig{TerminalMethods: map[string]TerminalMethodPolicy{terminalConfigMethod: {
+				Authority: a, ObservationTimeout: time.Second, SuccessPayload: tc.fixed, OutcomePayloads: tc.outcomes,
+			}}})
+			if h != nil {
+				defer h.Close()
+			}
+			if (err == nil) != tc.valid || (h != nil) != tc.valid || a.calls.Load() != 0 {
+				t.Fatalf("host present=%t, error=%v, authority calls=%d", h != nil, err, a.calls.Load())
+			}
+			if tc.valid {
+				p := h.cfg.terminalMethods[terminalConfigMethod]
+				for i, payload := range tc.outcomes {
+					if len(payload) > 0 {
+						payload[0] = 1
+					}
+					tc.outcomes[i] = []byte{2}
+					if got := p.OutcomePayloads[i]; len(got) != len(payload) || (len(got) > 0 && got[0] != 0) {
+						t.Fatalf("configured candidate %d aliases caller data", i)
+					}
+				}
+			}
+		})
+	}
+}

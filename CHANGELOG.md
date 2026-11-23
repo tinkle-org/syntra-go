@@ -36,6 +36,19 @@
   of either type no longer compile; convert them to keyed literals. Existing
   keyed fixed-receipt code can omit both fields. The wire format is unchanged.
 
+## 1.0.0-rc.4 (2026-11-23)
+
+## What's Changed
+* feat(host)!: support authority-selected terminal outcomes by @oscarlaw in https://github.com/tinkle-org/syntra-go/pull/30
+* chore(actions): bump actions/upload-artifact from 4.6.2 to 7.0.2 by @dependabot[bot] in https://github.com/tinkle-org/syntra-go/pull/24
+* chore(actions): bump github/codeql-action/autobuild from e1c541575b54ca50e5f5dcc7da77615756cf9f51 to 4bfa242aa49c5f7c6770b98670d354a7dfac05f8 by @dependabot[bot] in https://github.com/tinkle-org/syntra-go/pull/27
+* chore(actions): bump googleapis/release-please-action from 4.4.1 to 5.0.0 by @dependabot[bot] in https://github.com/tinkle-org/syntra-go/pull/29
+* chore(deps): align CodeQL and preserve Go 1.23 support by @oscarlaw in https://github.com/tinkle-org/syntra-go/pull/32
+* chore(actions): bump actions/setup-go from 7.0.0 to 7.1.0 by @dependabot[bot] in https://github.com/tinkle-org/syntra-go/pull/33
+
+
+**Full Changelog**: https://github.com/tinkle-org/syntra-go/compare/v1.0.0-rc.3...v1.0.0-rc.4
+
 ## 1.0.0-rc.3 (2026-11-08)
 
 ## What's Changed

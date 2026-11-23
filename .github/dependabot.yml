@@ -6,9 +6,18 @@ updates:
       interval: "weekly"
     commit-message:
       prefix: "chore(deps)"
+    ignore:
+      # Stay on the Go 1.23-compatible v0.35.x line for routine updates (v0.36.0 requires Go 1.24).
+      - dependency-name: "golang.org/x/sys"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
     commit-message:
       prefix: "chore(actions)"
+    groups:
+      codeql:
+        patterns:
+          - "github/codeql-action"
+          - "github/codeql-action/*"
